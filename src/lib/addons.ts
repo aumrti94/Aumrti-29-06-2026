@@ -24,6 +24,15 @@ export interface AddonSku {
   is_active?: boolean;
   sort_order?: number;
   badge_text?: string | null;
+  /**
+   * 'bundle' (default) = curated multi-module/AI package shown on the
+   * marketing and catalogue pickers. 'single_module' = a standalone,
+   * exactly-one-module SKU for the Modules-tab grid — deliberately excluded
+   * from those catalogue lists (pricing v3 Phase 2b). Optional on the type
+   * because older call sites that select a narrower column list never
+   * fetch it; treat a missing value as 'bundle'.
+   */
+  sku_type?: "bundle" | "single_module";
 }
 
 export interface HospitalAddon {
@@ -78,4 +87,25 @@ export function describeGrant(sku: AddonSku): string {
   if (mods) parts.push(`${mods} module${mods === 1 ? "" : "s"}`);
   if (ai) parts.push(`${ai} AI feature${ai === 1 ? "" : "s"}`);
   return parts.join(" + ") || "No additional access";
+}
+
+/**
+ * Index single-module SKUs by the one module key each grants, for the
+ * Modules-tab grid (and the Settings → Plan single-module picker) to look
+ * up "what does turning this Grey tile on cost" in O(1). A bundle SKU is
+ * never returned here even if it happens to carry exactly one module key —
+ * `sku_type` is the authority, not array length, so a curated single-module
+ * bundle (sold deliberately as a package) can never be mistaken for the
+ * flat a-la-carte price.
+ */
+export function indexSingleModuleSkus(
+  skus: ReadonlyArray<AddonSku>,
+): Map<string, AddonSku> {
+  const out = new Map<string, AddonSku>();
+  for (const s of skus) {
+    if (s.sku_type !== "single_module") continue;
+    const key = s.module_keys?.[0];
+    if (key) out.set(key, s);
+  }
+  return out;
 }

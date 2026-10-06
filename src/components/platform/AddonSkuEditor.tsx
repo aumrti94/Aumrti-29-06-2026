@@ -39,6 +39,7 @@ export default function AddonSkuEditor({ sku, onClose }: Props) {
   const [aiKeys, setAiKeys] = useState((s?.ai_feature_keys ?? []).join(", "));
   const [badge, setBadge] = useState(s?.badge_text ?? "");
   const [isActive, setIsActive] = useState(s?.is_active ?? true);
+  const [skuType, setSkuType] = useState<"bundle" | "single_module">(s?.sku_type ?? "bundle");
   const [error, setError] = useState<string | null>(null);
 
   // Reset the form whenever a different SKU is opened.
@@ -48,13 +49,23 @@ export default function AddonSkuEditor({ sku, onClose }: Props) {
     setPriceYearly(s?.price_yearly != null ? String(s.price_yearly) : "");
     setModuleKeys((s?.module_keys ?? []).join(", "));
     setAiKeys((s?.ai_feature_keys ?? []).join(", "));
-    setBadge(s?.badge_text ?? ""); setIsActive(s?.is_active ?? true); setError(null);
+    setBadge(s?.badge_text ?? ""); setIsActive(s?.is_active ?? true);
+    setSkuType(s?.sku_type ?? "bundle"); setError(null);
   }, [sku]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const save = useMutation({
     mutationFn: async () => {
       if (!name.trim()) throw new Error("Name is required");
       if (!slug.trim()) throw new Error("Slug is required");
+      const mods = parseList(moduleKeys);
+      const ai = parseList(aiKeys);
+      // single_module is "this module, standalone" — the Modules-tab grid prices
+      // a Grey tile off exactly one row per module (see 20261107000011), so a
+      // row that doesn't shape up as exactly one module and zero AI features
+      // would either fail the DB constraint or silently never be found by it.
+      if (skuType === "single_module" && (mods.length !== 1 || ai.length !== 0)) {
+        throw new Error("A single-module add-on must grant exactly one module key and no AI feature keys.");
+      }
       const payload: any = {
         ...(s?.id ? { id: s.id } : {}),
         slug: slug.trim(),
@@ -62,10 +73,11 @@ export default function AddonSkuEditor({ sku, onClose }: Props) {
         description: description.trim() || null,
         price_monthly: Number(priceMonthly) || 0,
         price_yearly: priceYearly.trim() === "" ? null : Number(priceYearly),
-        module_keys: parseList(moduleKeys),
-        ai_feature_keys: parseList(aiKeys),
+        module_keys: mods,
+        ai_feature_keys: ai,
         badge_text: badge.trim() || null,
         is_active: isActive,
+        sku_type: skuType,
         updated_at: new Date().toISOString(),
       };
       const { error } = await (supabase as any)
@@ -101,6 +113,20 @@ export default function AddonSkuEditor({ sku, onClose }: Props) {
           <div>
             <label className="text-xs text-muted-foreground">Slug (stable key, e.g. insurance_tpa)</label>
             <input className={field} value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="insurance_tpa" />
+          </div>
+          <div>
+            <label className="text-xs text-muted-foreground">Type</label>
+            <select className={field} value={skuType} onChange={(e) => setSkuType(e.target.value as "bundle" | "single_module")}>
+              <option value="bundle">Bundle (curated — shown on /pricing)</option>
+              <option value="single_module">Single module (a-la-carte — Modules-tab grid only)</option>
+            </select>
+            {skuType === "single_module" && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-400 mt-1">
+                Must grant exactly one module key and no AI feature keys. Not shown on /pricing or
+                the Settings → Plan bundle grid — priced hospitals see it only when they open a
+                Grey module tile for this exact module.
+              </p>
+            )}
           </div>
           <div>
             <label className="text-xs text-muted-foreground">Description</label>

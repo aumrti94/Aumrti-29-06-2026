@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
-import { ChevronLeft, Save, Loader2, Trash2, AlertTriangle, X, Activity, Eye, SlidersHorizontal, Sparkles } from "lucide-react";
+import { ChevronLeft, Save, Loader2, Trash2, AlertTriangle, X, Activity, Eye, SlidersHorizontal, Sparkles, IndianRupee } from "lucide-react";
 import { MODULE_TABS, MODULE_ACTIONS } from "@/lib/tabPermissions";
 import { ModuleAccessDrawer } from "@/components/access/ModuleAccessDrawer";
 import { toast } from "sonner";
@@ -12,7 +12,7 @@ import { Progress } from "@/components/ui/progress";
 import { FormError } from "@/components/ui/FormError";
 import { PLATFORM_STATUS_PILL } from "@/lib/platform-utils";
 import { formatINRExact, formatINRPrecise } from "@/lib/currency";
-import { activeSkus, addonsMonthlyTotal, describeGrant, type AddonSku, type HospitalAddon } from "@/lib/addons";
+import { activeSkus, addonsMonthlyTotal, describeGrant, indexSingleModuleSkus, type AddonSku, type HospitalAddon } from "@/lib/addons";
 import PaymentHistoryTable from "@/components/billing/PaymentHistoryTable";
 import { logAdminAction } from "@/lib/adminAudit";
 import { startImpersonation } from "@/lib/impersonation";
@@ -125,7 +125,7 @@ const STATUS_PILL = PLATFORM_STATUS_PILL;
 // ── data fetchers ─────────────────────────────────────────────
 
 async function fetchHospitalDetail(id: string) {
-  const [hRes, sRes, overRes, pricRes, plansRes, entRes, skuRes, addonRes, driftRes, aiBudgetRes, encRes] = await Promise.all([
+  const [hRes, sRes, overRes, pricRes, plansRes, entRes, skuRes, singleModRes, addonRes, driftRes, aiBudgetRes, encRes] = await Promise.all([
     (supabase as any).from("hospitals").select("*").eq("id", id).maybeSingle(),
     (supabase as any).from("hospital_subscriptions")
       .select("*, subscription_plans(id,name,slug,price_monthly,price_yearly,max_beds,max_staff,storage_included_gb,trial_days,description,beds_included,bed_block_size,price_per_bed_block,price_per_bed_block_yearly)")
@@ -138,9 +138,18 @@ async function fetchHospitalDetail(id: string) {
       .select("id, name, slug, price_monthly").eq("is_active", true).order("sort_order"),
     (supabase as any).from("hospital_module_entitlements")
       .select("module_key, tabs, actions").eq("hospital_id", id),
+    // Curated bundles only — the Billing-tab catalogue card. sku_type = 'bundle'
+    // keeps the 58 single-module SKUs (pricing v3 Phase 2b) out of this list.
     (supabase as any).from("addon_skus")
       .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, badge_text, sort_order")
-      .eq("is_active", true).order("sort_order"),
+      .eq("is_active", true).eq("sku_type", "bundle").order("sort_order"),
+    // The single-module price list the Modules-tab grid prices a Grey tile from.
+    (supabase as any).from("addon_skus")
+      .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, sort_order")
+      .eq("is_active", true).eq("sku_type", "single_module").order("sort_order"),
+    // NOT filtered by sku_type — this hospital's active purchases span both
+    // bundle and single-module add-ons, and the grid needs to know which
+    // modules are already addon-backed regardless of which kind.
     (supabase as any).from("hospital_addons")
       .select("id, addon_sku_id, status, granted_at, billing_starts_at, source, addon_skus(id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, sort_order)")
       .eq("hospital_id", id).eq("status", "active"),
@@ -165,6 +174,7 @@ async function fetchHospitalDetail(id: string) {
     plans: (plansRes.data || []) as Array<{ id: string; name: string; slug: string; price_monthly: number }>,
     entitlements: (entRes.data || []) as Array<{ module_key: string; tabs: Record<string, boolean>; actions: Record<string, boolean> }>,
     addonSkus: (skuRes.data || []) as AddonSku[],
+    singleModuleSkus: (singleModRes.data || []) as AddonSku[],
     addons: (addonRes.data || []) as HospitalAddon[],
     addonDrift: (driftRes.data || []) as Array<{ drift_type: string; addon_name: string; module_key: string; detail: string }>,
     aiBudget: aiBudgetRes.data as {
@@ -329,6 +339,54 @@ export default function HospitalDetailPage() {
         .delete().eq("hospital_id", id).eq("module_key", key);
     },
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["platform-hospital", id] }); },
+  });
+
+  // ── Single-module add-on (pricing v3 Phase 2b) ──
+  // A Grey module tile (not covered by the plan, no override yet) that has a
+  // priced single-module SKU opens a confirm step instead of toggling
+  // straight on. Confirming calls set_hospital_module_addon(true), which
+  // writes the override AND creates the hospital_addons row for billing
+  // inside ONE Postgres transaction — see 20261107000011_single_module_addons.sql
+  // for why this must not be two separate client-side .from() writes (the
+  // grid's own render logic only reads the override, so a half-done write
+  // would either bill with the tile still showing Grey, or grant access the
+  // grid never shows as changed — both are the drift addon_entitlement_drift
+  // exists to catch, reproduced a third time).
+  const [pendingModuleAddon, setPendingModuleAddon] = useState<{ key: string; sku: AddonSku } | null>(null);
+
+  const purchaseModuleAddon = useMutation({
+    mutationFn: async (moduleKey: string) => {
+      const { error } = await (supabase as any).rpc("set_hospital_module_addon", {
+        p_hospital_id: id, p_module_key: moduleKey, p_enabled: true,
+      });
+      if (error) throw error;
+    },
+    onSuccess: (_r, moduleKey) => {
+      logAdminAction("hospital_module_addon_purchased", { hospitalId: id, hospitalName: data?.hospital?.name, details: { module: moduleKey } });
+      toast.success("Module added — billed from the next renewal");
+      setPendingModuleAddon(null);
+      invalidate();
+      qc.invalidateQueries({ queryKey: ["subscription-config", id] });
+    },
+    onError: (e: any) => toast.error(getErrorMessage(e)),
+  });
+
+  // Symmetric undo: cancels the hospital_addons row AND removes the override
+  // this same RPC created, atomically — same reasoning as the purchase above.
+  const cancelModuleAddon = useMutation({
+    mutationFn: async (moduleKey: string) => {
+      const { error } = await (supabase as any).rpc("set_hospital_module_addon", {
+        p_hospital_id: id, p_module_key: moduleKey, p_enabled: false,
+      });
+      if (error) throw error;
+    },
+    onSuccess: (_r, moduleKey) => {
+      logAdminAction("hospital_module_addon_cancelled", { hospitalId: id, hospitalName: data?.hospital?.name, details: { module: moduleKey } });
+      toast.success("Module add-on cancelled — removed from the next renewal");
+      invalidate();
+      qc.invalidateQueries({ queryKey: ["subscription-config", id] });
+    },
+    onError: (e: any) => toast.error(getErrorMessage(e)),
   });
 
   // ── Per-module tab/action entitlement (Customise drawer) ──
@@ -628,6 +686,27 @@ export default function HospitalDetailPage() {
   const overrideMap = new Map(overrides.map((o) => [o.module_key, o.is_enabled]));
   const entitlementMap = new Map(entitlements.map((e) => [e.module_key, e]));
   const categories = [...new Set(CANONICAL_MODULE_KEYS.map((k) => MODULE_CATEGORY[k]).filter(Boolean))];
+
+  // ── Single-module add-on lookup (pricing v3 Phase 2b) ──
+  // What a Grey tile costs to turn on, and whether an amber tile's "on" is
+  // because the hospital is paying for it (vs. a plain free admin override).
+  const singleModuleSkuByKey = indexSingleModuleSkus(data?.singleModuleSkus ?? []);
+  const activeAddons = (data?.addons ?? []).filter((a) => a.status === "active");
+  const activeAddonSkuIds = new Set(activeAddons.map((a) => a.addon_sku_id));
+  const isModuleAddonActive = (key: string) => {
+    const sku = singleModuleSkuByKey.get(key);
+    return !!sku && activeAddonSkuIds.has(sku.id);
+  };
+  // Every module ANY currently-active add-on grants, bundle or single-module
+  // (flagged in revenue-pod review: without this, a Grey tile for a module
+  // already covered by a bundle — e.g. "insurance" under the active
+  // "Insurance & Claims Desk" SKU — would offer to sell it AGAIN as its own
+  // single-module add-on, double-billing for zero incremental access; the
+  // RPC also refuses this server-side, but the tile should never offer the
+  // paid path to begin with).
+  const modulesGrantedByAnyActiveAddon = new Set(
+    activeAddons.flatMap((a) => a.addon_skus?.module_keys ?? []),
+  );
 
   // A module can be fine-tuned only if we have a tab/action catalog for it.
   const isCustomisable = (key: string) =>
@@ -1170,6 +1249,9 @@ export default function HospitalDetailPage() {
                       const planDefault = planFeatureMap?.enabled.get(key) ?? true;
                       const hasOverride = overrideMap.has(key);
                       const effective = hasOverride ? overrideMap.get(key)! : planDefault;
+                      const addonSku = singleModuleSkuByKey.get(key);
+                      const addonActive = isModuleAddonActive(key);
+                      const busy = purchaseModuleAddon.isPending || cancelModuleAddon.isPending;
                       return (
                         <div
                           key={key}
@@ -1179,13 +1261,55 @@ export default function HospitalDetailPage() {
                                 ? "bg-amber-50 border-amber-400/60 text-amber-700"
                                 : "bg-blue-50 border-blue-300/60 text-foreground"
                               : "bg-muted/40 border-border/60 text-muted-foreground"
-                          }`}
-                          onClick={() => toggleModule.mutate({ key, enabled: !effective })}
-                          onContextMenu={(e) => { e.preventDefault(); if (hasOverride) removeOverride.mutate(key); }}
-                          title={hasOverride ? "Right-click to reset to plan default" : "Click to override"}
+                          } ${busy ? "opacity-60 pointer-events-none" : ""}`}
+                          onClick={() => {
+                            if (!effective) {
+                              // Grey → turning ON. A priced single-module SKU gets a
+                              // confirm step (atomic grant+bill on confirm); anything
+                              // without a price keeps the old free-override toggle.
+                              // EXCEPT: if some OTHER active add-on already grants this
+                              // module (e.g. a bundle), selling it again would double-bill
+                              // for zero new access — just flip the free override instead,
+                              // the same fix a plain "Blue" tile would get.
+                              if (addonSku && !modulesGrantedByAnyActiveAddon.has(key)) {
+                                setPendingModuleAddon({ key, sku: addonSku }); return;
+                              }
+                              toggleModule.mutate({ key, enabled: true });
+                              return;
+                            }
+                            // On → turning OFF. An addon-backed tile must cancel the
+                            // addon in the same action that removes the override —
+                            // never leave one without the other.
+                            if (addonActive) {
+                              if (!window.confirm(
+                                `Cancel the ${MODULE_NAME[key] || key} add-on? Billing stops at the next renewal and the module reverts to the plan default.`
+                              )) return;
+                              cancelModuleAddon.mutate(key);
+                              return;
+                            }
+                            toggleModule.mutate({ key, enabled: false });
+                          }}
+                          onContextMenu={(e) => { e.preventDefault(); if (hasOverride && !addonActive) removeOverride.mutate(key); }}
+                          title={
+                            addonActive
+                              ? `Paid add-on — ${formatINRExact(Number(addonSku!.price_monthly))}/mo. Click to cancel.`
+                              : !effective && addonSku && !modulesGrantedByAnyActiveAddon.has(key)
+                                ? `Not in this plan — add for ${formatINRExact(Number(addonSku.price_monthly))}/mo`
+                                : !effective && modulesGrantedByAnyActiveAddon.has(key)
+                                  ? "Already covered by another active add-on — click to enable at no extra charge"
+                                  : hasOverride ? "Right-click to reset to plan default" : "Click to override"
+                          }
                         >
-                          <span className="truncate">{MODULE_NAME[key] || key}</span>
+                          <span className="truncate flex items-center gap-1">
+                            {MODULE_NAME[key] || key}
+                            {addonActive && <IndianRupee size={10} className="text-amber-600 shrink-0" />}
+                          </span>
                           <div className="flex items-center gap-1.5 shrink-0 ml-2">
+                            {!effective && addonSku && !modulesGrantedByAnyActiveAddon.has(key) && (
+                              <span className="text-[10px] text-muted-foreground font-mono">
+                                {formatINRExact(Number(addonSku.price_monthly))}/mo
+                              </span>
+                            )}
                             {effective && isCustomisable(key) && (
                               <button
                                 type="button"
@@ -1216,6 +1340,48 @@ export default function HospitalDetailPage() {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* Single-module add-on purchase confirm — the price step the brief asks
+            for before a Grey tile goes on. Confirming fires the ONE atomic RPC
+            (grant + bill together); there is no path that completes only one. */}
+        {pendingModuleAddon && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setPendingModuleAddon(null)}>
+            <div className="bg-card border border-border rounded-2xl w-full max-w-sm shadow-2xl p-5 space-y-4" onClick={(e) => e.stopPropagation()}>
+              <div>
+                <p className="text-base font-bold text-foreground">
+                  Add {MODULE_NAME[pendingModuleAddon.key] || pendingModuleAddon.key}?
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Not covered by this hospital's plan. This creates a single-module add-on —
+                  access starts immediately, billed from the next renewal.
+                </p>
+              </div>
+              <div className="flex items-center justify-between text-sm bg-muted/40 rounded-lg px-3 py-2">
+                <span className="text-muted-foreground">Add-on price</span>
+                <span className="font-semibold text-foreground">
+                  {formatINRExact(Number(pendingModuleAddon.sku.price_monthly))}/mo
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setPendingModuleAddon(null)}
+                  disabled={purchaseModuleAddon.isPending}
+                  className="flex-1 h-9 rounded-md border border-border text-sm text-foreground disabled:opacity-60"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => purchaseModuleAddon.mutate(pendingModuleAddon.key)}
+                  disabled={purchaseModuleAddon.isPending}
+                  className="flex-1 inline-flex items-center justify-center gap-2 h-9 rounded-md bg-primary text-primary-foreground text-sm font-medium disabled:opacity-60"
+                >
+                  {purchaseModuleAddon.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  Add for {formatINRExact(Number(pendingModuleAddon.sku.price_monthly))}/mo
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
