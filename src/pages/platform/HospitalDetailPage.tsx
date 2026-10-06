@@ -122,10 +122,22 @@ const MODULE_CATEGORY: Record<string, string> = Object.fromEntries(
 
 const STATUS_PILL = PLATFORM_STATUS_PILL;
 
+// Product Mode / SKU — internal-only upsell targeting label. Values match the
+// `mode` column check in supabase/migrations/20260524000005_product_modes.sql;
+// labels here are the founder-facing names (the hospital-side badge in
+// SettingsPlanPage.tsx shows the shorter StatusBadge label instead).
+const PRODUCT_MODE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "hospital",   label: "Full Hospital" },
+  { value: "clinic",     label: "Clinic / Polyclinic" },
+  { value: "diagnostic", label: "Diagnostic Centre" },
+  { value: "pharmacy",   label: "Pharmacy / Retail" },
+  { value: "institute",  label: "Medical Institute" },
+];
+
 // ── data fetchers ─────────────────────────────────────────────
 
 async function fetchHospitalDetail(id: string) {
-  const [hRes, sRes, overRes, pricRes, plansRes, entRes, skuRes, addonRes, driftRes, aiBudgetRes, encRes] = await Promise.all([
+  const [hRes, sRes, overRes, pricRes, plansRes, entRes, skuRes, addonRes, driftRes, aiBudgetRes, encRes, pmRes] = await Promise.all([
     (supabase as any).from("hospitals").select("*").eq("id", id).maybeSingle(),
     (supabase as any).from("hospital_subscriptions")
       .select("*, subscription_plans(id,name,slug,price_monthly,price_yearly,max_beds,max_staff,storage_included_gb,trial_days,description,beds_included,bed_block_size,price_per_bed_block,price_per_bed_block_yearly)")
@@ -156,6 +168,13 @@ async function fetchHospitalDetail(id: string) {
     (supabase as any).from("hospital_encounter_usage")
       .select("voice_encounters, ocr_documents, voice_encounters_included, ocr_documents_included, encounter_credits, document_credits, inr_per_encounter")
       .eq("hospital_id", id).maybeSingle(),
+    // Product Mode / SKU — internal upsell-targeting label (clinic | hospital |
+    // diagnostic | pharmacy | institute). Hospitals see this read-only
+    // (Settings › Plan & Billing); only aumrti_admins may write it, per
+    // supabase/migrations/20261107000010_product_modes_rls_lockdown.sql. No row
+    // yet (the onboarding step that provisions it isn't in the live wizard FLOW)
+    // reads as the same "hospital" default ProductModeContext falls back to.
+    (supabase as any).from("product_modes").select("mode").eq("hospital_id", id).maybeSingle(),
   ]);
   return {
     hospital: hRes.data,
@@ -177,6 +196,7 @@ async function fetchHospitalDetail(id: string) {
       encounter_credits: number; document_credits: number;
       inr_per_encounter: number | null;
     } | null,
+    productMode: ((pmRes.data as any)?.mode || "hospital") as string,
   };
 }
 
@@ -307,6 +327,27 @@ export default function HospitalDetailPage() {
         : "No trial to resync (hospital is not on trial)");
       invalidate();
       qc.invalidateQueries({ queryKey: ["subscription-config", id] });
+    },
+    onError: (e: any) => toast.error(getErrorMessage(e)),
+  });
+
+  // ── Product Mode (SKU) — internal targeting label; admin-write only ──
+  // Upserts rather than update-only because most hospitals have no
+  // product_modes row yet (the onboarding step that provisions one,
+  // Step7bModules.tsx, isn't in the live wizard FLOW today). The admin-only
+  // RLS policy (product_modes_admin_write) grants FOR ALL, so this is the one
+  // place in the app allowed to write this table.
+  const updateProductMode = useMutation({
+    mutationFn: async (mode: string) => {
+      const { error } = await (supabase as any)
+        .from("product_modes")
+        .upsert({ hospital_id: id, mode }, { onConflict: "hospital_id" });
+      if (error) throw error;
+    },
+    onSuccess: (_r, mode) => {
+      logAdminAction("hospital_product_mode_updated", { hospitalId: id, hospitalName: data?.hospital?.name, details: { mode } });
+      toast.success("Product mode updated");
+      invalidate();
     },
     onError: (e: any) => toast.error(getErrorMessage(e)),
   });
@@ -601,7 +642,7 @@ export default function HospitalDetailPage() {
     );
   }
 
-  const { hospital, subscription, overrides, pricing, plans, entitlements } = data!;
+  const { hospital, subscription, overrides, pricing, plans, entitlements, productMode } = data!;
 
   // Trial maths for the Subscription card. `drift` is how far the stored trial end sits
   // from what the plan's CURRENT trial_days would produce — non-zero means someone edited
@@ -713,6 +754,32 @@ export default function HospitalDetailPage() {
                   <p className="text-xs text-foreground">{String(val)}</p>
                 </div>
               ))}
+            </div>
+
+            {/* Product Mode / SKU — internal upsell-targeting signal, never hospital-editable.
+                Hospitals see this as a read-only badge on Settings › Plan & Billing; write
+                access is admin-only at the RLS layer
+                (supabase/migrations/20261107000010_product_modes_rls_lockdown.sql), so this
+                select is the one place in the app where it can actually change. */}
+            <div className="space-y-2">
+              <p className="text-[10px] uppercase font-bold text-muted-foreground tracking-wider">Product Mode (SKU)</p>
+              <div className="flex items-center gap-2">
+                <select
+                  value={productMode}
+                  onChange={(e) => updateProductMode.mutate(e.target.value)}
+                  disabled={updateProductMode.isPending}
+                  className="h-8 px-3 text-xs bg-background border border-border rounded-lg text-foreground focus:outline-none focus:border-primary disabled:opacity-60"
+                >
+                  {PRODUCT_MODE_OPTIONS.map((m) => (
+                    <option key={m.value} value={m.value}>{m.label}</option>
+                  ))}
+                </select>
+                {updateProductMode.isPending && <Loader2 size={12} className="animate-spin text-muted-foreground" />}
+              </div>
+              <p className="text-[11px] text-muted-foreground leading-relaxed">
+                Internal targeting only — hospitals cannot change this. Flag a mismatch
+                (e.g. on Clinic but running heavy Lab volume) as a Diagnostic Centre upsell.
+              </p>
             </div>
 
             {/* Contact details */}

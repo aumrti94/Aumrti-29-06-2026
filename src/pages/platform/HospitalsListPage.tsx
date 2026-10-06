@@ -14,13 +14,14 @@ interface HospRow {
   id: string; name: string; state: string | null; beds_count: number;
   created_at: string; plan_name: string; status: string; plan_id: string | null;
   hasRecentOpd: boolean; hasRecentBilling: boolean; deletedAt: string | null;
+  productMode: string;
 }
 
 // ─── Data Fetcher ─────────────────────────────────────────────────────────────
 async function fetchHospitals(): Promise<HospRow[]> {
   const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString();
 
-  const [hResult, sResult, activeResult] = await Promise.all([
+  const [hResult, sResult, activeResult, pmResult] = await Promise.all([
     (supabase as any).from("hospitals")
       .select("id, name, state, beds_count, created_at, deleted_at")
       .eq("is_active", true)
@@ -28,12 +29,17 @@ async function fetchHospitals(): Promise<HospRow[]> {
     (supabase as any).from("hospital_subscriptions")
       .select("hospital_id, status, plan_id, subscription_plans(name)"),
     (supabase as any).rpc("platform_active_hospitals", { since: thirtyDaysAgo }),
+    // Product Mode / SKU — internal upsell-targeting label, scanned fleet-wide here.
+    // Hospitals without a row yet (the onboarding step that provisions one isn't in
+    // the live wizard FLOW) fall back to "hospital", matching ProductModeContext.
+    (supabase as any).from("product_modes").select("hospital_id, mode"),
   ]);
 
   const subs = new Map((sResult.data || []).map((s: any) => [s.hospital_id, s]));
   const activeList = activeResult.data || [];
   const activeOpd  = new Set(activeList.filter((r: any) => r.has_opd).map((r: any) => r.hospital_id));
   const activeBill = new Set(activeList.filter((r: any) => r.has_billing).map((r: any) => r.hospital_id));
+  const modes = new Map((pmResult.data || []).map((m: any) => [m.hospital_id, m.mode]));
 
   return (hResult.data || []).map((h: any) => {
     const sub = subs.get(h.id) as any;
@@ -46,6 +52,7 @@ async function fetchHospitals(): Promise<HospRow[]> {
       hasRecentOpd:     activeOpd.has(h.id),
       hasRecentBilling: activeBill.has(h.id),
       deletedAt: h.deleted_at || null,
+      productMode: (modes.get(h.id) as string) || "hospital",
     };
   });
 }
@@ -177,6 +184,7 @@ export default function HospitalsListPage() {
             { key: "state", header: "State" },
             { key: "beds", header: <SortBtn k="beds" label="Beds" /> },
             { key: "plan", header: "Plan" },
+            { key: "mode", header: "Mode (SKU)" },
             { key: "status", header: "Status" },
             { key: "score", header: <SortBtn k="score" label="Health Score" /> },
             { key: "activity", header: "Activity (30d)" },
@@ -203,6 +211,9 @@ export default function HospitalsListPage() {
               <td className="px-5 py-3 text-xs text-muted-foreground">{h.state || "—"}</td>
               <td className="px-5 py-3 text-xs text-muted-foreground font-mono">{h.beds_count}</td>
               <td className="px-5 py-3 text-xs text-foreground/80">{h.plan_name}</td>
+              <td className="px-5 py-3">
+                <StatusBadge status={h.productMode} />
+              </td>
               <td className="px-5 py-3">
                 <StatusBadge status={h.status} />
               </td>

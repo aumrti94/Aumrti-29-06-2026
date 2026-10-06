@@ -87,6 +87,17 @@ const STATUS_CONFIG: Record<string, { bg: string; text: string; label?: string }
   erasure_request_rejected:  { bg: "bg-slate-100",   text: "text-slate-600", label: "Erasure Request Rejected" },
   impersonation_start:       { bg: "bg-purple-100",  text: "text-purple-700", label: "Impersonation Start" },
   impersonation_end:         { bg: "bg-purple-100",  text: "text-purple-600", label: "Impersonation End" },
+  hospital_product_mode_updated: { bg: "bg-indigo-100", text: "text-indigo-700", label: "Product Mode Updated" },
+  // Platform — product mode / SKU (deployment type), shown read-only on the
+  // hospital side (Settings › Plan & Billing) and editable on the platform-admin
+  // side (HospitalDetailPage, HospitalsListPage). Hospital staff can never
+  // change this — write access is admin-only per
+  // supabase/migrations/20261107000010_product_modes_rls_lockdown.sql.
+  clinic:      { bg: "bg-violet-100",  text: "text-violet-700",  label: "Clinic" },
+  hospital:    { bg: "bg-blue-100",    text: "text-blue-700",    label: "Hospital" },
+  diagnostic:  { bg: "bg-cyan-100",    text: "text-cyan-700",    label: "Diagnostic Centre" },
+  pharmacy:    { bg: "bg-emerald-100", text: "text-emerald-700", label: "Pharmacy" },
+  institute:   { bg: "bg-amber-100",   text: "text-amber-700",   label: "Medical Institute" },
 };
 
 /**

@@ -8,8 +8,10 @@ import { Download, Mail, AlertTriangle, Clock, CheckCircle2, XCircle, Loader2, F
 import { QRCodeSVG } from "qrcode.react";
 import { useSubscriptionConfig } from "@/hooks/useSubscriptionConfig";
 import { useHospitalId } from "@/hooks/useHospitalId";
+import { useProductMode } from "@/hooks/useProductMode";
 import { supabase } from "@/integrations/supabase/client";
 import { ALL_MODULES } from "@/lib/modules";
+import { StatusBadge } from "@/components/shared/StatusBadge";
 import SubscribeButton from "@/components/subscription/SubscribeButton";
 import AiCreditsCard from "@/components/subscription/AiCreditsCard";
 import PaymentHistoryTable from "@/components/billing/PaymentHistoryTable";
@@ -79,6 +81,7 @@ const limitPct = (used: number, limit: number | null): number => {
 
 const SettingsPlanPage: React.FC = () => {
   const { hospitalId } = useHospitalId();
+  const { productMode } = useProductMode();
 
   const {
     plan, subscription, status,
@@ -461,6 +464,16 @@ const SettingsPlanPage: React.FC = () => {
               {plan?.description && (
                 <p className="text-sm text-muted-foreground mt-1 max-w-md leading-relaxed">{plan.description}</p>
               )}
+              {/* Deployment Mode — display only. Set by Aumrti's team for internal
+                  targeting (e.g. a Clinic-mode hospital running heavy Lab volume is a
+                  Diagnostic Centre upsell candidate); hospitals can view but never
+                  change it — write access is admin-only at the database layer
+                  (supabase/migrations/20261107000010_product_modes_rls_lockdown.sql),
+                  so there is no dropdown or click-to-change control here by design. */}
+              <div className="mt-2 flex items-center gap-1.5">
+                <span className="text-xs text-muted-foreground">Deployment Mode:</span>
+                <StatusBadge status={productMode} />
+              </div>
             </div>
             <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium ${statusCfg.color}`}>
               {statusCfg.icon}
