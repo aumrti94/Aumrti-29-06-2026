@@ -65,6 +65,7 @@ async function fetchHospitalUsage(hospitalId: string): Promise<UsageData> {
   };
 }
 import { ALL_MODULES } from "@/lib/modules";
+import { getHospitalTypeLabel } from "@/lib/hospitalTypes";
 import { CANONICAL_MODULE_KEYS } from "@/hooks/useSubscriptionConfig";
 
 // ── Users tab data fetcher ────────────────────────────────────────────────────
@@ -699,7 +700,7 @@ export default function HospitalDetailPage() {
             <div className="space-y-4">
               {[
                 ["Name", hospital.name],
-                ["Category", hospital.hospital_category || hospital.type || "—"],
+                ["Category", getHospitalTypeLabel(hospital.hospital_category || hospital.type)],
                 ["State", hospital.state || "—"], ["City", hospital.city || "—"],
                 ["Beds", hospital.beds_count],
                 ["GSTIN", hospital.gstin || "—"], ["NABH Number", hospital.nabh_number || "—"],

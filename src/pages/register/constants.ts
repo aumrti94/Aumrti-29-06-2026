@@ -45,19 +45,6 @@ export const SALES_WHATSAPP =
 export const SALES_EMAIL =
   (import.meta.env.VITE_SALES_EMAIL as string) || ENTERPRISE_EMAIL;
 
-export const HOSPITAL_TYPES = [
-  "Private Hospital",
-  "Government Hospital",
-  "Trust / NGO Hospital",
-  "Corporate Hospital",
-  "Nursing Home",
-  "Clinic",
-  "Specialty Center",
-  "Dental Clinic",
-  "AYUSH Center",
-  "Other",
-];
-
 export const BED_COUNTS = [
   { label: "Under 30 beds", value: "under_30" },
   { label: "30–50 beds", value: "30_50" },
@@ -79,7 +66,17 @@ export const DESIGNATIONS = [
 
 export interface RegistrationData {
   hospitalName: string;
+  /** Broad category key from src/lib/hospitalTypes.ts (BROAD_CATEGORIES) — UI-only, narrows the
+   *  second dropdown; not sent to register-hospital. */
+  hospitalBroadCategory: string;
+  /** Specific hospital-type key from src/lib/hospitalTypes.ts (HOSPITAL_TYPES) — this is what
+   *  gets sent as hospital.type and stored verbatim in hospitals.hospital_category. */
   hospitalType: string;
+  /** "Medical College / Teaching Hospital" overlay checkbox — only offered for types with
+   *  teachingOverlayEligible. Front-end wizard state only for now (no DB column yet). */
+  isTeachingInstitution: boolean;
+  /** AYUSH-only secondary multi-select ("which system(s)") — front-end wizard state only. */
+  ayushSubSystems: string[];
   state: string;
   bedCount: string;
   phone: string;
@@ -108,7 +105,10 @@ export interface RegistrationData {
 
 export const initialData: RegistrationData = {
   hospitalName: "",
+  hospitalBroadCategory: "",
   hospitalType: "",
+  isTeachingInstitution: false,
+  ayushSubSystems: [],
   state: "",
   bedCount: "",
   phone: "",

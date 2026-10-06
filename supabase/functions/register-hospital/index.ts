@@ -236,8 +236,51 @@ serve(async (req) => {
       "500_plus": 600,
     };
 
-    // Map hospital type to enum
+    // Map hospital type to enum. Keys are the granular hospital-type `key`s from
+    // src/lib/hospitalTypes.ts (HOSPITAL_TYPES[].coarseType is the source of truth this table
+    // mirrors — duplicated here rather than imported because Edge Functions deploy standalone
+    // and don't bundle files outside supabase/functions). The legacy free-text labels below
+    // (pre-taxonomy wizard) are kept so any in-flight/cached client build still resolves cleanly.
     const typeMap: Record<string, string> = {
+      // ── current granular taxonomy keys (src/lib/hospitalTypes.ts) ──
+      clinic_polyclinic: "clinic",
+      nursing_home_small_hospital: "nursing_home",
+      phc_chc: "general",
+      general_hospital: "general",
+      multispecialty_hospital: "general",
+      super_specialty_hospital: "specialty",
+      district_hospital: "general",
+      government_hospital: "general",
+      trust_charitable_hospital: "general",
+      esi_hospital: "general",
+      railway_hospital: "general",
+      defence_military_hospital: "general",
+      cancer_oncology_hospital: "specialty",
+      dialysis_renal_hospital: "specialty",
+      maternity_womens_hospital: "specialty",
+      neonatal_nicu_hospital: "specialty",
+      ivf_fertility_centre: "specialty",
+      eye_hospital: "specialty",
+      dental_hospital: "specialty",
+      ent_hospital: "specialty",
+      orthopaedic_hospital: "specialty",
+      cardiac_cardiology_hospital: "specialty",
+      urology_hospital: "specialty",
+      gastroenterology_hospital: "specialty",
+      dermatology_skin_clinic: "clinic",
+      psychiatric_mental_health_hospital: "specialty",
+      rehabilitation_physiotherapy_hospital: "specialty",
+      palliative_long_term_care: "nursing_home",
+      homecare_palliative_provider: "clinic",
+      geriatric_care_centre: "specialty",
+      paediatric_only_hospital: "specialty",
+      daycare_procedure_centre: "clinic",
+      diagnostic_pathology_lab_chain: "clinic",
+      trauma_emergency_centre: "specialty",
+      ayush_traditional_medicine_centre: "clinic",
+      wellness_preventive_health_centre: "clinic",
+      vaccination_centre: "clinic",
+      // ── legacy free-text labels (pre-taxonomy wizard) — kept for backward compatibility ──
       "Private Hospital": "general",
       "Government Hospital": "general",
       "Trust / NGO Hospital": "general",
