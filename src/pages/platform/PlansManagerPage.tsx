@@ -96,6 +96,10 @@ export default function PlansManagerPage() {
   const qc = useQueryClient();
   const [activeTab, setActiveTab] = useState<"plans" | "addons" | "leads">("plans");
   const [editingSku, setEditingSku] = useState<AddonSku | "new" | null>(null);
+  // Bundles (curated, few, marketed on /pricing) vs single-module SKUs (one row
+  // per module, pricing v3 Phase 2b, ~58 rows) — kept as separate views of the
+  // same table so neither list drowns the other.
+  const [addonTypeFilter, setAddonTypeFilter] = useState<"bundle" | "single_module">("bundle");
   const [editing, setEditing] = useState<string | null>(null);
   const [form, setForm] = useState<Partial<Plan>>(BLANK_PLAN);
   const [enabledKeys, setEnabledKeys] = useState<Set<string>>(new Set());
@@ -128,7 +132,7 @@ export default function PlansManagerPage() {
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("addon_skus")
-        .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, is_active, sort_order, badge_text")
+        .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, is_active, sort_order, badge_text, sku_type")
         .order("sort_order");
       return (data || []) as AddonSku[];
     },
@@ -366,8 +370,34 @@ export default function PlansManagerPage() {
             immediately; the subscription amount is rebound at its next renewal. Editing a price
             here changes what every future renewal charges — it does not retro-bill.
           </p>
+
+          <div className="flex items-center gap-1.5 mb-4">
+            {([
+              { key: "bundle" as const, label: "Bundles" },
+              { key: "single_module" as const, label: "Single modules" },
+            ]).map((t) => (
+              <button
+                key={t.key}
+                onClick={() => setAddonTypeFilter(t.key)}
+                className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
+                  addonTypeFilter === t.key
+                    ? "bg-primary text-primary-foreground border-primary"
+                    : "border-border text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {t.label} ({(addonSkus || []).filter((s) => (s.sku_type ?? "bundle") === t.key).length})
+              </button>
+            ))}
+          </div>
+          {addonTypeFilter === "single_module" && (
+            <p className="text-xs text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900 rounded-lg px-3 py-2 mb-4 max-w-2xl">
+              These 58 prices are PLACEHOLDERS seeded by migration (₹499 or ₹999/mo by category) —
+              not signed off by finance. Edit each one here before relying on it commercially.
+            </p>
+          )}
+
           <div className="grid gap-3 md:grid-cols-2 max-w-4xl">
-            {(addonSkus || []).map((s) => (
+            {(addonSkus || []).filter((s) => (s.sku_type ?? "bundle") === addonTypeFilter).map((s) => (
               <Card key={s.id}>
               <CardContent className="p-4">
                 <div className="flex items-start justify-between gap-2">
@@ -405,9 +435,11 @@ export default function PlansManagerPage() {
               </CardContent>
               </Card>
             ))}
-            {(!addonSkus || addonSkus.length === 0) && (
+            {(addonSkus || []).filter((s) => (s.sku_type ?? "bundle") === addonTypeFilter).length === 0 && (
               <p className="text-xs text-muted-foreground">
-                No add-on SKUs yet — click “New Add-on” to create one.
+                {addonTypeFilter === "bundle"
+                  ? "No bundle SKUs yet — click “New Add-on” to create one."
+                  : "No single-module SKUs yet."}
               </p>
             )}
           </div>

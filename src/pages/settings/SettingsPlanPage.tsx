@@ -4,7 +4,7 @@ import SettingsPageWrapper from "@/components/settings/SettingsPageWrapper";
 import { Progress } from "@/components/ui/progress";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Download, Mail, AlertTriangle, Clock, CheckCircle2, XCircle, Loader2, FileText, ExternalLink, Gift, Copy, Check, Sparkles } from "lucide-react";
+import { Download, Mail, AlertTriangle, Clock, CheckCircle2, XCircle, Loader2, FileText, ExternalLink, Gift, Copy, Check, Sparkles, ChevronDown, ChevronRight, Search } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { useSubscriptionConfig } from "@/hooks/useSubscriptionConfig";
 import { useHospitalId } from "@/hooks/useHospitalId";
@@ -282,13 +282,37 @@ const SettingsPlanPage: React.FC = () => {
     queryFn: async () => {
       const { data } = await (supabase as any)
         .from("addon_skus")
+        // sku_type = 'bundle' — the 58 single-module SKUs (pricing v3 Phase 2b)
+        // are listed separately below, not mixed into this curated grid.
         .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, badge_text, sort_order")
         .eq("is_active", true)
+        .eq("sku_type", "bundle")
         .order("sort_order");
       return (data || []) as AddonSku[];
     },
     staleTime: 5 * 60_000,
   });
+
+  // ── Single-module add-ons (pricing v3 Phase 2b) ──
+  // One module, standalone price — for the hospital that wants just Lab
+  // without a bundle. Reuses the exact same confirm dialog and insert as the
+  // bundle Add-ons above (setPendingAddon / the mutation a few lines down);
+  // this is additional catalogue DATA, not a second purchase flow.
+  const { data: singleModuleCatalogue = [] } = useQuery({
+    queryKey: ["addon-catalogue-single-module"],
+    queryFn: async () => {
+      const { data } = await (supabase as any)
+        .from("addon_skus")
+        .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, sort_order")
+        .eq("is_active", true)
+        .eq("sku_type", "single_module")
+        .order("sort_order");
+      return (data || []) as AddonSku[];
+    },
+    staleTime: 5 * 60_000,
+  });
+  const [moduleFilter, setModuleFilter] = React.useState("");
+  const [showSingleModules, setShowSingleModules] = React.useState(false);
 
   const { data: myAddons = [], refetch: refetchAddons } = useQuery({
     queryKey: ["hospital-addons", hospitalId],
@@ -306,6 +330,18 @@ const SettingsPlanPage: React.FC = () => {
 
   const ownedSkuIds = new Set(myAddons.map((a) => a.addon_sku_id));
   const ownedSkus = activeSkus(myAddons);
+
+  // Only offer a single-module SKU for a module the hospital does not
+  // already have — via plan, override, or another add-on. Buying access to
+  // something already open would charge for nothing. `enabledModules` is
+  // the one place that already resolves all three layers (useSubscriptionConfig),
+  // so this list never drifts from what the hospital can actually open.
+  const purchasableSingleModules = singleModuleCatalogue.filter((sku) => {
+    const key = sku.module_keys?.[0];
+    if (!key || enabledModules.includes(key)) return false;
+    if (!moduleFilter.trim()) return true;
+    return sku.name.toLowerCase().includes(moduleFilter.trim().toLowerCase());
+  });
   const [pendingAddon, setPendingAddon] = React.useState<AddonSku | null>(null);
   const [addonBusy, setAddonBusy] = React.useState(false);
 
@@ -889,6 +925,63 @@ const SettingsPlanPage: React.FC = () => {
               Add-ons total <span className="font-semibold text-foreground">{fmtINR(addonsMonthlyTotal(ownedSkus))}/month</span>,
               billed with your subscription. To remove one, contact support.
             </p>
+          )}
+
+          {/* Just one module, not a bundle — pricing v3 Phase 2b. Same catalogue
+              table, same confirm dialog (setPendingAddon below), collapsed by
+              default so it doesn't turn a 4-card grid into a 50-card one. */}
+          {singleModuleCatalogue.length > 0 && (
+            <div className="mt-5 pt-4 border-t border-border">
+              <button
+                type="button"
+                onClick={() => setShowSingleModules((v) => !v)}
+                className="flex items-center gap-1.5 text-xs font-semibold text-foreground hover:text-primary transition-colors"
+              >
+                {showSingleModules ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                Just want one module? Buy it on its own
+              </button>
+              <p className="text-[11px] text-muted-foreground mt-1 ml-[19px]">
+                Skip the bundle — add a single module at its own standalone price.
+              </p>
+
+              {showSingleModules && (
+                <div className="mt-3 ml-[19px]">
+                  <div className="relative max-w-xs mb-3">
+                    <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      value={moduleFilter}
+                      onChange={(e) => setModuleFilter(e.target.value)}
+                      placeholder="Search modules…"
+                      className="w-full h-8 pl-8 pr-3 text-xs bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-primary"
+                    />
+                  </div>
+
+                  {purchasableSingleModules.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">
+                      {moduleFilter.trim()
+                        ? "No module matches that search."
+                        : "Every priced module is already included in your plan or add-ons."}
+                    </p>
+                  ) : (
+                    <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                      {purchasableSingleModules.map((sku) => (
+                        <div key={sku.id} className="flex items-center justify-between gap-2 rounded-lg border border-border px-3 py-2">
+                          <p className="text-xs font-medium text-foreground truncate">{sku.name}</p>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <p className="text-xs font-bold text-foreground font-mono">
+                              {fmtINR(Number(sku.price_monthly))}<span className="text-[10px] font-normal text-muted-foreground">/mo</span>
+                            </p>
+                            <Button size="sm" variant="outline" className="h-7 px-2 text-[11px]" onClick={() => setPendingAddon(sku)}>
+                              Add
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           )}
         </section>
 

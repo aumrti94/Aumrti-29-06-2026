@@ -124,10 +124,15 @@ const PricingPage: React.FC = () => {
         // section simply does not render.
         // `as any`: addon_skus is not in the generated Database types until the
         // add-on migration is applied and types.ts regenerated.
+        // sku_type = 'bundle' only — the 58 single-module SKUs (pricing v3
+        // Phase 2b) are sold from the platform Modules-tab grid, not the
+        // public marketing page; without this filter every one of them
+        // would render here as its own card.
         const { data: skus } = await (supabase as any)
           .from("addon_skus")
           .select("id, slug, name, description, price_monthly, price_yearly, module_keys, ai_feature_keys, badge_text, sort_order")
           .eq("is_active", true)
+          .eq("sku_type", "bundle")
           .order("sort_order");
         if (skus?.length) setAddons(skus as AddonSku[]);
       } catch {

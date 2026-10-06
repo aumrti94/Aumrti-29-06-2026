@@ -4,6 +4,7 @@ import {
   addonsYearlyTotal,
   activeSkus,
   describeGrant,
+  indexSingleModuleSkus,
   type AddonSku,
   type HospitalAddon,
 } from "@/lib/addons";
@@ -110,5 +111,29 @@ describe("describeGrant", () => {
 
   it("falls back to a clear message when a SKU grants nothing", () => {
     expect(describeGrant(sku({ module_keys: null, ai_feature_keys: null }))).toBe("No additional access");
+  });
+});
+
+describe("indexSingleModuleSkus", () => {
+  it("indexes a single_module SKU by its one module key", () => {
+    const s = sku({ sku_type: "single_module", module_keys: ["lab"] });
+    expect(indexSingleModuleSkus([s]).get("lab")).toBe(s);
+  });
+
+  it("ignores a bundle SKU even if it happens to carry exactly one module key", () => {
+    // accounts_erp is a real example: sku_type 'bundle', module_keys ['accounts'].
+    // The grid must never price a Grey tile off a curated bundle's number.
+    const bundle = sku({ sku_type: "bundle", module_keys: ["accounts"] });
+    expect(indexSingleModuleSkus([bundle]).has("accounts")).toBe(false);
+  });
+
+  it("ignores a SKU with no sku_type at all (older/narrow column selects)", () => {
+    const s = sku({ module_keys: ["lab"] });
+    expect(indexSingleModuleSkus([s]).has("lab")).toBe(false);
+  });
+
+  it("skips a single_module SKU with an empty module_keys array rather than indexing it under undefined", () => {
+    const s = sku({ sku_type: "single_module", module_keys: [] });
+    expect(indexSingleModuleSkus([s]).size).toBe(0);
   });
 });
