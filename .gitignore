@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Isolated worktrees created for background agent tasks
+.claude/worktrees/
+
 # Test/coverage output. `coverage/` is live again as of 2026-09-11: `npm run test:coverage`
 # was restored for Phase 1 of docs/testing/PHASED_TEST_PLAN.md and the v8 reporter writes
 # there on every run. `playwright-report/` and `test-results/` are still produced by nothing —
