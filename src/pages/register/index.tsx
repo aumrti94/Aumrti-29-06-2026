@@ -4,6 +4,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { Check } from "lucide-react";
 import { RegistrationData, initialData } from "./constants";
+import { getHospitalTypeByKey } from "@/lib/hospitalTypes";
 import { getInvokeError } from "@/lib/errorMessage";
 import { resolvePostAuthRoute } from "@/lib/postAuthRoute";
 import { FormError } from "@/components/ui/FormError";
@@ -63,8 +64,20 @@ const Register: React.FC = () => {
 
   const canProceed = (s: number): boolean => {
     switch (s) {
-      case 0:
-        return !!(data.hospitalName && data.hospitalType && data.state && data.bedCount && data.phone && (!otpRequired || data.phoneVerified));
+      case 0: {
+        const selectedType = getHospitalTypeByKey(data.hospitalType);
+        const subSystemsOk = !selectedType?.subSystems || data.ayushSubSystems.length > 0;
+        return !!(
+          data.hospitalName &&
+          data.hospitalBroadCategory &&
+          data.hospitalType &&
+          subSystemsOk &&
+          data.state &&
+          data.bedCount &&
+          data.phone &&
+          (!otpRequired || data.phoneVerified)
+        );
+      }
       case 1:
         return !!(
           data.fullName &&

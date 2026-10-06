@@ -1,5 +1,6 @@
 import React from "react";
 import { RegistrationData, BED_COUNTS } from "./constants";
+import { getHospitalTypeLabel } from "@/lib/hospitalTypes";
 import { Checkbox } from "@/components/ui/checkbox";
 
 interface Props {
@@ -18,10 +19,15 @@ const planLabels: Record<string, string> = {
 
 const Step5Confirm: React.FC<Props> = ({ data, onChange, onEditStep, loading, onLaunch }) => {
   const bedLabel = BED_COUNTS.find((b) => b.value === data.bedCount)?.label || data.bedCount;
+  const hospitalTypeLabel = [
+    getHospitalTypeLabel(data.hospitalType),
+    data.isTeachingInstitution ? "Teaching Institution" : null,
+    data.ayushSubSystems.length > 0 ? data.ayushSubSystems.join(", ") : null,
+  ].filter(Boolean).join(" · ");
 
   const rows = [
     { label: "Hospital Name", value: data.hospitalName, step: 0 },
-    { label: "Hospital Type", value: data.hospitalType, step: 0 },
+    { label: "Hospital Type", value: hospitalTypeLabel, step: 0 },
     { label: "State", value: data.state, step: 0 },
     { label: "Beds", value: bedLabel, step: 0 },
     { label: "Admin Name", value: data.fullName, step: 1 },

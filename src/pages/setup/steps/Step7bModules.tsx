@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { LayoutGrid } from "lucide-react";
+import { getHospitalTypeByKey, resolveModuleBuckets } from "@/lib/hospitalTypes";
 
 interface Module {
   key: string;
@@ -30,16 +31,46 @@ const DEFAULT_MODULES: Module[] = [
   { key: "inbox",       label: "Inbox",              description: "Internal messaging and clinical notifications",   enabled: true },
 ];
 
-// Sensible starting module sets keyed by the hospital_category captured at signup.
-// These are DEFAULTS the user can still toggle — full hospitals (Private/Government/
-// Trust/Corporate/Other) fall through to "all modules on".
-const CATEGORY_PRESETS: Record<string, string[]> = {
-  "Clinic":           ["opd", "pharmacy", "lab", "billing", "inventory", "patient_portal", "inbox"],
-  "Dental Clinic":    ["opd", "pharmacy", "billing", "inventory", "patient_portal", "inbox"],
-  "AYUSH Center":     ["opd", "pharmacy", "billing", "inventory", "patient_portal", "inbox"],
-  "Specialty Center": ["opd", "lab", "radiology", "pharmacy", "billing", "insurance", "inventory", "analytics", "patient_portal", "inbox"],
-  "Nursing Home":     ["opd", "ipd", "pharmacy", "lab", "billing", "inventory", "hr", "patient_portal", "inbox"],
+// Sensible starting module sets, derived from the Core bucket of the hospital type captured at
+// signup (src/lib/hospitalTypes.ts — the single source of truth; do not reintroduce a second,
+// local preset list here). Only modules this step actually toggles have a short key below — a
+// hospital type's finer-grained specialty modules (e.g. "Dialysis Unit") have no entry and are
+// silently skipped, matching this step's existing fixed module set.
+const MODULE_NAME_TO_KEY: Record<string, string> = {
+  "OPD Queue": "opd",
+  "IPD / Wards": "ipd",
+  "Emergency": "emergency",
+  "Operation Theatre": "ot",
+  "Pharmacy (IP)": "pharmacy",
+  "Pharmacy Retail": "pharmacy",
+  "Laboratory (LIS)": "lab",
+  "Radiology (RIS)": "radiology",
+  "Billing": "billing",
+  "Insurance / TPA": "insurance",
+  "HR & Payroll": "hr",
+  "Inventory & Stores": "inventory",
+  "Quality & NABH": "quality",
+  "Analytics & BI": "analytics",
+  "Patient Portal": "patient_portal",
+  "Telemedicine": "telemedicine",
+  "HOD Dashboard": "hod_dashboard",
+  "Communication Inbox": "inbox",
 };
+
+/** Resolves a stored `hospitals.hospital_category` value (new granular key, or legacy free-text
+ *  label) to the short module keys this step toggles, or undefined if there's no match (falls
+ *  through to "all modules on" below). */
+function presetKeysForHospitalCategory(categoryOrKey: string | null): string[] | undefined {
+  const type = getHospitalTypeByKey(categoryOrKey);
+  if (!type) return undefined;
+  const { core } = resolveModuleBuckets(type, false);
+  const keys = new Set<string>();
+  for (const name of core) {
+    const key = MODULE_NAME_TO_KEY[name];
+    if (key) keys.add(key);
+  }
+  return keys.size > 0 ? Array.from(keys) : undefined;
+}
 
 interface Props {
   hospitalId: string;
@@ -65,9 +96,9 @@ const Step7bModules: React.FC<Props> = ({ hospitalId, onComplete, onSkip }) => {
         .maybeSingle();
       if (cancelled) return;
       const category = (data as any)?.hospital_category as string | null;
-      const preset = category ? CATEGORY_PRESETS[category] : undefined;
+      const preset = presetKeysForHospitalCategory(category);
       if (preset) {
-        setPresetCategory(category);
+        setPresetCategory(getHospitalTypeByKey(category)?.label ?? category);
         setModules((prev) => prev.map((m) => ({ ...m, enabled: preset.includes(m.key) })));
       }
     })();
