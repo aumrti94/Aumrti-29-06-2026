@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
-import { Check, X, Loader2, MessageCircle, Mail } from "lucide-react";
+import { Check, X, Loader2, MessageCircle, Mail, Sparkles } from "lucide-react";
 import { RegistrationData, SALES_WHATSAPP, SALES_EMAIL } from "./constants";
+import { getHospitalTypeByKey } from "@/lib/hospitalTypes";
 
 interface Props {
   data: RegistrationData;
@@ -133,6 +134,27 @@ const Step4ChoosePlan: React.FC<Props> = ({ data, onChange }) => {
   const [leadMessage, setLeadMessage] = useState("");
   const [detailPlan, setDetailPlan] = useState<DbPlan | null>(null);
 
+  // Best-guess plan suggestion from the hospital type picked in Step 1 (src/lib/hospitalTypes.ts).
+  // SUGGESTION ONLY — every plan below stays fully clickable regardless of this value; the
+  // founder was explicit that over-filtering risks losing an edge-case hospital that doesn't fit
+  // the mould. If the hospital type has no suggestion, or the suggested slug isn't among the
+  // live active plans, this is simply undefined and nothing is highlighted.
+  const selectedHospitalType = getHospitalTypeByKey(data.hospitalType);
+  const recommendedSlug = selectedHospitalType?.defaultPlanSlug;
+
+  // Pre-select the recommended plan once, the first time plans have loaded — but only if the
+  // admin hasn't already picked one (never clobber a manual choice, including "going back" to
+  // this step after picking something else).
+  const autoSelectedRef = useRef(false);
+  useEffect(() => {
+    if (autoSelectedRef.current) return;
+    if (loading || !recommendedSlug || data.plan) return;
+    if (!plans.some((p) => p.slug === recommendedSlug)) return;
+    autoSelectedRef.current = true;
+    onChange({ plan: recommendedSlug as any });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, plans, recommendedSlug]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -223,13 +245,16 @@ const Step4ChoosePlan: React.FC<Props> = ({ data, onChange }) => {
           const selected = data.plan === plan.slug;
           const highlights = (plan.feature_highlights?.length ? plan.feature_highlights : PLAN_HIGHLIGHTS[plan.slug]) || [];
           const isMostPopular = plan.badge_text === "Most Popular";
+          // Suggestion only — never hides or disables any other card (see founder's explicit
+          // call against over-filtering, which could lose an edge-case hospital type).
+          const isRecommended = !!recommendedSlug && plan.slug === recommendedSlug;
 
           return (
             <div
               key={plan.id}
               role="radio"
               aria-checked={selected}
-              aria-label={`${plan.name} plan`}
+              aria-label={`${plan.name} plan${isRecommended ? " (recommended)" : ""}`}
               tabIndex={0}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
@@ -242,6 +267,8 @@ const Step4ChoosePlan: React.FC<Props> = ({ data, onChange }) => {
               } ${
                 selected
                   ? "border-primary shadow-[0_2px_12px_rgba(26,47,90,0.12)]"
+                  : isRecommended
+                  ? "border-[hsl(160,84%,39%)]/60 shadow-[0_2px_10px_rgba(16,185,129,0.15)]"
                   : "border-border hover:border-primary/40"
               }`}
               onClick={() => onChange({ plan: plan.slug as any })}
@@ -255,7 +282,19 @@ const Step4ChoosePlan: React.FC<Props> = ({ data, onChange }) => {
                 </div>
               )}
 
-              <p className="text-sm font-semibold text-foreground mt-2">{plan.name}</p>
+              {/* Recommended-for-hospital-type pill — a suggestion, never a filter. Shown
+                  alongside plan.badge_text (e.g. "Most Popular") rather than replacing it. */}
+              {isRecommended && selectedHospitalType && (
+                <div
+                  title={`Recommended for ${selectedHospitalType.label}`}
+                  className="inline-flex items-center gap-1 max-w-full text-[10px] font-semibold text-[hsl(160,84%,30%)] bg-[hsl(160,84%,39%)]/10 border border-[hsl(160,84%,39%)]/30 px-2 py-0.5 rounded-full mt-2"
+                >
+                  <Sparkles size={10} className="shrink-0" />
+                  <span className="truncate">Recommended for {selectedHospitalType.label}</span>
+                </div>
+              )}
+
+              <p className={`text-sm font-semibold text-foreground ${isRecommended && selectedHospitalType ? "mt-1.5" : "mt-2"}`}>{plan.name}</p>
 
               {/* Price */}
               <div className="mt-2">
