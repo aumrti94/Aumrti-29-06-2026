@@ -1,0 +1,1463 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { autoChargeService, MODULE_ED, getEdChargeRate, getEdItemRate, recordUnbilledService } from "@/lib/serviceBilling";
+import { useNavigate } from "react-router-dom";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Button } from "@/components/ui/button";
+import { toast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
+import { ExternalLink, Mic, FileText, Bot, Loader2, X, FlaskConical, ScanLine } from "lucide-react";
+import AIAttestationModal from "@/components/ai/AIAttestationModal";
+import { printDocument, printHeader } from "@/lib/printUtils";
+import { useVoiceScribe } from "@/hooks/useVoiceScribe";
+import VoiceDictationButton from "@/components/voice/VoiceDictationButton";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle, AlertDialogDescription, AlertDialogFooter, AlertDialogAction, AlertDialogCancel } from "@/components/ui/alert-dialog";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import AdmitPatientModal from "@/components/ipd/AdmitPatientModal";
+import NewLabOrderModal from "@/components/lab/NewLabOrderModal";
+import NewRadiologyOrderModal from "@/components/radiology/NewRadiologyOrderModal";
+import BookOTModal from "@/components/ot/BookOTModal";
+import EDChargesPanel from "@/components/emergency/EDChargesPanel";
+import EDDischargeSummaryModal from "@/components/emergency/EDDischargeSummaryModal";
+import ReferralLetterModal from "@/components/opd/ReferralLetterModal";
+import AdvanceReceiptModal from "@/components/billing/AdvanceReceiptModal";
+import EDMedicationPanel from "@/components/emergency/EDMedicationPanel";
+import EDHandoverNotePanel from "@/components/emergency/EDHandoverNotePanel";
+import ConsentSignatureModal from "@/components/consent/ConsentSignatureModal";
+import { routeEdPatientToMortuary } from "@/lib/edMortuary";
+import { calculateNEWS2, getNEWS2BadgeClasses, getNEWS2Label } from "@/lib/news2";
+import type { OTRoom } from "@/pages/ot/OTPage";
+import type { EDVisit } from "@/pages/emergency/EmergencyPage";
+
+interface Props {
+  visit: EDVisit | null;
+  hospitalId: string | null;
+  userId: string | null;
+  onRefresh: () => void;
+}
+
+const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefresh }) => {
+  const navigate = useNavigate();
+  const { registerScreen, unregisterScreen } = useVoiceScribe();
+  const [vitals, setVitals] = useState({ bp_s: "", bp_d: "", pulse: "", spo2: "", gcs: "", rr: "", temp: "" });
+  const [treatingDoctor, setTreatingDoctor] = useState<string | null>(null);
+  const [complaint, setComplaint] = useState("");
+  const [ample, setAmple] = useState({ a: "", m: "", p: "", l: "", e: "" });
+  const [diagnosis, setDiagnosis] = useState("");
+  const [mlc, setMlc] = useState(false);
+  const [mlcDetails, setMlcDetails] = useState({ police_station: "", officer: "", fir: "", injury_type: "" });
+  const [savingVitals, setSavingVitals] = useState(false);
+  const [triageSuggestion, setTriageSuggestion] = useState<string | null>(null);
+  const [dispositionSuggestion, setDispositionSuggestion] = useState<string | null>(null);
+  const [investigationsSuggested, setInvestigationsSuggested] = useState<string[]>([]);
+  // AI Triage Assist
+  const [aiTriageResult, setAiTriageResult] = useState<Record<string, any> | null>(null);
+  const [aiTriageLoading, setAiTriageLoading] = useState(false);
+  const [showTriagePanel, setShowTriagePanel] = useState(false);
+  const [showTriageAttestation, setShowTriageAttestation] = useState(false);
+
+  // Modal states
+  const [showAdmitModal, setShowAdmitModal] = useState(false);
+  const [showLabModal, setShowLabModal] = useState(false);
+  const [showRadModal, setShowRadModal] = useState(false);
+  const [radModalities, setRadModalities] = useState<{ id: string; name: string; modality_type: string; is_active: boolean }[]>([]);
+  const [showBloodDialog, setShowBloodDialog] = useState(false);
+  const [showSpecialistDialog, setShowSpecialistDialog] = useState(false);
+  const [showDischargeConfirm, setShowDischargeConfirm] = useState(false);
+  const [showMlcDialog, setShowMlcDialog] = useState(false);
+  const [showOTModal, setShowOTModal] = useState(false);
+  const [otRooms, setOtRooms] = useState<OTRoom[]>([]);
+
+  // Blood request state
+  const [bloodGroup, setBloodGroup] = useState("");
+  const [bloodComponent, setBloodComponent] = useState("PRBCs");
+  const [bloodUnits, setBloodUnits] = useState("1");
+  const [bloodUrgent, setBloodUrgent] = useState(true);
+  const [bloodSubmitting, setBloodSubmitting] = useState(false);
+
+  // Specialist state
+  const [specialistDept, setSpecialistDept] = useState("");
+  const [specialistReason, setSpecialistReason] = useState("");
+  const [specialistSubmitting, setSpecialistSubmitting] = useState(false);
+  const [departments, setDepartments] = useState<{ id: string; name: string }[]>([]);
+  const [billConsult, setBillConsult] = useState(false);
+  const [consultRate, setConsultRate] = useState<{ fee: number; gstPct: number }>({ fee: 0, gstPct: 0 });
+
+  // ED billing summary for the Charges panel.
+  // total = casualty fee; itemizedTotal / itemizedBillId = itemized ED charges (ed_charge_items).
+  const [edBilling, setEdBilling] = useState<{ status: string; billId: string | null; total: number; itemizedTotal: number; itemizedBillId: string | null }>(
+    { status: "unbilled", billId: null, total: 0, itemizedTotal: 0, itemizedBillId: null }
+  );
+  const [showChargesPanel, setShowChargesPanel] = useState(false);
+  const [showDischargeSummary, setShowDischargeSummary] = useState(false);
+  const [showDeposit, setShowDeposit] = useState(false);
+  const [showMedications, setShowMedications] = useState(false);
+  const [showHandoverNote, setShowHandoverNote] = useState(false);
+  const [showConsent, setShowConsent] = useState(false);
+  // ED bill balance surfaced in the discharge dialog (settlement prompt)
+  const [edBillInfo, setEdBillInfo] = useState<{ id: string; balance: number } | null>(null);
+  // Advisory-only unbilled ancillary services (lab/radiology/pharmacy) for this ED visit,
+  // surfaced in the discharge dialog. Never blocks discharge — informational, matching
+  // IPD's PreDischargeLeakageBanner.
+  const [edUnbilled, setEdUnbilled] = useState<{ type: string; count: number }[]>([]);
+  // Additional dispositions (LAMA/DAMA/LWBS/absconded/referred-out)
+  const [pendingDisp, setPendingDisp] = useState<string | null>(null);
+  const [showReferralModal, setShowReferralModal] = useState(false);
+  const [referralUhid, setReferralUhid] = useState("");
+  const [dispKey, setDispKey] = useState(0);
+
+  // ED lab results-return (lab plan Phase 10). ED can order STAT labs but never saw
+  // results back; the timeline "Investigation" step was hardcoded empty. Fetch this
+  // visit's lab orders (patient's orders since arrival) + realtime updates.
+  const [edLabs, setEdLabs] = useState<Array<{ id: string; status: string; accession: string | null; items: Array<{ test_name: string; result_value: string | null; result_unit: string | null; result_flag: string | null; status: string }> }>>([]);
+
+  const loadEdLabs = useCallback(async () => {
+    if (!visit?.patient_id || !hospitalId) { setEdLabs([]); return; }
+    const { data } = await (supabase as any)
+      .from("lab_orders")
+      .select(`id, status, accession_number, order_time,
+        lab_order_items(result_value, result_unit, result_flag, status,
+          lab_test_master:lab_test_master!lab_order_items_test_id_fkey(test_name))`)
+      .eq("hospital_id", hospitalId)
+      .eq("patient_id", visit.patient_id)
+      .gte("order_time", visit.arrival_time)
+      .neq("status", "cancelled")
+      .order("order_time", { ascending: false });
+    setEdLabs((data || []).map((o: any) => ({
+      id: o.id,
+      status: o.status,
+      accession: o.accession_number,
+      items: (o.lab_order_items || []).map((i: any) => ({
+        test_name: i.lab_test_master?.test_name || "—",
+        result_value: i.result_value,
+        result_unit: i.result_unit,
+        result_flag: i.result_flag,
+        status: i.status,
+      })),
+    })));
+  }, [visit?.patient_id, visit?.arrival_time, hospitalId]);
+
+  useEffect(() => { loadEdLabs(); }, [loadEdLabs]);
+
+  useEffect(() => {
+    if (!hospitalId || !visit?.patient_id) return;
+    const channel = supabase
+      .channel(`ed-labs-${visit.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "lab_order_items", filter: `hospital_id=eq.${hospitalId}` }, () => loadEdLabs())
+      .on("postgres_changes", { event: "*", schema: "public", table: "lab_orders", filter: `hospital_id=eq.${hospitalId}` }, () => loadEdLabs())
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [hospitalId, visit?.id, visit?.patient_id, loadEdLabs]);
+
+  const edLabsHasResults = edLabs.some(o => o.status !== "ordered");
+  const edLabsHasCritical = edLabs.some(o => o.items.some(i => i.result_flag === "CH" || i.result_flag === "CL"));
+
+  // ED radiology results-return (Radiology completion plan Phase 2, mirrors edLabs above).
+  // ED can order STAT radiology but the "Imaging" timeline step needs its own fetch since
+  // ED visits have no encounter FK that radiology_orders can join against — same
+  // patient_id + order_time-since-arrival heuristic as loadEdLabs.
+  const [edRads, setEdRads] = useState<Array<{ id: string; status: string; accession: string | null; study_name: string; report: { findings: string | null; impression: string | null; is_critical: boolean | null; is_signed: boolean | null } | null }>>([]);
+
+  const loadEdRads = useCallback(async () => {
+    if (!visit?.patient_id || !hospitalId) { setEdRads([]); return; }
+    const { data } = await (supabase as any)
+      .from("radiology_orders")
+      .select(`id, status, accession_number, study_name, order_time,
+        radiology_reports(findings, impression, is_critical, is_signed)`)
+      .eq("hospital_id", hospitalId)
+      .eq("patient_id", visit.patient_id)
+      .gte("order_time", visit.arrival_time)
+      .neq("status", "cancelled")
+      .order("order_time", { ascending: false });
+    setEdRads((data || []).map((o: any) => ({
+      id: o.id,
+      status: o.status,
+      accession: o.accession_number,
+      study_name: o.study_name,
+      report: Array.isArray(o.radiology_reports) ? (o.radiology_reports[0] || null) : (o.radiology_reports || null),
+    })));
+  }, [visit?.patient_id, visit?.arrival_time, hospitalId]);
+
+  useEffect(() => { loadEdRads(); }, [loadEdRads]);
+
+  useEffect(() => {
+    if (!hospitalId || !visit?.patient_id) return;
+    const channel = supabase
+      .channel(`ed-rads-${visit.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "radiology_reports", filter: `hospital_id=eq.${hospitalId}` }, () => loadEdRads())
+      .on("postgres_changes", { event: "*", schema: "public", table: "radiology_orders", filter: `hospital_id=eq.${hospitalId}` }, () => loadEdRads())
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [hospitalId, visit?.id, visit?.patient_id, loadEdRads]);
+
+  const edRadsHasResults = edRads.some(o => o.status === "reported" || o.status === "validated");
+  const edRadsHasCritical = edRads.some(o => o.report?.is_critical);
+
+  // Active radiology modalities for the STAT Radiology order modal (loaded eagerly so the
+  // modal opens instantly, mirroring RadiologyPage.tsx's own fetch).
+  const loadRadModalities = useCallback(async () => {
+    if (!hospitalId) { setRadModalities([]); return; }
+    const { data } = await supabase
+      .from("radiology_modalities")
+      .select("*")
+      .eq("hospital_id", hospitalId)
+      .eq("is_active", true)
+      .order("name");
+    setRadModalities((data as any) || []);
+  }, [hospitalId]);
+
+  useEffect(() => { loadRadModalities(); }, [loadRadModalities]);
+
+  const loadEdCharges = useCallback(async () => {
+    if (!visit?.id || !hospitalId) {
+      setEdBilling({ status: "unbilled", billId: null, total: 0, itemizedTotal: 0, itemizedBillId: null });
+      return;
+    }
+    const { data: v } = await supabase.from("ed_visits").select("billing_status, bill_id").eq("id", visit.id).maybeSingle();
+    let total = 0;
+    const billId = (v as any)?.bill_id ?? null;
+    if (billId) {
+      const { data: items } = await (supabase as any).from("bill_line_items")
+        .select("total_amount").eq("bill_id", billId).eq("source_record_id", visit.id).eq("source_module", MODULE_ED);
+      total = (items || []).reduce((s: number, i: any) => s + Number(i.total_amount || 0), 0);
+    }
+    // Itemized ED charges (procedures / observation / consumables / consults).
+    const { data: charges } = await (supabase as any).from("ed_charge_items")
+      .select("quantity, unit_rate, gst_percent, bill_id").eq("ed_visit_id", visit.id);
+    const itemizedTotal = (charges || []).reduce((s: number, c: any) => {
+      const taxable = Number(c.quantity || 0) * Number(c.unit_rate || 0);
+      return s + taxable + (taxable * (Number(c.gst_percent) || 0)) / 100;
+    }, 0);
+    const itemizedBillId = (charges || []).find((c: any) => c.bill_id)?.bill_id ?? null;
+    setEdBilling({ status: (v as any)?.billing_status ?? "unbilled", billId, total, itemizedTotal, itemizedBillId });
+  }, [visit?.id, hospitalId]);
+
+  useEffect(() => { loadEdCharges(); }, [loadEdCharges]);
+
+  // Resolve the treating doctor's name for display.
+  useEffect(() => {
+    if (!visit?.doctor_id) { setTreatingDoctor(null); return; }
+    supabase.from("users").select("full_name").eq("id", visit.doctor_id).maybeSingle()
+      .then(({ data }) => setTreatingDoctor((data as any)?.full_name || null));
+  }, [visit?.doctor_id]);
+
+  // When the discharge dialog opens, fetch the ED bill balance for the settlement prompt.
+  useEffect(() => {
+    if (!showDischargeConfirm || !visit?.id) { setEdBillInfo(null); return; }
+    (supabase as any).from("bills")
+      .select("id, balance_due").eq("ed_visit_id", visit.id).eq("bill_type", "emergency")
+      .order("created_at", { ascending: false }).limit(1).maybeSingle()
+      .then(({ data }: any) => setEdBillInfo(data ? { id: data.id, balance: Number(data.balance_due || 0) } : null));
+  }, [showDischargeConfirm, visit?.id]);
+
+  // When the discharge dialog opens, advisory-check for unbilled ancillary services
+  // (lab/radiology/pharmacy) from this ED visit. ED visits have no FK those tables can
+  // join against, so this reuses the same patient_id + order_time-since-arrival heuristic
+  // as loadEdLabs/loadEdRads above. Non-blocking — informational only.
+  useEffect(() => {
+    if (!showDischargeConfirm || !visit?.patient_id || !hospitalId) { setEdUnbilled([]); return; }
+    (async () => {
+      const [{ data: labs }, { data: rads }, { data: pharm }] = await Promise.all([
+        (supabase as any).from("lab_orders").select("id")
+          .eq("hospital_id", hospitalId).eq("patient_id", visit.patient_id)
+          .gte("order_time", visit.arrival_time).neq("status", "cancelled").eq("billed", false),
+        (supabase as any).from("radiology_orders").select("id")
+          .eq("hospital_id", hospitalId).eq("patient_id", visit.patient_id)
+          .gte("order_time", visit.arrival_time).neq("status", "cancelled").eq("billed", false),
+        (supabase as any).from("pharmacy_dispensing").select("id")
+          .eq("hospital_id", hospitalId).eq("patient_id", visit.patient_id)
+          .gte("dispensed_at", visit.arrival_time).eq("billed", false),
+      ]);
+      const items: { type: string; count: number }[] = [];
+      if ((labs || []).length) items.push({ type: "Lab", count: labs.length });
+      if ((rads || []).length) items.push({ type: "Radiology", count: rads.length });
+      if ((pharm || []).length) items.push({ type: "Pharmacy", count: pharm.length });
+      setEdUnbilled(items);
+    })();
+  }, [showDischargeConfirm, visit?.patient_id, visit?.arrival_time, hospitalId]);
+
+  // Load departments for specialist dialog + configured in-ED specialist consult rate
+  useEffect(() => {
+    if (!hospitalId) return;
+    supabase.from("departments").select("id, name").eq("hospital_id", hospitalId).eq("is_active", true).order("name")
+      .then(({ data }) => setDepartments(data || []));
+    getEdItemRate(hospitalId, "ed_specialist_consult").then(setConsultRate);
+  }, [hospitalId]);
+
+  // Load OT rooms for refer-to-OT modal
+  useEffect(() => {
+    if (!hospitalId) return;
+    supabase.from("ot_rooms").select("id, name, type").eq("hospital_id", hospitalId).eq("is_active", true).order("name")
+      .then(({ data }) => setOtRooms((data as OTRoom[]) || []));
+  }, [hospitalId]);
+
+  // Latest-ref for `visit`: these effects re-seed the form when a DIFFERENT visit
+  // is opened, keyed on its id. Depending on the object itself would re-seed —
+  // wiping in-progress edits — every time a refetch returned an equal object.
+  const visitRef = useRef(visit);
+  useEffect(() => { visitRef.current = visit; });
+  const visitId = visit?.id;
+  const visitTriageCategory = visit?.triage_category;
+
+  // Load data when visit changes
+  useEffect(() => {
+    const visit = visitRef.current;
+    if (!visit) return;
+    setComplaint(visit.chief_complaint || "");
+    setDiagnosis(visit.working_diagnosis || "");
+    setMlc(visit.mlc);
+    setMlcDetails(visit.mlc_details as any || { police_station: "", officer: "", fir: "", injury_type: "" });
+    setAmple(visit.ample_history as any || { a: "", m: "", p: "", l: "", e: "" });
+    const vs = visit.vitals_snapshot || {};
+    setVitals({ bp_s: vs.bp_s || "", bp_d: vs.bp_d || "", pulse: vs.pulse || "", spo2: vs.spo2 || "", gcs: vs.gcs || "", rr: vs.rr || "", temp: vs.temp || "" });
+    setTriageSuggestion(null);
+    setDispositionSuggestion(null);
+    setInvestigationsSuggested([]);
+  }, [visitId]);
+
+  // Register screen for voice scribe
+  useEffect(() => {
+    const fillFn = (data: Record<string, unknown>) => {
+      if (data.presenting_complaint) setComplaint(data.presenting_complaint as string);
+      if (data.working_diagnosis) setDiagnosis(data.working_diagnosis as string);
+
+      const vd = data.vitals_detected as Record<string, string> | undefined;
+      if (vd) {
+        setVitals(prev => ({
+          bp_s: vd.bp_systolic || prev.bp_s,
+          bp_d: vd.bp_diastolic || prev.bp_d,
+          pulse: vd.pulse || prev.pulse,
+          spo2: vd.spo2 || prev.spo2,
+          gcs: vd.gcs || prev.gcs,
+          rr: vd.respiratory_rate || vd.rr || prev.rr,
+          temp: vd.temperature || vd.temp || prev.temp,
+        }));
+      }
+
+      const amp = data.ample as Record<string, string> | undefined;
+      if (amp) {
+        setAmple(prev => ({
+          a: amp.allergies || prev.a,
+          m: amp.medications || prev.m,
+          p: amp.past_history || prev.p,
+          l: amp.last_meal || prev.l,
+          e: amp.events || prev.e,
+        }));
+      } else if (data.history) {
+        setAmple(prev => ({ ...prev, e: data.history as string }));
+      }
+
+      if (data.triage_category && visitRef.current) {
+        const suggested = data.triage_category as string;
+        if (suggested !== visitRef.current.triage_category) setTriageSuggestion(suggested);
+      }
+      if (data.disposition) setDispositionSuggestion(data.disposition as string);
+      if (Array.isArray(data.investigations_ordered) && data.investigations_ordered.length > 0) {
+        setInvestigationsSuggested(data.investigations_ordered as string[]);
+      }
+    };
+    registerScreen("emergency", fillFn);
+    return () => unregisterScreen("emergency");
+  }, [registerScreen, unregisterScreen, visitTriageCategory, visitId]);
+
+  if (!visit) {
+    return (
+      <div className="h-full flex items-center justify-center" style={{ background: "#1E293B", borderTop: "1px solid #334155" }}>
+        <p className="text-slate-500 text-sm">↑ Select a patient from the triage board</p>
+      </div>
+    );
+  }
+
+  const losMinutes = visit.minutes_ago;
+  const losColor = losMinutes < 120 ? "text-emerald-400" : losMinutes < 240 ? "text-amber-400" : "text-red-400";
+  const losText = losMinutes < 60 ? `${losMinutes}m` : `${Math.floor(losMinutes / 60)}h ${losMinutes % 60}m`;
+
+  const mapUrgencyToTriage = (urgency: string): string => {
+    if (urgency === "emergent") return "P1";
+    if (urgency === "urgent") return "P2";
+    return "P3";
+  };
+
+  const handleAITriageAssist = async () => {
+    if (!visit || !hospitalId) return;
+    setAiTriageLoading(true);
+    try {
+      const start = Date.now();
+      const { data, error } = await supabase.functions.invoke("ai-differential-diagnosis", {
+        body: {
+          chief_complaint: complaint || visit.chief_complaint || "Unknown",
+          vitals: {
+            bp_systolic: vitals.bp_s || null,
+            bp_diastolic: vitals.bp_d || null,
+            pulse: vitals.pulse || null,
+            spo2: vitals.spo2 || null,
+            gcs: vitals.gcs || null,
+          },
+          history: `AMPLE — Allergies: ${ample.a || "none"} | Medications: ${ample.m || "none"} | Past Hx: ${ample.p || "none"} | Last meal: ${ample.l || "unknown"} | Events: ${ample.e || "none"}`,
+          patient_context: `Emergency triage. Current triage category: ${visit.triage_category}. Please also suggest the appropriate triage priority (P1=Immediate/emergent, P2=Urgent, P3=Delayed, P4=Minor) with rationale, and list any red flag symptoms that must be acted on immediately.`,
+        },
+      });
+      if (error) throw new Error(error.message);
+      setAiTriageResult(data);
+      setShowTriagePanel(true);
+
+      await (supabase as any).from("ai_feature_logs").insert({
+        hospital_id: hospitalId,
+        patient_id: visit.patient_id,
+        module: "emergency",
+        feature_key: "triage_assist",
+        success: true,
+        input_summary: `ED Visit ${visit.id} | CC: ${(complaint || visit.chief_complaint || "").slice(0, 80)}`,
+        output_summary: `Urgency: ${data?.overall_urgency || "unknown"} | Top Dx: ${data?.differentials?.[0]?.diagnosis || "—"}`,
+        latency_ms: Date.now() - start,
+      });
+    } catch (e: any) {
+      toast({ title: "AI Triage failed", description: e.message, variant: "destructive" });
+    } finally {
+      setAiTriageLoading(false);
+    }
+  };
+
+  const saveVitals = async () => {
+    setSavingVitals(true);
+    await supabase.from("ed_visits").update({ vitals_snapshot: vitals, gcs_score: vitals.gcs ? parseInt(vitals.gcs) : null }).eq("id", visit.id);
+    setSavingVitals(false);
+    toast({ title: "Vitals saved" });
+  };
+
+  // NEWS2 Early Warning Score — computed from the entered vitals (reuses lib/news2).
+  // Plain computation (not a hook) so it is safe below the early return above.
+  const news2Score = computeEdNews2(vitals);
+
+  // Assign the current user as the treating doctor (ed_visits.doctor_id → users.id).
+  const assignToMe = async () => {
+    if (!userId) return;
+    const { data: ud } = await supabase.from("users").select("id").eq("auth_user_id", userId).maybeSingle();
+    if (!ud?.id) { toast({ title: "Could not resolve your staff record", variant: "destructive" }); return; }
+    await supabase.from("ed_visits").update({ doctor_id: ud.id }).eq("id", visit.id);
+    toast({ title: "Assigned to you" });
+    onRefresh();
+  };
+
+  const saveField = async (field: string, value: any) => {
+    await supabase.from("ed_visits").update({ [field]: value } as any).eq("id", visit.id);
+  };
+
+  const handleDisposition = async (disp: string) => {
+    // Terminal dispositions close the visit (remove from the active board). "admitted" and
+    // "expired" keep their prior behaviour (unchanged). New: lama/dama/lwbs/absconded/referred_out.
+    const TERMINAL = ["discharged", "lama", "dama", "lwbs", "absconded", "referred_out"];
+    await supabase.from("ed_visits").update({
+      disposition: disp,
+      disposition_time: new Date().toISOString(),
+      is_active: TERMINAL.includes(disp) ? false : true,
+    }).eq("id", visit.id);
+
+    // Auto-create mortuary admission for expired patients
+    if ((disp === "expired" || disp === "deceased") && hospitalId && visit) {
+      const { bodyNumber } = await routeEdPatientToMortuary({
+        hospitalId,
+        patientId: visit.patient_id,
+        pronouncedBy: userId,
+        cause: visit.chief_complaint,
+        isMlc: mlc || false,
+        mlcDetails: { police_station: mlcDetails.police_station, officer: mlcDetails.officer, fir: mlcDetails.fir },
+      });
+      toast({ title: `Mortuary admission created — Body No: ${bodyNumber}` });
+    }
+
+    // Auto-bill the configured Casualty / Emergency fee when the patient was treated:
+    // discharge, admission, or leaving against advice (LAMA/DAMA) — a service was rendered.
+    // LWBS / absconded / referred_out do NOT trigger the casualty fee here.
+    // On admit, the fee is appended to the patient's IPD bill; otherwise it forms an ED bill.
+    // Idempotent via ed_visits.billing_status (no double charge). If no fee is configured (₹0),
+    // nothing is billed — same as before this feature.
+    if (["discharged", "admitted", "lama", "dama"].includes(disp) && hospitalId && visit.patient_id) {
+      const { fee, gstPct } = await getEdChargeRate(hospitalId);
+      if (fee > 0) {
+        let admissionId: string | null = null;
+        if (disp === "admitted") {
+          const { data: adm } = await supabase.from("admissions")
+            .select("id")
+            .eq("hospital_id", hospitalId)
+            .eq("patient_id", visit.patient_id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          admissionId = adm?.id ?? null;
+        }
+        try {
+          await autoChargeService({
+            hospitalId,
+            patientId:     visit.patient_id,
+            admissionId,                              // set → append to IPD bill
+            encounterId:   admissionId ? null : visit.id,
+            serviceName:   "Casualty / Emergency Fee",
+            serviceModule: MODULE_ED,
+            sourceTable:   "ed_visits",
+            sourceId:      visit.id,
+            unitRate:      fee,
+            gstPercent:    gstPct,
+            performedBy:   userId,
+            serviceDate:   new Date().toISOString().split("T")[0],
+          });
+          toast({ title: "Emergency charge billed", description: `Casualty fee ₹${fee.toLocaleString("en-IN")} added to the ${admissionId ? "IPD" : "ED"} bill.` });
+        } catch {
+          toast({ title: "Could not bill the emergency charge", variant: "destructive" });
+        }
+        loadEdCharges();
+      } else if (disp !== "admitted") {
+        // No casualty fee configured — preserve prior behaviour: flag for the leakage dashboard.
+        recordUnbilledService({
+          hospitalId,
+          patientId:     visit.patient_id,
+          serviceModule: MODULE_ED,
+          serviceRefId:  visit.id,
+          serviceName:   "Emergency Department visit",
+          notes:         "Casualty fee not configured in Services & Fees — manual billing required",
+        }).catch(() => {});
+      }
+    }
+
+    toast({ title: `Patient ${disp.replace(/_/g, " ")}` });
+    onRefresh();
+  };
+
+  // Open the referral letter for a transfer-out (uhid needed by the letter).
+  const openReferral = async () => {
+    const { data } = await supabase.from("patients").select("uhid").eq("id", visit.patient_id).maybeSingle();
+    setReferralUhid((data as any)?.uhid || "");
+    setShowReferralModal(true);
+  };
+
+  const handleDispSelect = (v: string) => {
+    if (v === "referred_out") openReferral();
+    else setPendingDisp(v);
+  };
+
+  const handleBloodRequest = async () => {
+    if (!hospitalId || !visit) return;
+    setBloodSubmitting(true);
+    try {
+      await supabase.from("clinical_alerts").insert({
+        hospital_id: hospitalId,
+        alert_type: "blood_request",
+        severity: bloodUrgent ? "critical" : "high",
+        alert_message: `🩸 Blood Request: ${bloodUnits} unit(s) ${bloodComponent}${bloodGroup ? ` (${bloodGroup})` : ""} for ${visit.patient_name}`,
+        patient_id: visit.patient_id,
+      });
+      toast({ title: "✓ Blood request sent", description: `${bloodUnits} unit(s) ${bloodComponent} requested` });
+      setShowBloodDialog(false);
+    } catch (err: any) {
+      toast({ title: "Failed to send blood request", variant: "destructive" });
+    } finally {
+      setBloodSubmitting(false);
+    }
+  };
+
+  const handleSpecialistCall = async () => {
+    if (!hospitalId || !visit || !specialistDept) return;
+    setSpecialistSubmitting(true);
+    try {
+      const deptName = departments.find(d => d.id === specialistDept)?.name || specialistDept;
+      await supabase.from("clinical_alerts").insert({
+        hospital_id: hospitalId,
+        alert_type: "specialist_consult",
+        severity: "high",
+        alert_message: `📟 Specialist consult requested: ${deptName} for ${visit.patient_name}. Reason: ${specialistReason || "Emergency consultation"}`,
+        patient_id: visit.patient_id,
+      });
+
+      // Optional: bill the in-ED specialist consult fee (off by default; itemized ED charge).
+      if (billConsult && consultRate.fee > 0) {
+        try {
+          const { data: row } = await (supabase as any).from("ed_charge_items").insert({
+            hospital_id:  hospitalId,
+            ed_visit_id:  visit.id,
+            patient_id:   visit.patient_id,
+            description:  `Specialist Consult — ${deptName}`,
+            category:     "consult",
+            quantity:     1,
+            unit_rate:    consultRate.fee,
+            gst_percent:  consultRate.gstPct,
+            performed_by: userId,
+          }).select("id").maybeSingle();
+          if (row) {
+            await autoChargeService({
+              hospitalId,
+              patientId:     visit.patient_id,
+              encounterId:   visit.id,
+              serviceName:   `Specialist Consult — ${deptName}`,
+              serviceModule: MODULE_ED,
+              sourceTable:   "ed_charge_items",
+              sourceId:      row.id,
+              unitRate:      consultRate.fee,
+              gstPercent:    consultRate.gstPct,
+              performedBy:   userId,
+            });
+            loadEdCharges();
+          }
+        } catch { /* alert already sent; billing is best-effort */ }
+      }
+
+      toast({ title: "✓ Specialist alert sent", description: `${deptName} team notified` });
+      setShowSpecialistDialog(false);
+      setSpecialistDept("");
+      setSpecialistReason("");
+      setBillConsult(false);
+    } catch {
+      toast({ title: "Failed to send alert", variant: "destructive" });
+    } finally {
+      setSpecialistSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="h-full flex" style={{ background: "#1E293B", borderTop: "1px solid #334155" }}>
+      {/* LEFT: Timeline */}
+      <div className="w-[200px] flex-shrink-0 flex flex-col p-3 overflow-y-auto" style={{ background: "#162032", borderRight: "1px solid #334155" }}>
+        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-3">Timeline</p>
+        <div className="space-y-3 flex-1">
+          <TimelineItem filled label="Arrived" time={new Date(visit.arrival_time).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })} />
+          <TimelineItem filled label={`Triaged as ${visit.triage_category}`} time="" />
+          <TimelineItem filled={!!visit.doctor_id} label="Doctor seen" time="" />
+          <TimelineItem
+            filled={edLabsHasResults}
+            label={edLabs.length > 0 ? `Investigation (${edLabs.length})` : "Investigation"}
+            time={edLabsHasCritical ? "🔴 Critical" : edLabsHasResults ? "Results in" : ""}
+          />
+          <TimelineItem
+            filled={edRadsHasResults}
+            label={edRads.length > 0 ? `Imaging (${edRads.length})` : "Imaging"}
+            time={edRadsHasCritical ? "🔴 Critical" : edRadsHasResults ? "Results in" : ""}
+          />
+          <TimelineItem filled={visit.disposition !== "awaiting"} label={visit.disposition !== "awaiting" ? `Disposition: ${visit.disposition}` : "Disposition"} time={visit.disposition !== "awaiting" ? "Done" : ""} />
+        </div>
+        <div className="mt-2 bg-red-900/20 rounded-md p-2 flex items-center gap-2">
+          <Mic className="h-3.5 w-3.5 text-red-400" />
+          <span className="text-[10px] text-red-300">Tap mic for emergency voice entry</span>
+        </div>
+        <div className="mt-auto pt-3 border-t border-slate-700">
+          <p className="text-[10px] text-slate-500 uppercase font-bold">Time in ED</p>
+          <p className={cn("text-lg font-bold font-mono tabular-nums", losColor)}>{losText}</p>
+        </div>
+      </div>
+
+      {/* CENTER: Clinical Entry */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {/* Vitals row */}
+        <div className="flex gap-2 items-end flex-wrap">
+          <VInput label="BP Sys" value={vitals.bp_s} onChange={v => setVitals({ ...vitals, bp_s: v })} placeholder="120" />
+          <span className="text-slate-500 pb-2">/</span>
+          <VInput label="Dia" value={vitals.bp_d} onChange={v => setVitals({ ...vitals, bp_d: v })} placeholder="80" />
+          <VInput label="Pulse" value={vitals.pulse} onChange={v => setVitals({ ...vitals, pulse: v })} placeholder="88" />
+          <VInput label="RR" value={vitals.rr} onChange={v => setVitals({ ...vitals, rr: v })} placeholder="16" />
+          <VInput label="SpO2" value={vitals.spo2} onChange={v => setVitals({ ...vitals, spo2: v })} placeholder="98" />
+          <VInput label="Temp°C" value={vitals.temp} onChange={v => setVitals({ ...vitals, temp: v })} placeholder="37" />
+          <VInput label="GCS" value={vitals.gcs} onChange={v => setVitals({ ...vitals, gcs: v })} placeholder="15" />
+          <Button size="sm" onClick={saveVitals} disabled={savingVitals} className="h-8 text-xs bg-blue-600 hover:bg-blue-700 mb-0.5">
+            {savingVitals ? "..." : "Save"}
+          </Button>
+          {news2Score != null && (
+            <span className={cn("mb-0.5 px-2 py-1.5 rounded text-[11px] font-bold", getNEWS2BadgeClasses(news2Score))} title={getNEWS2Label(news2Score)}>
+              {getNEWS2Label(news2Score)}
+            </span>
+          )}
+        </div>
+
+        {/* Chief complaint */}
+        <div>
+          <div className="flex items-center justify-between">
+            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Chief Complaint</label>
+            <VoiceDictationButton sessionType="emergency" patientId={visit?.patient_id} size="sm" />
+          </div>
+          <Textarea value={complaint} onChange={e => setComplaint(e.target.value)}
+            onBlur={() => saveField("chief_complaint", complaint)}
+            placeholder="Chief complaint / presenting history..."
+            className="mt-1 text-sm resize-none text-white border-slate-600 h-16"
+            style={{ background: "#0F172A" }} />
+        </div>
+
+        {/* Triage suggestion banner */}
+        {triageSuggestion && (
+          <div className="bg-amber-900/30 border border-amber-700/50 rounded-lg p-2.5 flex items-center justify-between">
+            <span className="text-xs text-amber-300">
+              🎯 Voice scribe suggests triage: <strong>{triageSuggestion}</strong> (currently {visit.triage_category})
+            </span>
+            <div className="flex gap-1.5">
+              <button onClick={() => { saveField("triage_category", triageSuggestion); setTriageSuggestion(null); onRefresh(); }}
+                className="text-[10px] bg-amber-600 text-white px-2 py-1 rounded hover:bg-amber-500">Apply</button>
+              <button onClick={() => setTriageSuggestion(null)}
+                className="text-[10px] text-amber-400 px-2 py-1 hover:underline">Dismiss</button>
+            </div>
+          </div>
+        )}
+
+        {/* Investigations suggested */}
+        {investigationsSuggested.length > 0 && (
+          <div className="bg-purple-900/30 border border-purple-700/50 rounded-lg p-2.5">
+            <p className="text-[10px] font-bold text-purple-300 uppercase mb-1.5">Voice scribe detected investigations</p>
+            <div className="flex flex-wrap gap-1.5">
+              {investigationsSuggested.map((inv, i) => (
+                <span key={i} className="text-[11px] bg-purple-800/50 text-purple-200 px-2 py-0.5 rounded-full">{inv}</span>
+              ))}
+            </div>
+            <button onClick={() => { if (hospitalId) { setShowLabModal(true); } setInvestigationsSuggested([]); }}
+              className="text-[10px] text-purple-300 hover:underline mt-1.5">Create STAT Lab Orders →</button>
+          </div>
+        )}
+
+        {/* ED lab results (Phase 10) — realtime results-return for STAT labs */}
+        {edLabs.length > 0 && (
+          <div className={cn("rounded-lg p-2.5 border", edLabsHasCritical ? "bg-red-900/30 border-red-700/50" : "bg-slate-800/50 border-slate-700")}>
+            <p className={cn("text-[10px] font-bold uppercase mb-1.5 flex items-center gap-1.5", edLabsHasCritical ? "text-red-300" : "text-slate-400")}>
+              <FlaskConical className="h-3 w-3" /> Lab Results {edLabsHasCritical && "— CRITICAL VALUES"}
+            </p>
+            <div className="space-y-1.5">
+              {edLabs.map(o => (
+                <div key={o.id} className="text-[11px]">
+                  <div className="flex items-center gap-2 text-slate-500">
+                    <span className="font-mono text-[10px]">{o.accession || "—"}</span>
+                    <span className="capitalize">{o.status.replace(/_/g, " ")}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 mt-0.5">
+                    {o.items.map((it, idx) => {
+                      const crit = it.result_flag === "CH" || it.result_flag === "CL";
+                      const abn = it.result_flag === "H" || it.result_flag === "L";
+                      return (
+                        <span key={idx} className={cn("text-[11px]", crit ? "text-red-400 font-bold" : abn ? "text-amber-300 font-semibold" : "text-slate-300")}>
+                          {it.test_name}: {it.result_value ?? "—"}{it.result_unit ? ` ${it.result_unit}` : ""}
+                          {crit ? " 🔴" : abn ? " ⚠" : ""}
+                        </span>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* ED radiology results (Radiology completion plan Phase 2) — realtime results-return for STAT imaging */}
+        {edRads.length > 0 && (
+          <div className={cn("rounded-lg p-2.5 border", edRadsHasCritical ? "bg-red-900/30 border-red-700/50" : "bg-slate-800/50 border-slate-700")}>
+            <p className={cn("text-[10px] font-bold uppercase mb-1.5 flex items-center gap-1.5", edRadsHasCritical ? "text-red-300" : "text-slate-400")}>
+              <ScanLine className="h-3 w-3" /> Radiology Results {edRadsHasCritical && "— CRITICAL FINDING"}
+            </p>
+            <div className="space-y-1.5">
+              {edRads.map(o => (
+                <div key={o.id} className="text-[11px]">
+                  <div className="flex items-center gap-2 text-slate-500">
+                    <span className="font-mono text-[10px]">{o.accession || "—"}</span>
+                    <span>{o.study_name}</span>
+                    <span className="capitalize">{o.status.replace(/_/g, " ")}</span>
+                  </div>
+                  {o.report?.impression && (
+                    <p className={cn("mt-0.5", o.report.is_critical ? "text-red-400 font-bold" : "text-slate-300")}>
+                      {o.report.impression}{o.report.is_critical ? " 🔴" : ""}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Disposition suggestion */}
+        {dispositionSuggestion && (
+          <div className="bg-emerald-900/30 border border-emerald-700/50 rounded-lg p-2.5 flex items-center justify-between">
+            <span className="text-xs text-emerald-300">
+              📋 Suggested disposition: <strong className="capitalize">{dispositionSuggestion}</strong>
+            </span>
+            <div className="flex gap-1.5">
+              <button onClick={() => { handleDisposition(dispositionSuggestion); setDispositionSuggestion(null); }}
+                className="text-[10px] bg-emerald-600 text-white px-2 py-1 rounded hover:bg-emerald-500">Apply</button>
+              <button onClick={() => setDispositionSuggestion(null)}
+                className="text-[10px] text-emerald-400 px-2 py-1 hover:underline">Dismiss</button>
+            </div>
+          </div>
+        )}
+
+        {/* AMPLE */}
+        <div>
+          <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">AMPLE History</label>
+          <div className="grid grid-cols-5 gap-1.5 mt-1">
+            {(["a", "m", "p", "l", "e"] as const).map(key => (
+              <div key={key}>
+                <span className="text-[9px] text-slate-500 uppercase font-bold">{key === "a" ? "Allergies" : key === "m" ? "Meds" : key === "p" ? "Past Hx" : key === "l" ? "Last Meal" : "Events"}</span>
+                <Input value={(ample as any)[key]} onChange={e => setAmple({ ...ample, [key]: e.target.value })}
+                  onBlur={() => saveField("ample_history", ample)}
+                  className="h-7 text-[11px] text-white border-slate-600 mt-0.5"
+                  style={{ background: "#0F172A" }} />
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* AI Triage Suggestions Panel */}
+        {showTriagePanel && aiTriageResult && (
+          <div className="bg-indigo-950/60 border border-indigo-600/50 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1.5">
+                <Bot className="h-3.5 w-3.5 text-indigo-400" />
+                <span className="text-xs font-bold text-indigo-300">🤖 AI Triage Suggestions</span>
+                <span className="text-[10px] bg-indigo-800/60 text-indigo-300 px-1.5 py-0.5 rounded">AI Suggested</span>
+              </div>
+              <button onClick={() => setShowTriagePanel(false)} className="text-slate-500 hover:text-slate-300">
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+
+            {/* Suggested triage category */}
+            {aiTriageResult.overall_urgency && (
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] font-bold text-slate-400 uppercase">Suggested Category:</span>
+                <span className={cn("text-xs font-bold px-2 py-0.5 rounded",
+                  aiTriageResult.overall_urgency === "emergent" ? "bg-red-900/60 text-red-300" :
+                  aiTriageResult.overall_urgency === "urgent" ? "bg-orange-900/60 text-orange-300" :
+                  "bg-yellow-900/60 text-yellow-300"
+                )}>
+                  {mapUrgencyToTriage(aiTriageResult.overall_urgency)} — {aiTriageResult.overall_urgency}
+                </span>
+              </div>
+            )}
+
+            {/* Red flags */}
+            {aiTriageResult.red_flags_detected?.length > 0 && (
+              <div>
+                <p className="text-[10px] text-red-400 font-bold uppercase mb-1">Red Flags Detected</p>
+                <div className="flex flex-wrap gap-1">
+                  {aiTriageResult.red_flags_detected.map((f: string, i: number) => (
+                    <span key={i} className="text-[10px] bg-red-900/40 text-red-300 px-1.5 py-0.5 rounded">{f}</span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Top differential + investigations */}
+            {aiTriageResult.differentials?.[0] && (
+              <div className="space-y-1">
+                <p className="text-[10px] text-slate-400 font-bold uppercase">Top Differential</p>
+                <p className="text-xs text-slate-300 font-medium">{aiTriageResult.differentials[0].diagnosis}</p>
+                {aiTriageResult.differentials[0].recommended_investigations?.length > 0 && (
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    {aiTriageResult.differentials[0].recommended_investigations.slice(0, 5).map((inv: string, i: number) => (
+                      <span key={i} className="text-[10px] bg-indigo-900/40 text-indigo-300 px-1.5 py-0.5 rounded">{inv}</span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex gap-1.5 pt-1 border-t border-indigo-700/30">
+              <button
+                onClick={() => setShowTriageAttestation(true)}
+                className="text-[10px] bg-emerald-700 text-white px-3 py-1.5 rounded hover:bg-emerald-600 transition-colors"
+              >
+                Apply with Attestation
+              </button>
+              <button
+                onClick={() => setShowTriagePanel(false)}
+                className="text-[10px] text-slate-400 px-3 py-1.5 hover:underline"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Diagnosis */}
+        <div>
+          <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Working Diagnosis</label>
+          <Input value={diagnosis} onChange={e => setDiagnosis(e.target.value)}
+            onBlur={() => saveField("working_diagnosis", diagnosis)}
+            placeholder="Working diagnosis..."
+            className="h-8 text-sm text-white border-slate-600 mt-1"
+            style={{ background: "#0F172A" }} />
+        </div>
+
+        {/* MLC */}
+        <div>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input type="checkbox" checked={mlc} onChange={e => { setMlc(e.target.checked); saveField("mlc", e.target.checked); }}
+              className="rounded border-slate-600" />
+            <span className="text-xs text-slate-400 font-medium">Medico-Legal Case (MLC)</span>
+          </label>
+          {mlc && (
+            <div className="grid grid-cols-4 gap-1.5 mt-2">
+              {[
+                { k: "police_station", l: "Police Station" },
+                { k: "officer", l: "Officer Name" },
+                { k: "fir", l: "FIR Number" },
+                { k: "injury_type", l: "Injury Type" },
+              ].map(f => (
+                <div key={f.k}>
+                  <span className="text-[9px] text-slate-500 uppercase font-bold">{f.l}</span>
+                  <Input value={(mlcDetails as any)[f.k] || ""} onChange={e => setMlcDetails({ ...mlcDetails, [f.k]: e.target.value })}
+                    onBlur={() => saveField("mlc_details", mlcDetails)}
+                    className="h-7 text-[11px] text-white border-slate-600 mt-0.5"
+                    style={{ background: "#0F172A" }} />
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* RIGHT: Actions */}
+      <div className="w-[170px] flex-shrink-0 flex flex-col gap-2 p-3 overflow-y-auto" style={{ background: "#162032", borderLeft: "1px solid #334155" }}>
+        <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">Actions</p>
+
+        {/* Treating doctor */}
+        {visit.doctor_id ? (
+          <div className="rounded-lg border border-teal-700/50 px-2.5 py-1.5" style={{ background: "rgba(13,148,136,0.12)" }}>
+            <p className="text-[9px] text-slate-500 uppercase font-bold">Treating Doctor</p>
+            <p className="text-[11px] text-teal-300 font-medium truncate">{treatingDoctor || "Assigned"}</p>
+          </div>
+        ) : (
+          <ActionBtn label="🙋 Assign to me" bg="#0D9488" onClick={assignToMe} />
+        )}
+
+        <button
+          onClick={handleAITriageAssist}
+          disabled={aiTriageLoading}
+          className="w-full h-9 rounded-lg text-[12px] font-bold text-white flex items-center justify-center gap-1.5 transition-all active:scale-[0.97]"
+          style={{ background: "#6366F1" }}
+        >
+          {aiTriageLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bot className="h-3 w-3" />}
+          AI Triage Assist
+        </button>
+        <ActionBtn label="🛏️ Admit to IPD" bg="#3B82F6" onClick={() => setShowAdmitModal(true)} />
+        <ActionBtn label="🔬 STAT Lab" bg="#8B5CF6" onClick={() => { if (hospitalId) setShowLabModal(true); }} />
+        <ActionBtn label="🩻 STAT Radiology" bg="#0369A1" onClick={() => { if (hospitalId) setShowRadModal(true); }} />
+        <ActionBtn label="💉 Medications" bg="#7C3AED" onClick={() => setShowMedications(true)} />
+        <ActionBtn label="🗒️ Handover Note" bg="#475569" onClick={() => setShowHandoverNote(true)} />
+        <ActionBtn label="📝 Consent" bg="#0891B2" onClick={() => setShowConsent(true)} />
+        <ActionBtn label="🩸 Blood Request" bg="#EF4444" onClick={() => setShowBloodDialog(true)} />
+        <ActionBtn label="📟 Call Specialist" bg="#F59E0B" onClick={() => setShowSpecialistDialog(true)} />
+        {visit.triage_category !== "red" && visit.triage_category !== "critical" && visit.disposition !== "discharged" && visit.disposition !== "expired" && (
+          <ActionBtn label="🏥 Refer to OT" bg="#0E7B7B" onClick={() => setShowOTModal(true)} />
+        )}
+        <ActionBtn label="📄 Discharge Summary" bg="#0EA5E9" onClick={() => setShowDischargeSummary(true)} />
+        <ActionBtn label="🏠 Discharge" bg="#10B981" onClick={() => setShowDischargeConfirm(true)} />
+
+        {/* Other dispositions: LAMA / DAMA / LWBS / Absconded / Referred-out */}
+        <Select key={dispKey} onValueChange={(v) => { handleDispSelect(v); setDispKey(k => k + 1); }}>
+          <SelectTrigger className="h-9 text-[12px] font-bold text-white border-slate-600" style={{ background: "#64748B" }}>
+            <SelectValue placeholder="⚑ Other Disposition" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="lama">LAMA — Left Against Medical Advice</SelectItem>
+            <SelectItem value="dama">DAMA — Discharge Against Medical Advice</SelectItem>
+            <SelectItem value="lwbs">LWBS — Left Without Being Seen</SelectItem>
+            <SelectItem value="absconded">Absconded</SelectItem>
+            <SelectItem value="referred_out">Referred Out (transfer)</SelectItem>
+          </SelectContent>
+        </Select>
+        {mlc && <ActionBtn label="📄 MLC Register" bg="#7C3AED" onClick={() => setShowMlcDialog(true)} />}
+        {mlc && (
+          <ActionBtn label="📋 Police Intimation" bg="#6D28D9" onClick={() => {
+            const now = new Date();
+            const body = `
+              ${printHeader(hospitalId ? "Hospital" : "Hospital", "Medico-Legal Case — Police Intimation")}
+              <div style="text-align:center;font-size:14px;font-weight:bold;margin:12px 0;text-decoration:underline">
+                POLICE INTIMATION (FORM 4)
+              </div>
+              <div class="row"><span class="label">Date & Time:</span><span>${now.toLocaleDateString("en-IN")} ${now.toLocaleTimeString("en-IN")}</span></div>
+              <div class="row"><span class="label">To:</span><span>The Station House Officer, ${mlcDetails.police_station || "_______________"}</span></div>
+              <div style="margin:16px 0;font-size:12px;line-height:1.8">
+                <p>Sir/Madam,</p>
+                <p>This is to inform you that the following patient has been brought to this hospital
+                and the case appears to be of medico-legal nature:</p>
+              </div>
+              <table style="width:100%;border-collapse:collapse;font-size:12px;margin:12px 0">
+                <tr><td style="padding:6px;border:1px solid #ccc;width:35%;font-weight:bold">Patient Name</td><td style="padding:6px;border:1px solid #ccc">${visit.patient_name}</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Date & Time of Arrival</td><td style="padding:6px;border:1px solid #ccc">${new Date(visit.arrival_time).toLocaleString("en-IN")}</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Brought By</td><td style="padding:6px;border:1px solid #ccc">—</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Nature of Injuries / Condition</td><td style="padding:6px;border:1px solid #ccc">${mlcDetails.injury_type || complaint || "—"}</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Chief Complaint</td><td style="padding:6px;border:1px solid #ccc">${complaint || "—"}</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Working Diagnosis</td><td style="padding:6px;border:1px solid #ccc">${diagnosis || "Under evaluation"}</td></tr>
+                <tr><td style="padding:6px;border:1px solid #ccc;font-weight:bold">Condition on Arrival</td><td style="padding:6px;border:1px solid #ccc">BP: ${vitals.bp_s || "—"}/${vitals.bp_d || "—"}, Pulse: ${vitals.pulse || "—"}, SpO2: ${vitals.spo2 || "—"}%, GCS: ${vitals.gcs || "—"}/15</td></tr>
+              </table>
+              <div style="margin:16px 0;font-size:12px;line-height:1.8">
+                <p>The patient is being treated at this hospital. You are requested to take necessary action.</p>
+              </div>
+              <div style="margin-top:40px;display:flex;justify-content:space-between;font-size:12px">
+                <div><p>_________________________</p><p>Attending Doctor</p></div>
+                <div style="text-align:right"><p>_________________________</p><p>Medical Superintendent</p></div>
+              </div>
+            `;
+            printDocument("Police Intimation - " + visit.patient_name, body);
+          }} />
+        )}
+
+        <button
+          onClick={() => navigate(`/patients?id=${visit.patient_id}`)}
+          className="flex items-center gap-1 text-[11px] text-blue-400 font-medium hover:underline mt-2"
+        >
+          View Patient Record <ExternalLink className="h-3 w-3" />
+        </button>
+
+        {/* ED Charges */}
+        <div className="mt-2 rounded-lg border border-slate-700 p-2.5" style={{ background: "#0F172A" }}>
+          <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1">ED Charges</p>
+
+          {/* Casualty fee (unchanged) */}
+          {edBilling.status === "billed" ? (
+            <>
+              <p className="text-sm font-bold text-emerald-400 tabular-nums">₹{edBilling.total.toLocaleString("en-IN")}</p>
+              <p className="text-[10px] text-slate-500 mt-0.5">Casualty fee billed</p>
+              {edBilling.billId && (
+                <button onClick={() => navigate(`/billing?bill_id=${edBilling.billId}`)}
+                  className="flex items-center gap-1 text-[11px] text-blue-400 font-medium hover:underline mt-1">
+                  View Bill <ExternalLink className="h-3 w-3" />
+                </button>
+              )}
+            </>
+          ) : (
+            <p className="text-[11px] text-slate-400 leading-snug">Casualty fee bills automatically on discharge or admit.</p>
+          )}
+
+          {/* Itemized ED charges */}
+          {edBilling.itemizedTotal > 0 && (
+            <div className="mt-2 pt-2 border-t border-slate-700/70">
+              <p className="text-sm font-bold text-emerald-400 tabular-nums">₹{edBilling.itemizedTotal.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</p>
+              <p className="text-[10px] text-slate-500 mt-0.5">Itemized ED charges</p>
+              {edBilling.itemizedBillId && (
+                <button onClick={() => navigate(`/billing?bill_id=${edBilling.itemizedBillId}`)}
+                  className="flex items-center gap-1 text-[11px] text-blue-400 font-medium hover:underline mt-1">
+                  View Bill <ExternalLink className="h-3 w-3" />
+                </button>
+              )}
+            </div>
+          )}
+
+          <button onClick={() => setShowChargesPanel(true)}
+            className="w-full mt-2 h-8 rounded-md text-[11px] font-bold text-white flex items-center justify-center gap-1 transition-all active:scale-[0.97]"
+            style={{ background: "#334155" }}>
+            + Add ED Charge
+          </button>
+          <button onClick={() => setShowDeposit(true)}
+            className="w-full mt-1.5 h-8 rounded-md text-[11px] font-bold text-white flex items-center justify-center gap-1 transition-all active:scale-[0.97]"
+            style={{ background: "#0D9488" }}>
+            💰 Collect Deposit
+          </button>
+        </div>
+
+        <div className="mt-auto pt-2 border-t border-slate-700">
+          <p className="text-[10px] text-slate-500 uppercase font-bold">Status</p>
+          <p className="text-xs text-slate-300 capitalize font-medium mt-0.5">{visit.disposition}</p>
+        </div>
+      </div>
+
+      {/* === MODALS === */}
+
+      {/* Admit to IPD */}
+      <AdmitPatientModal
+        open={showAdmitModal}
+        onClose={() => setShowAdmitModal(false)}
+        hospitalId={hospitalId}
+        onAdmitted={() => {
+          setShowAdmitModal(false);
+          handleDisposition("admitted");
+        }}
+      />
+
+      {/* STAT Lab */}
+      {showLabModal && hospitalId && (
+        <NewLabOrderModal
+          hospitalId={hospitalId}
+          onClose={() => setShowLabModal(false)}
+          onCreated={() => {
+            setShowLabModal(false);
+            toast({ title: "✓ STAT lab order created from ED" });
+          }}
+        />
+      )}
+
+      {/* STAT Radiology */}
+      {showRadModal && hospitalId && (
+        <NewRadiologyOrderModal
+          hospitalId={hospitalId}
+          modalities={radModalities}
+          onClose={() => setShowRadModal(false)}
+          onCreated={() => {
+            setShowRadModal(false);
+            toast({ title: "✓ STAT radiology order created from ED" });
+          }}
+        />
+      )}
+
+      {/* Refer to OT */}
+      {showOTModal && (
+        <BookOTModal
+          rooms={otRooms}
+          selectedRoomId={otRooms[0]?.id || ""}
+          selectedDate={new Date().toISOString().slice(0, 10)}
+          prefillTime={null}
+          initialPatientId={visit.patient_id}
+          initialPatientName={visit.patient_name}
+          initialDiagnosis={diagnosis || complaint || ""}
+          initialUrgency="emergency"
+          initialSurgeonId={visit.doctor_id || undefined}
+          onClose={() => setShowOTModal(false)}
+          onBooked={() => {
+            setShowOTModal(false);
+            toast({ title: `OT referral raised for ${visit.patient_name}` });
+          }}
+        />
+      )}
+
+      {/* Itemized ED Charges */}
+      {showChargesPanel && hospitalId && (
+        <EDChargesPanel
+          hospitalId={hospitalId}
+          userId={userId}
+          edVisitId={visit.id}
+          patientId={visit.patient_id}
+          patientName={visit.patient_name}
+          onClose={() => setShowChargesPanel(false)}
+          onCharged={loadEdCharges}
+        />
+      )}
+
+      {/* ED Discharge Summary */}
+      {showDischargeSummary && hospitalId && (
+        <EDDischargeSummaryModal
+          hospitalId={hospitalId}
+          userId={userId}
+          edVisitId={visit.id}
+          patientName={visit.patient_name}
+          onClose={() => setShowDischargeSummary(false)}
+        />
+      )}
+
+      {/* Collect Deposit (patient advance) */}
+      {showDeposit && hospitalId && (
+        <AdvanceReceiptModal
+          hospitalId={hospitalId}
+          prefilledPatient={{ id: visit.patient_id, full_name: visit.patient_name, uhid: "" }}
+          onClose={() => setShowDeposit(false)}
+          onCreated={() => setShowDeposit(false)}
+        />
+      )}
+
+      {/* ED Medications (eMAR) */}
+      {showMedications && hospitalId && (
+        <EDMedicationPanel
+          hospitalId={hospitalId}
+          userId={userId}
+          edVisitId={visit.id}
+          patientId={visit.patient_id}
+          patientName={visit.patient_name}
+          allergies={ample.a}
+          onClose={() => setShowMedications(false)}
+          onAdministered={loadEdCharges}
+        />
+      )}
+
+      {/* ED nursing handover note */}
+      {showHandoverNote && hospitalId && (
+        <EDHandoverNotePanel
+          hospitalId={hospitalId}
+          userId={userId}
+          edVisitId={visit.id}
+          patientId={visit.patient_id}
+          patientName={visit.patient_name}
+          onClose={() => setShowHandoverNote(false)}
+        />
+      )}
+
+      {/* Emergency / high-risk consent (reuses the shared consent capture) */}
+      {showConsent && hospitalId && (
+        <ConsentSignatureModal
+          open={showConsent}
+          onClose={() => setShowConsent(false)}
+          edVisitId={visit.id}
+          admissionId={null}
+          patientId={visit.patient_id}
+          patientName={visit.patient_name}
+          hospitalId={hospitalId}
+        />
+      )}
+
+      {/* Confirm LAMA / DAMA / LWBS / Absconded */}
+      <AlertDialog open={!!pendingDisp} onOpenChange={(o) => { if (!o) setPendingDisp(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm disposition</AlertDialogTitle>
+            <AlertDialogDescription>
+              Mark <strong>{visit.patient_name}</strong> as <strong>{pendingDisp ? DISP_LABELS[pendingDisp] ?? pendingDisp : ""}</strong>? This closes the ED visit.
+              {(pendingDisp === "lama" || pendingDisp === "dama") && " The casualty fee (if configured) will be billed."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { const d = pendingDisp!; setPendingDisp(null); handleDisposition(d); }}>
+              Confirm
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Referred-out — referral / transfer letter (reuses the OPD referral letter) */}
+      {showReferralModal && hospitalId && (
+        <ReferralLetterModal
+          open={showReferralModal}
+          onClose={() => setShowReferralModal(false)}
+          hospitalId={hospitalId}
+          patientName={visit.patient_name}
+          patientUhid={referralUhid}
+          chiefComplaint={complaint}
+          diagnosis={diagnosis}
+          onReferred={() => { setShowReferralModal(false); handleDisposition("referred_out"); }}
+        />
+      )}
+
+      {/* Discharge Confirmation */}
+      <AlertDialog open={showDischargeConfirm} onOpenChange={setShowDischargeConfirm}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Confirm Discharge</AlertDialogTitle>
+            <AlertDialogDescription>
+              Are you sure you want to discharge <strong>{visit.patient_name}</strong> from the Emergency Department? This will mark the visit as inactive.
+              {edBillInfo && edBillInfo.balance > 0 && (
+                <span className="block mt-2 rounded-md bg-amber-50 border border-amber-200 px-2.5 py-1.5 text-amber-800">
+                  Outstanding ED bill: <strong>₹{edBillInfo.balance.toLocaleString("en-IN")}</strong>
+                  <button
+                    onClick={() => navigate(`/billing?bill_id=${edBillInfo.id}`)}
+                    className="ml-2 text-amber-900 underline font-medium">
+                    Collect payment in Billing →
+                  </button>
+                </span>
+              )}
+              {edUnbilled.length > 0 && (
+                <span className="block mt-2 rounded-md bg-amber-50 border border-amber-200 px-2.5 py-1.5 text-amber-800">
+                  {edUnbilled.map(u => `${u.count} ${u.type}`).join(", ")} item{edUnbilled.reduce((s, u) => s + u.count, 0) !== 1 ? "s" : ""} from this visit may not be billed yet.
+                  <button
+                    onClick={() => navigate(edBillInfo ? `/billing?bill_id=${edBillInfo.id}` : "/billing")}
+                    className="ml-2 text-amber-900 underline font-medium">
+                    Review in Billing →
+                  </button>
+                </span>
+              )}
+              <button
+                onClick={() => { setShowDischargeConfirm(false); setShowDischargeSummary(true); }}
+                className="block mt-2 text-sky-600 hover:underline font-medium">
+                📄 Prepare discharge summary first
+              </button>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { handleDisposition("discharged"); setShowDischargeConfirm(false); }}
+              className="bg-emerald-600 hover:bg-emerald-700">
+              Confirm Discharge
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Blood Request Dialog */}
+      <Dialog open={showBloodDialog} onOpenChange={setShowBloodDialog}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>🩸 Blood Request</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-sm font-medium">Blood Group</label>
+              <Select value={bloodGroup} onValueChange={setBloodGroup}>
+                <SelectTrigger className="mt-1"><SelectValue placeholder="Select blood group" /></SelectTrigger>
+                <SelectContent>
+                  {["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"].map(g => (
+                    <SelectItem key={g} value={g}>{g}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Component</label>
+              <Select value={bloodComponent} onValueChange={setBloodComponent}>
+                <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {["Whole Blood", "PRBCs", "FFP", "Platelets", "Cryoprecipitate"].map(c => (
+                    <SelectItem key={c} value={c}>{c}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Units</label>
+              <Input type="number" min="1" max="10" value={bloodUnits} onChange={e => setBloodUnits(e.target.value)} className="mt-1" />
+            </div>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" checked={bloodUrgent} onChange={e => setBloodUrgent(e.target.checked)} className="rounded" />
+              <span className="text-sm font-medium text-destructive">Urgent / Emergency</span>
+            </label>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowBloodDialog(false)}>Cancel</Button>
+            <Button onClick={handleBloodRequest} disabled={bloodSubmitting} className="bg-red-600 hover:bg-red-700">
+              {bloodSubmitting ? "Sending..." : "Send Request"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Specialist Consult Dialog */}
+      <Dialog open={showSpecialistDialog} onOpenChange={setShowSpecialistDialog}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>📟 Call Specialist</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <label className="text-sm font-medium">Department / Specialty *</label>
+              <Select value={specialistDept} onValueChange={setSpecialistDept}>
+                <SelectTrigger className="mt-1"><SelectValue placeholder="Select department" /></SelectTrigger>
+                <SelectContent>
+                  {departments.map(d => (
+                    <SelectItem key={d.id} value={d.id}>{d.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <label className="text-sm font-medium">Reason for Consult</label>
+              <Textarea value={specialistReason} onChange={e => setSpecialistReason(e.target.value)}
+                placeholder="Brief reason for specialist consultation..."
+                className="mt-1 resize-none" rows={3} />
+            </div>
+            {consultRate.fee > 0 && (
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={billConsult} onChange={e => setBillConsult(e.target.checked)} className="rounded" />
+                <span className="text-sm font-medium">Bill consultation fee (₹{consultRate.fee.toLocaleString("en-IN")})</span>
+              </label>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowSpecialistDialog(false)}>Cancel</Button>
+            <Button onClick={handleSpecialistCall} disabled={specialistSubmitting || !specialistDept}
+              className="bg-amber-600 hover:bg-amber-700">
+              {specialistSubmitting ? "Sending..." : "Send Alert"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* MLC Summary Dialog */}
+      <Dialog open={showMlcDialog} onOpenChange={setShowMlcDialog}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>📄 MLC Register Summary</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-2 text-sm">
+            <div className="grid grid-cols-2 gap-2">
+              <div><span className="text-muted-foreground">Patient:</span> <strong>{visit.patient_name}</strong></div>
+              <div><span className="text-muted-foreground">Arrival:</span> {new Date(visit.arrival_time).toLocaleString("en-IN")}</div>
+              <div><span className="text-muted-foreground">Police Station:</span> {mlcDetails.police_station || "—"}</div>
+              <div><span className="text-muted-foreground">Officer:</span> {mlcDetails.officer || "—"}</div>
+              <div><span className="text-muted-foreground">FIR No:</span> {mlcDetails.fir || "—"}</div>
+              <div><span className="text-muted-foreground">Injury Type:</span> {mlcDetails.injury_type || "—"}</div>
+              <div className="col-span-2"><span className="text-muted-foreground">Chief Complaint:</span> {complaint || "—"}</div>
+              <div className="col-span-2"><span className="text-muted-foreground">Working Diagnosis:</span> {diagnosis || "—"}</div>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowMlcDialog(false)}>Close</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* AI Triage Attestation */}
+      {showTriageAttestation && aiTriageResult && hospitalId && (
+        <AIAttestationModal
+          open={showTriageAttestation}
+          title="AI Triage Assist — Apply Suggested Category"
+          feature="triage_assist"
+          sourceId={visit.id}
+          hospitalId={hospitalId}
+          aiOutput={aiTriageResult}
+          previewContent={[
+            `Suggested urgency: ${aiTriageResult.overall_urgency || "unknown"} → ${mapUrgencyToTriage(aiTriageResult.overall_urgency || "")}`,
+            aiTriageResult.red_flags_detected?.length ? `Red flags: ${aiTriageResult.red_flags_detected.join(", ")}` : "",
+            aiTriageResult.differentials?.[0] ? `Top Dx: ${aiTriageResult.differentials[0].diagnosis}` : "",
+          ].filter(Boolean).join("\n")}
+          initialEditableText={mapUrgencyToTriage(aiTriageResult.overall_urgency || "P3")}
+          editableLabel="Triage Category to Apply (P1 / P2 / P3 / P4)"
+          onAccept={(category) => {
+            const cat = category.trim().toUpperCase();
+            if (["P1","P2","P3","P4"].includes(cat)) {
+              supabase.from("ed_visits").update({ triage_category: cat } as any).eq("id", visit.id).then(() => {
+                toast({ title: `Triage updated to ${cat}` });
+                setShowTriageAttestation(false);
+                setShowTriagePanel(false);
+                onRefresh();
+              });
+            } else {
+              toast({ title: "Invalid category", description: "Enter P1, P2, P3, or P4", variant: "destructive" });
+            }
+          }}
+          onDiscard={() => setShowTriageAttestation(false)}
+        />
+      )}
+    </div>
+  );
+};
+
+// NEWS2 from the ED vitals object. Returns null until the required vitals are present.
+// Consciousness is derived from GCS (15 = Alert); supplemental O2 defaults to off.
+function computeEdNews2(vitals: { rr: string; spo2: string; bp_s: string; pulse: string; temp: string; gcs: string }): number | null {
+  const rr = parseFloat(vitals.rr), spo2 = parseFloat(vitals.spo2), sbp = parseFloat(vitals.bp_s);
+  const hr = parseFloat(vitals.pulse), temp = parseFloat(vitals.temp), gcs = parseFloat(vitals.gcs);
+  if ([rr, spo2, sbp, hr, temp].some(n => isNaN(n))) return null;
+  return calculateNEWS2({
+    respiratory_rate: rr,
+    spo2,
+    on_supplemental_o2: false,
+    systolic_bp: sbp,
+    heart_rate: hr,
+    consciousness: (!isNaN(gcs) && gcs < 15) ? "V" : "A",
+    temperature: temp,
+  });
+}
+
+const DISP_LABELS: Record<string, string> = {
+  lama: "LAMA (Left Against Medical Advice)",
+  dama: "DAMA (Discharge Against Medical Advice)",
+  lwbs: "LWBS (Left Without Being Seen)",
+  absconded: "Absconded",
+  referred_out: "Referred Out",
+};
+
+const VInput = ({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (v: string) => void; placeholder: string }) => (
+  <div className="flex flex-col">
+    <span className="text-[9px] text-slate-500 uppercase font-bold mb-0.5">{label}</span>
+    <Input value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder}
+      className="h-8 w-16 text-xs text-white border-slate-600"
+      style={{ background: "#0F172A" }} type="number" />
+  </div>
+);
+
+const ActionBtn = ({ label, bg, onClick }: { label: string; bg: string; onClick: () => void }) => (
+  <button
+    onClick={onClick}
+    className="w-full text-left px-3 py-2.5 rounded-lg text-xs font-bold text-white hover:opacity-90 active:scale-[0.97] transition-all"
+    style={{ background: bg }}
+  >{label}</button>
+);
+
+const TimelineItem = ({ filled, label, time }: { filled: boolean; label: string; time: string }) => (
+  <div className="flex items-start gap-2">
+    <div className={cn("w-2.5 h-2.5 rounded-full mt-0.5 flex-shrink-0 border-2", filled ? "bg-emerald-400 border-emerald-400" : "border-slate-600 bg-transparent")} />
+    <div>
+      <p className={cn("text-[11px] leading-tight", filled ? "text-slate-300" : "text-slate-600")}>{label}</p>
+      {time && <p className="text-[10px] text-slate-500">{time}</p>}
+    </div>
+  </div>
+);
+
+export default EmergencyWorkspace;

@@ -1,0 +1,951 @@
+import React, { useState, useEffect, useCallback } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { syncAdvanceToBill } from "@/lib/advanceBillSync";
+import { resolveRoomRateFallback } from "@/lib/ipdBilling";
+import { computeBedSegments, formatSegmentDateRange } from "@/lib/ipdBedSegments";
+import { isRunningBill } from "@/lib/lockedDay";
+import { bundlesNursingIntoRoom } from "@/lib/payerTypes";
+import { getWardNursingRate } from "@/lib/wardNursingRate";
+import {
+  addManualConsultationCharge,
+  fetchConsultationDoctors,
+  type DoctorConsultOption,
+} from "@/lib/ipdConsultationCharge";
+import { addSpecialNursingCharge, fetchWardNursingRate } from "@/lib/ipdNursingCharge";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
+import { Loader2, Plus, RefreshCw, ArrowUpCircle, ArrowDownCircle, Wallet, Stethoscope, HeartPulse } from "lucide-react";
+
+interface Props {
+  admissionId: string;
+  patientId: string;
+  hospitalId: string;
+  userId: string | null;
+  patientName?: string;
+}
+
+interface LedgerLine {
+  date: string;
+  description: string;
+  amount: number;
+  category: "room" | "nursing" | "pharmacy" | "lab" | "other";
+}
+
+interface AdvanceTx {
+  id: string;
+  transaction_type: string;
+  amount: number;
+  payment_mode: string | null;
+  reference_no: string | null;
+  description: string | null;
+  created_at: string;
+  collected_by_name: string | null;
+}
+
+const CATEGORY_COLORS: Record<string, string> = {
+  room:     "bg-blue-50 text-blue-700",
+  nursing:  "bg-teal-50 text-teal-700",
+  pharmacy: "bg-purple-50 text-purple-700",
+  lab:      "bg-amber-50 text-amber-700",
+  other:    "bg-slate-50 text-slate-600",
+};
+
+const TX_ICONS: Record<string, React.ReactElement> = {
+  deposit:       <ArrowUpCircle className="h-3.5 w-3.5 text-emerald-600 shrink-0" />,
+  refund:        <ArrowUpCircle className="h-3.5 w-3.5 text-blue-600 shrink-0" />,
+  service_debit: <ArrowDownCircle className="h-3.5 w-3.5 text-red-500 shrink-0" />,
+  adjustment:    <ArrowUpCircle className="h-3.5 w-3.5 text-amber-600 shrink-0" />,
+};
+
+const fmt = (n: number) => `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2 })}`;
+
+// Map a bill_line_items.item_type to a ledger display category.
+const categorizeItem = (itemType?: string | null): LedgerLine["category"] => {
+  const t = (itemType || "").toLowerCase();
+  if (t.includes("room") || t.includes("bed")) return "room";
+  // Covers both the daily 'nursing' line and per-procedure 'nursing_procedure' rows.
+  if (t.includes("nurs")) return "nursing";
+  if (t.includes("pharm") || t.includes("drug") || t.includes("medic")) return "pharmacy";
+  if (t.includes("lab") || t.includes("investig")) return "lab";
+  return "other";
+};
+
+const IPDFinancialTab: React.FC<Props> = ({ admissionId, patientId, hospitalId, userId, patientName }) => {
+  const [chargeLines, setChargeLines] = useState<LedgerLine[]>([]);
+  const [advanceTxns, setAdvanceTxns] = useState<AdvanceTx[]>([]);
+  const [totalDeposited, setTotalDeposited] = useState(0);
+  const [totalDebited, setTotalDebited] = useState(0);
+  const [totalRefunded, setTotalRefunded] = useState(0);
+  const [discountAmount, setDiscountAmount] = useState(0);
+  const [directCashPaid, setDirectCashPaid] = useState(0);
+  const [loading, setLoading] = useState(true);
+  // true = charges shown are a pre-bill estimate; false = read from the real IPD bill.
+  const [isEstimate, setIsEstimate] = useState(false);
+  const [noDiagnosis, setNoDiagnosis] = useState(false);
+
+  // Deposit form
+  const [showDeposit, setShowDeposit] = useState(false);
+  const [depositAmount, setDepositAmount] = useState("");
+  const [paymentMode, setPaymentMode] = useState("cash");
+  const [referenceNo, setReferenceNo] = useState("");
+  const [depositNote, setDepositNote] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  // Add-consultation ("doctor round") form — for hospitals that don't record ward-round
+  // notes, so the consultation charge is never auto-captured.
+  const [showConsult, setShowConsult] = useState(false);
+  const [consultDoctors, setConsultDoctors] = useState<DoctorConsultOption[]>([]);
+  const [consultDoctorId, setConsultDoctorId] = useState("");
+  const [consultDate, setConsultDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [consultVisits, setConsultVisits] = useState("1");
+  const [consultFee, setConsultFee] = useState("");
+  const [consultGst, setConsultGst] = useState(0);
+  const [consultHsn, setConsultHsn] = useState("999312");
+  const [consultLoadingDocs, setConsultLoadingDocs] = useState(false);
+  const [savingConsult, setSavingConsult] = useState(false);
+
+  // Special / private-duty nursing form. Routine daily nursing accrues automatically from
+  // the ward's configured rate — this covers only one-to-one nursing, which is a clinical
+  // decision nothing can infer.
+  const [showNursing, setShowNursing] = useState(false);
+  const [nursingDate, setNursingDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [nursingDays, setNursingDays] = useState("1");
+  const [nursingRate, setNursingRate] = useState("");
+  const [wardNursingRate, setWardNursingRate] = useState<number | null>(null);
+  const [nursingLoadingRate, setNursingLoadingRate] = useState(false);
+  const [savingNursing, setSavingNursing] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    let charges: LedgerLine[] = [];
+
+    // Phase 1: All independent queries in parallel — admission meta, bill, and all
+    // advance data fetched simultaneously so nothing waits on autoPull.
+    const [admRes, billRes, balRes, txRes, receiptsRes, ipdAdvRefs] = await Promise.all([
+      (supabase as any)
+        .from("admissions")
+        .select("admitted_at, discharged_at, admitting_diagnosis, payer_type, ward_id, bed_id, wards(name, rate_per_day), beds!admissions_bed_id_fkey(bed_category)")
+        .eq("id", admissionId)
+        .maybeSingle(),
+      (supabase as any)
+        .from("bills")
+        .select("id, payment_status, bill_status, discount_amount")
+        .eq("hospital_id", hospitalId)
+        .eq("admission_id", admissionId)
+        .eq("bill_type", "ipd")
+        .neq("payment_status", "cancelled")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle(),
+      (supabase as any)
+        .from("ipd_advance_balances")
+        .select("balance, total_deposited, total_debited")
+        .eq("admission_id", admissionId)
+        .maybeSingle(),
+      (supabase as any)
+        .from("ipd_advances")
+        .select("id, transaction_type, amount, payment_mode, reference_no, description, created_at, users(full_name)")
+        .eq("admission_id", admissionId)
+        .order("created_at", { ascending: false }),
+      // Legacy receipts that live only in advance_receipts (pre dual-write fix).
+      // MUST be scoped to THIS admission: scoping by patient pulled in every advance
+      // the patient ever paid — including ones already recorded on a previous stay —
+      // which double-counted them and invented a bogus "refund due" on this admission.
+      (supabase as any)
+        .from("advance_receipts")
+        .select("id, amount, payment_mode, receipt_number, notes, created_at")
+        .eq("hospital_id", hospitalId)
+        .eq("admission_id", admissionId)
+        .order("created_at", { ascending: false }),
+      (supabase as any)
+        .from("ipd_advances")
+        .select("reference_no")
+        .eq("admission_id", admissionId)
+        .not("reference_no", "is", null),
+    ]);
+
+    const adm = admRes.data;
+    const ipdBill = billRes.data;
+    if (billRes.error) console.error("IPD ledger: bill lookup failed:", billRes.error.message);
+    setNoDiagnosis(!adm?.admitting_diagnosis);
+    setDiscountAmount(Number(ipdBill?.discount_amount || 0));
+
+    if (ipdBill?.id) {
+      // ── Authoritative path: show existing line items immediately (no waiting for autoPull) ──
+      const [{ data: lineItems, error: liErr }, { data: cashPmts }] = await Promise.all([
+        (supabase as any)
+          .from("bill_line_items")
+          .select("description, total_amount, item_type, created_at")
+          .eq("bill_id", ipdBill.id)
+          .order("created_at", { ascending: true }),
+        (supabase as any)
+          .from("bill_payments")
+          .select("amount")
+          .eq("bill_id", ipdBill.id)
+          .eq("is_advance", false),
+      ]);
+      if (liErr) console.error("IPD ledger: bill line items failed:", liErr.message);
+      setDirectCashPaid((cashPmts || []).reduce((s: number, p: any) => s + Number(p.amount || 0), 0));
+      charges = (lineItems || [])
+        .filter((li: any) => Number(li.total_amount))
+        .map((li: any) => ({
+          date: (li.created_at || "").split("T")[0],
+          description: li.description || "Service charge",
+          amount: Number(li.total_amount),
+          category: categorizeItem(li.item_type),
+        }));
+      setIsEstimate(false);
+    } else {
+      // ── Estimate path (no bill yet): live estimate; labs are priced at billing ──
+      setIsEstimate(true);
+
+      if (adm?.admitted_at) {
+        // Split by ward/bed segment (mid-stay transfers), same rule the real bill applies
+        // in lib/ipdBilling.ts: the old ward keeps the transfer day, the new ward starts the
+        // next calendar day. With zero transfers this is exactly one segment, whole-stay,
+        // at the current ward — identical to the previous single-block estimate.
+        const { data: transferRows } = await (supabase as any)
+          .from("bed_transfers")
+          .select("from_ward_id, from_bed_id, to_ward_id, to_bed_id, transferred_at")
+          .eq("admission_id", admissionId)
+          .order("transferred_at", { ascending: true });
+
+        const segments = computeBedSegments({
+          admittedAt: adm.admitted_at,
+          dischargedAt: adm.discharged_at,
+          currentWardId: adm.ward_id,
+          currentBedId: adm.bed_id,
+          transfers: transferRows || [],
+        });
+
+        const wardIds = [...new Set(segments.map((s) => s.wardId))];
+        const bedIds = [...new Set(segments.map((s) => s.bedId))];
+        const [{ data: wardRows }, { data: bedRows }] = await Promise.all([
+          (supabase as any).from("wards").select("id, rate_per_day").in("id", wardIds),
+          (supabase as any).from("beds").select("id, bed_category").in("id", bedIds),
+        ]);
+        const wardRateById = new Map((wardRows || []).map((w: any) => [w.id, Number(w.rate_per_day) || 0]));
+        const bedCatById = new Map((bedRows || []).map((b: any) => [b.id, b.bed_category || "general"]));
+
+        for (const seg of segments) {
+          const cat = bedCatById.get(seg.bedId) || adm.beds?.bed_category || "general";
+          // Same simplified resolver the estimate has always used (wards.rate_per_day →
+          // static fallback table) — deliberately not upgraded to the full
+          // service_rates/service_master chain the real bill uses; that gap predates this
+          // change and is out of scope here.
+          const rate = resolveRoomRateFallback(wardRateById.get(seg.wardId), cat);
+          const dateRange = formatSegmentDateRange(seg.startDate, seg.endDate);
+          charges.push({
+            date: seg.startDate,
+            description: `Room — ${cat.replace("_", " ")} (${dateRange}, ${seg.days} day${seg.days !== 1 ? "s" : ""}) @ ₹${rate.toLocaleString("en-IN")}`,
+            amount: rate * seg.days,
+            category: "room",
+          });
+
+          // Mirror the bill's nursing rule so the estimate doesn't understate the stay:
+          // per-ward rate, and nothing at all for payers that bundle nursing into room rent.
+          // Fetched separately — see lib/wardNursingRate.ts.
+          const nursingRate = await getWardNursingRate(seg.wardId);
+          if (nursingRate > 0 && !bundlesNursingIntoRoom(adm.payer_type)) {
+            charges.push({
+              date: seg.startDate,
+              description: `Nursing — (${dateRange}, ${seg.days} day${seg.days !== 1 ? "s" : ""}) @ ₹${nursingRate.toLocaleString("en-IN")}`,
+              amount: nursingRate * seg.days,
+              category: "nursing",
+            });
+          }
+        }
+      }
+
+      // Pharmacy + labs in parallel for the estimate path
+      const [pharmRes, labsRes] = await Promise.all([
+        (supabase as any)
+          .from("pharmacy_dispensing")
+          .select("id, dispensed_at, net_amount, pharmacy_dispensing_items(drug_name)")
+          .eq("hospital_id", hospitalId)
+          .eq("admission_id", admissionId)
+          .eq("billed", false)
+          .order("dispensed_at", { ascending: true }),
+        (supabase as any)
+          .from("lab_orders")
+          .select("order_date, id")
+          .eq("admission_id", admissionId)
+          .neq("status", "cancelled"),
+      ]);
+
+      (pharmRes.data || []).forEach((r: any) => {
+        if (r.net_amount) {
+          const drugNames = (r.pharmacy_dispensing_items || []).map((i: any) => i.drug_name).join(", ");
+          charges.push({
+            date: (r.dispensed_at || "").split("T")[0],
+            description: `Pharmacy${drugNames ? ` — ${drugNames}` : ""}`,
+            amount: Number(r.net_amount),
+            category: "pharmacy",
+          });
+        }
+      });
+
+      (labsRes.data || []).forEach((l: any) => {
+        charges.push({
+          date: l.order_date,
+          description: `Lab Order — ${l.id.slice(0, 8).toUpperCase()}`,
+          amount: 0,
+          category: "lab",
+        });
+      });
+    }
+
+    charges.sort((a, b) => a.date.localeCompare(b.date));
+    setChargeLines(charges);
+
+    // Process advances (already fetched in Phase 1 above)
+    const ipdTxns: AdvanceTx[] = (txRes.data || []).map((t: any) => ({
+      id: t.id,
+      transaction_type: t.transaction_type,
+      amount: Number(t.amount),
+      payment_mode: t.payment_mode,
+      reference_no: t.reference_no,
+      description: t.description,
+      created_at: t.created_at,
+      collected_by_name: t.users?.full_name || null,
+    }));
+
+    const mirroredRefs = new Set(
+      (ipdAdvRefs.data || []).map((r: any) => r.reference_no)
+    );
+    const unmirroredReceipts = (receiptsRes.data || []).filter(
+      (r: any) => !mirroredRefs.has(r.receipt_number)
+    );
+    const receiptTxns: AdvanceTx[] = unmirroredReceipts.map((r: any) => ({
+      id: r.id,
+      transaction_type: "deposit",
+      amount: Number(r.amount),
+      payment_mode: r.payment_mode,
+      reference_no: r.receipt_number,
+      description: r.notes || "Advance deposit",
+      created_at: r.created_at,
+      collected_by_name: null,
+    }));
+
+    const unmirroredTotal = unmirroredReceipts.reduce(
+      (s: number, r: any) => s + Number(r.amount || 0), 0
+    );
+    const ipdDeposited = Number(balRes.data?.total_deposited) || 0;
+    const ipdDebited   = Number(balRes.data?.total_debited)   || 0;
+    const ipdRefunds   = (txRes.data || []).reduce(
+      (s: number, t: any) => t.transaction_type === 'refund' ? s + Number(t.amount || 0) : s, 0
+    );
+
+    setTotalDeposited(ipdDeposited + unmirroredTotal);
+    setTotalDebited(ipdDebited);
+    setTotalRefunded(ipdRefunds);
+
+    const all = [...ipdTxns, ...receiptTxns].sort(
+      (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+    setAdvanceTxns(all);
+    setLoading(false);  // ← Data visible immediately; autoPull runs in background below
+
+    // Fire autoPull in background while the bill is still running — never blocks the UI.
+    // When it completes, silently refresh the charge list in place.
+    //
+    // "Running", not "draft": a bill leaves 'draft' mid-stay the moment someone
+    // requests a discount ('pending_approval'), and a strict draft test froze the
+    // room and nursing charges at that day's count for the rest of the admission.
+    // isRunningBill is the same rule the day-closure guard already uses.
+    if (ipdBill?.id && isRunningBill(ipdBill.bill_status)) {
+      const billId = ipdBill.id;
+      import("@/lib/ipdBilling").then(({ autoPullAdmissionCharges }) => {
+        autoPullAdmissionCharges(billId, admissionId, hospitalId).then(result => {
+          if (!result.ok) return;
+          (supabase as any)
+            .from("bill_line_items")
+            .select("description, total_amount, item_type, created_at")
+            .eq("bill_id", billId)
+            .order("created_at", { ascending: true })
+            .then(({ data: refreshed }: any) => {
+              if (!refreshed) return;
+              const updated = (refreshed as any[])
+                .filter((li: any) => Number(li.total_amount))
+                .map((li: any) => ({
+                  date: (li.created_at || "").split("T")[0],
+                  description: li.description || "Service charge",
+                  amount: Number(li.total_amount),
+                  category: categorizeItem(li.item_type),
+                }));
+              updated.sort((a: any, b: any) => a.date.localeCompare(b.date));
+              setChargeLines(updated);
+            });
+        });
+      });
+    }
+  }, [admissionId, hospitalId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleDeposit = async () => {
+    const amount = parseFloat(depositAmount);
+    if (!amount || amount <= 0) { toast.error("Enter a valid amount"); return; }
+    setSaving(true);
+    try {
+      const { error } = await (supabase as any).from("ipd_advances").insert({
+        hospital_id:      hospitalId,
+        admission_id:     admissionId,
+        patient_id:       patientId,
+        amount,
+        transaction_type: "deposit",
+        payment_mode:     paymentMode,
+        reference_no:     referenceNo || null,
+        description:      depositNote || "Advance deposit",
+        collected_by:     userId,
+      });
+      if (error) throw error;
+
+      // Sync to bill_payments so billing, analytics and dashboard reflect the receipt
+      await syncAdvanceToBill({
+        admissionId,
+        hospitalId,
+        amount,
+        paymentMode,
+        userId,
+        referenceNo: referenceNo || null,
+        notes:       depositNote || "Advance deposit",
+      });
+
+      toast.success(`₹${amount.toLocaleString("en-IN")} advance collected`);
+      setShowDeposit(false);
+      setDepositAmount(""); setReferenceNo(""); setDepositNote("");
+      load();
+    } catch (e: any) {
+      toast.error(e.message || "Failed to record advance");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const openConsult = async () => {
+    setShowConsult(true);
+    setConsultLoadingDocs(true);
+    try {
+      const docs = await fetchConsultationDoctors(hospitalId, admissionId);
+      setConsultDoctors(docs);
+      if (docs.length > 0) {
+        const first = docs[0];
+        setConsultDoctorId(first.doctorId);
+        setConsultFee(first.fee ? String(first.fee) : "");
+        setConsultGst(first.gstPercent);
+        setConsultHsn(first.hsnCode);
+      }
+    } catch (e: any) {
+      toast.error(e?.message || "Could not load doctors");
+    } finally {
+      setConsultLoadingDocs(false);
+    }
+  };
+
+  const handleConsultDoctorChange = (id: string) => {
+    setConsultDoctorId(id);
+    const d = consultDoctors.find((x) => x.doctorId === id);
+    if (d) {
+      setConsultFee(d.fee ? String(d.fee) : "");
+      setConsultGst(d.gstPercent);
+      setConsultHsn(d.hsnCode);
+    }
+  };
+
+  const handleAddConsult = async () => {
+    const doc = consultDoctors.find((x) => x.doctorId === consultDoctorId);
+    const fee = parseFloat(consultFee);
+    const visits = parseInt(consultVisits, 10);
+    if (!doc) { toast.error("Select a doctor"); return; }
+    if (!fee || fee <= 0) { toast.error("Enter a valid consultation fee"); return; }
+    setSavingConsult(true);
+    try {
+      const res = await addManualConsultationCharge({
+        hospitalId,
+        patientId,
+        admissionId,
+        doctorId: doc.doctorId,
+        doctorName: doc.doctorName,
+        date: consultDate,
+        visits: Number.isFinite(visits) ? visits : 1,
+        fee,
+        gstPercent: consultGst,
+        hsnCode: consultHsn,
+        orderedBy: userId,
+      });
+      if (!res.ok) { toast.error(res.error || "Failed to add consultation"); return; }
+      toast.success(`Consultation charged: ₹${(res.amount || 0).toLocaleString("en-IN")}`);
+      setShowConsult(false);
+      setConsultVisits("1");
+      load();
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to add consultation");
+    } finally {
+      setSavingConsult(false);
+    }
+  };
+
+  const openNursing = async () => {
+    setShowNursing(true);
+    setNursingLoadingRate(true);
+    try {
+      const { rate } = await fetchWardNursingRate(admissionId);
+      setWardNursingRate(rate);
+      // Prefill from the ward, but leave it editable — special nursing normally costs
+      // more than the routine daily rate.
+      setNursingRate(rate > 0 ? String(rate) : "");
+    } catch (e: any) {
+      toast.error(e?.message || "Could not load the ward's nursing rate");
+    } finally {
+      setNursingLoadingRate(false);
+    }
+  };
+
+  const handleAddNursing = async () => {
+    const rate = parseFloat(nursingRate);
+    const days = parseInt(nursingDays, 10);
+    if (!rate || rate <= 0) { toast.error("Enter a valid nursing rate"); return; }
+    setSavingNursing(true);
+    try {
+      const res = await addSpecialNursingCharge({
+        hospitalId,
+        patientId,
+        admissionId,
+        date: nursingDate,
+        days: Number.isFinite(days) ? days : 1,
+        rate,
+        orderedBy: userId,
+      });
+      if (!res.ok) { toast.error(res.error || "Failed to add nursing charge"); return; }
+      toast.success(`Nursing charged: ₹${(res.amount || 0).toLocaleString("en-IN")}`);
+      setShowNursing(false);
+      setNursingDays("1");
+      load();
+    } catch (e: any) {
+      toast.error(e?.message || "Failed to add nursing charge");
+    } finally {
+      setSavingNursing(false);
+    }
+  };
+
+  const totalCharges   = chargeLines.reduce((s, l) => s + l.amount, 0);
+  const effectiveCharges = Math.max(0, totalCharges - discountAmount);
+  const netAdvance     = totalDeposited - totalRefunded;
+  const balanceDue     = effectiveCharges - netAdvance - directCashPaid;
+  const isRefund       = balanceDue < 0;
+  const balanceColor  = balanceDue > 0 ? "text-amber-700" : isRefund ? "text-blue-700" : "text-emerald-700";
+  const balanceBg     = balanceDue > 0 ? "bg-amber-50"   : isRefund ? "bg-blue-50"    : "bg-emerald-50";
+
+  return (
+    <div className="h-full flex flex-col overflow-hidden p-4 gap-3">
+
+      {/* ── Summary row ── */}
+      <div className="grid grid-cols-3 gap-3 flex-shrink-0">
+        <div className="bg-muted/50 rounded-lg p-3">
+          <p className="text-[11px] text-muted-foreground">Total Charges</p>
+          <p className="text-lg font-bold">{fmt(effectiveCharges)}</p>
+          {discountAmount > 0 && (
+            <p className="text-[10px] text-destructive mt-0.5">Discount: −{fmt(discountAmount)}</p>
+          )}
+          {directCashPaid > 0 && (
+            <p className="text-[10px] text-emerald-700 mt-0.5">Cash/UPI paid: {fmt(directCashPaid)}</p>
+          )}
+        </div>
+        <div className="bg-emerald-50 rounded-lg p-3">
+          <p className="text-[11px] text-emerald-700">Advance Paid</p>
+          <p className="text-lg font-bold text-emerald-700">{fmt(totalDeposited)}</p>
+          {totalRefunded > 0 && (
+            <p className="text-[10px] text-blue-600 mt-0.5">
+              Refunded: −{fmt(totalRefunded)} · Net: {fmt(netAdvance)}
+            </p>
+          )}
+          {totalDebited > 0 && (
+            <p className="text-[10px] text-muted-foreground mt-0.5">
+              Applied: {fmt(totalDebited)} · Balance: {fmt(netAdvance - totalDebited)}
+            </p>
+          )}
+        </div>
+        <div className={`rounded-lg p-3 ${balanceBg}`}>
+          <p className={`text-[11px] ${balanceColor}`}>
+            {isRefund ? "⬅ Refund Due" : "Balance Due"}
+          </p>
+          <p className={`text-lg font-bold ${balanceColor}`}>
+            {balanceDue > 0 ? fmt(balanceDue) : isRefund ? fmt(Math.abs(balanceDue)) : "Nil"}
+          </p>
+          {isRefund && (
+            <p className="text-[10px] text-blue-600 mt-0.5">Patient overpaid — refund required</p>
+          )}
+        </div>
+      </div>
+
+      {/* ── Two-panel body ── */}
+      <div className="flex-1 flex gap-3 overflow-hidden min-h-0">
+
+        {/* Left: Charges ledger */}
+        <div className="flex-1 flex flex-col overflow-hidden rounded-lg border border-border">
+          <div className="flex-shrink-0 px-3 py-2 bg-muted/40 border-b border-border space-y-1">
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Charges</p>
+              {!loading && isEstimate && (
+                <span className="text-[10px] font-semibold px-1.5 py-px rounded-full bg-amber-50 text-amber-700">
+                  Estimate — IPD bill not yet generated
+                </span>
+              )}
+              {!loading && !isEstimate && (
+                <span className="text-[10px] font-semibold px-1.5 py-px rounded-full bg-emerald-50 text-emerald-700">
+                  From IPD bill
+                </span>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 px-2 text-xs ml-auto"
+                onClick={openConsult}
+                disabled={loading}
+                title="Charge a doctor's consultation / round even when no ward-round note was recorded"
+              >
+                <Stethoscope className="h-3 w-3 mr-1" /> Add Consultation
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-6 px-2 text-xs"
+                onClick={openNursing}
+                disabled={loading}
+                title="Charge special / one-to-one nursing. Routine daily nursing is billed automatically from the ward's configured rate."
+              >
+                <HeartPulse className="h-3 w-3 mr-1" /> Add Nursing
+              </Button>
+            </div>
+            {!loading && noDiagnosis && (
+              <p className="text-[10px] text-amber-700">
+                ⚠ No admitting diagnosis recorded — add a provisional diagnosis before finalising billing.
+              </p>
+            )}
+          </div>
+          {loading ? (
+            <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading…
+            </div>
+          ) : chargeLines.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
+              No charges recorded
+            </div>
+          ) : (
+            <div className="flex-1 overflow-y-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-muted/70 backdrop-blur z-10">
+                  <tr className="text-[10px] font-semibold text-muted-foreground uppercase">
+                    <th className="text-left py-2 px-3">Date</th>
+                    <th className="text-left py-2 px-3">Description</th>
+                    <th className="text-center py-2 px-3">Type</th>
+                    <th className="text-right py-2 px-3">Amount</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/50">
+                  {chargeLines.map((l, i) => (
+                    <tr key={i} className="hover:bg-muted/20 transition-colors">
+                      <td className="py-2 px-3 text-xs tabular-nums text-muted-foreground whitespace-nowrap">
+                        {l.date
+                          ? new Date(l.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })
+                          : "—"}
+                      </td>
+                      <td className="py-2 px-3 text-xs">{l.description}</td>
+                      <td className="py-2 px-3 text-center">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-full font-semibold capitalize ${CATEGORY_COLORS[l.category]}`}>
+                          {l.category}
+                        </span>
+                      </td>
+                      <td className="py-2 px-3 text-right tabular-nums font-semibold text-sm">
+                        {l.amount > 0
+                          ? fmt(l.amount)
+                          : <span className="text-muted-foreground text-xs">Pending</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot className="border-t-2 border-border">
+                  <tr className="bg-muted/30 font-bold">
+                    <td colSpan={3} className="py-2 px-3 text-xs text-right text-muted-foreground uppercase">Total</td>
+                    <td className="py-2 px-3 text-right text-sm tabular-nums">{fmt(totalCharges)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+          )}
+        </div>
+
+        {/* Right: Advance panel */}
+        <div className="w-72 flex flex-col overflow-hidden rounded-lg border border-border">
+          <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 bg-muted/40 border-b border-border">
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+              Advance{patientName ? ` — ${patientName}` : ""}
+            </p>
+            <div className="flex gap-1">
+              <Button size="icon" variant="ghost" className="h-6 w-6" onClick={load} disabled={loading}>
+                <RefreshCw className={`h-3 w-3 ${loading ? "animate-spin" : ""}`} />
+              </Button>
+              <Button size="sm" className="h-6 px-2 text-xs" onClick={() => setShowDeposit(true)}>
+                <Plus className="h-3 w-3 mr-1" /> Collect
+              </Button>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+            </div>
+          ) : advanceTxns.length === 0 ? (
+            <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground px-3 text-center">
+              No advance transactions yet
+            </div>
+          ) : (
+            <div className="flex-1 overflow-y-auto divide-y divide-border/40">
+              {advanceTxns.map((tx) => {
+                const isCredit = tx.transaction_type === "deposit" || tx.transaction_type === "adjustment";
+                return (
+                  <div key={tx.id} className="flex items-start gap-2 px-3 py-2 hover:bg-muted/20 transition-colors">
+                    {TX_ICONS[tx.transaction_type] ?? <Wallet className="h-3.5 w-3.5 shrink-0 mt-0.5" />}
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs truncate">{tx.description || tx.transaction_type}</p>
+                      <p className="text-[10px] text-muted-foreground truncate">
+                        {new Date(tx.created_at).toLocaleString("en-IN", { dateStyle: "short", timeStyle: "short" })}
+                        {tx.payment_mode && ` · ${tx.payment_mode}`}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <p className={`text-xs font-semibold ${isCredit ? "text-emerald-600" : "text-red-600"}`}>
+                        {isCredit ? "+" : "−"}₹{tx.amount.toLocaleString("en-IN")}
+                      </p>
+                      <Badge variant="outline" className="text-[9px] py-0 px-1 capitalize mt-0.5">
+                        {tx.transaction_type.replace("_", " ")}
+                      </Badge>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Advance balance footer */}
+          <div className="flex-shrink-0 border-t border-border bg-muted/30 px-3 py-2 space-y-0.5">
+            <div className="flex justify-between text-[10px] text-muted-foreground">
+              <span>Total Deposited</span>
+              <span className="font-semibold text-emerald-700">{fmt(totalDeposited)}</span>
+            </div>
+            {totalRefunded > 0 && (
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>Refunded to Patient</span>
+                <span className="font-semibold text-blue-600">−{fmt(totalRefunded)}</span>
+              </div>
+            )}
+            {totalDebited > 0 && (
+              <div className="flex justify-between text-[10px] text-muted-foreground">
+                <span>Applied to Bill</span>
+                <span className="font-semibold text-red-600">−{fmt(totalDebited)}</span>
+              </div>
+            )}
+            <div className="flex justify-between text-[11px] font-bold border-t border-border/60 pt-1 mt-1">
+              <span>Advance Balance</span>
+              <span className={netAdvance - totalDebited >= 0 ? "text-emerald-700" : "text-red-600"}>
+                {fmt(Math.max(0, netAdvance - totalDebited))}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Collect Advance modal */}
+      <Dialog open={showDeposit} onOpenChange={setShowDeposit}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Collect Advance</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div>
+              <Label className="text-xs">Amount (₹) *</Label>
+              <Input
+                type="number"
+                value={depositAmount}
+                onChange={(e) => setDepositAmount(e.target.value)}
+                placeholder="0"
+                className="mt-1"
+                autoFocus
+              />
+            </div>
+            <div>
+              <Label className="text-xs">Payment Mode</Label>
+              <Select value={paymentMode} onValueChange={setPaymentMode}>
+                <SelectTrigger className="mt-1"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="cash">Cash</SelectItem>
+                  <SelectItem value="upi">UPI</SelectItem>
+                  <SelectItem value="card">Card</SelectItem>
+                  <SelectItem value="neft">NEFT/RTGS</SelectItem>
+                  <SelectItem value="cheque">Cheque</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {paymentMode !== "cash" && (
+              <div>
+                <Label className="text-xs">Reference / Transaction No.</Label>
+                <Input value={referenceNo} onChange={(e) => setReferenceNo(e.target.value)} className="mt-1" />
+              </div>
+            )}
+            <div>
+              <Label className="text-xs">Note</Label>
+              <Input value={depositNote} onChange={(e) => setDepositNote(e.target.value)} placeholder="Optional" className="mt-1" />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowDeposit(false)}>Cancel</Button>
+            <Button onClick={handleDeposit} disabled={saving}>
+              {saving && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              Collect ₹{parseFloat(depositAmount || "0").toLocaleString("en-IN")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Doctor Consultation modal — manual "doctor round" charge */}
+      <Dialog open={showConsult} onOpenChange={setShowConsult}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Add Doctor Consultation</DialogTitle>
+          </DialogHeader>
+          <p className="text-[11px] text-muted-foreground -mt-1">
+            Charges a doctor's consultation / round for a day when no ward-round note was
+            recorded. One line per doctor per date — re-adding replaces it.
+          </p>
+          {consultLoadingDocs ? (
+            <div className="flex items-center justify-center py-6 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading doctors…
+            </div>
+          ) : consultDoctors.length === 0 ? (
+            <div className="py-6 text-center text-sm text-muted-foreground">
+              No doctors with a consultation fee configured.
+              <span className="block text-[11px] mt-1">Set one up in Settings → Services.</span>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div>
+                <Label className="text-xs">Doctor *</Label>
+                <Select value={consultDoctorId} onValueChange={handleConsultDoctorChange}>
+                  <SelectTrigger className="mt-1"><SelectValue placeholder="Select doctor" /></SelectTrigger>
+                  <SelectContent>
+                    {consultDoctors.map((d) => (
+                      <SelectItem key={d.doctorId} value={d.doctorId}>
+                        Dr. {d.doctorName}{d.fee ? ` — ₹${d.fee.toLocaleString("en-IN")}` : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs">Date *</Label>
+                  <Input type="date" value={consultDate} onChange={(e) => setConsultDate(e.target.value)} className="mt-1" />
+                </div>
+                <div>
+                  <Label className="text-xs">Visits</Label>
+                  <Input type="number" min="1" value={consultVisits} onChange={(e) => setConsultVisits(e.target.value)} className="mt-1" />
+                </div>
+              </div>
+              <div>
+                <Label className="text-xs">Fee per visit (₹) *</Label>
+                <Input type="number" min="0" value={consultFee} onChange={(e) => setConsultFee(e.target.value)} placeholder="0" className="mt-1" />
+                {consultGst > 0 && (
+                  <p className="text-[10px] text-muted-foreground mt-1">+{consultGst}% GST applies</p>
+                )}
+              </div>
+              <div className="text-xs text-muted-foreground flex justify-between border-t border-border/60 pt-2">
+                <span>Total (incl. GST)</span>
+                <span className="font-semibold text-foreground">
+                  {(() => {
+                    const f = parseFloat(consultFee) || 0;
+                    const v = Math.max(1, parseInt(consultVisits, 10) || 1);
+                    const taxable = f * v;
+                    return fmt(taxable + (taxable * consultGst) / 100);
+                  })()}
+                </span>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowConsult(false)}>Cancel</Button>
+            <Button onClick={handleAddConsult} disabled={savingConsult || consultLoadingDocs || consultDoctors.length === 0}>
+              {savingConsult && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              Add Consultation
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Special Nursing modal — one-to-one / private-duty nursing only */}
+      <Dialog open={showNursing} onOpenChange={setShowNursing}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Add Special Nursing Charge</DialogTitle>
+          </DialogHeader>
+          <p className="text-[11px] text-muted-foreground -mt-1">
+            For one-to-one / private-duty nursing only. Routine daily nursing is billed
+            automatically from the ward's rate. One line per date — re-adding replaces it.
+          </p>
+          {nursingLoadingRate ? (
+            <div className="flex items-center justify-center py-6 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading ward rate…
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <Label className="text-xs">Date *</Label>
+                  <Input type="date" value={nursingDate} onChange={(e) => setNursingDate(e.target.value)} className="mt-1" />
+                </div>
+                <div>
+                  <Label className="text-xs">Days</Label>
+                  <Input type="number" min="1" value={nursingDays} onChange={(e) => setNursingDays(e.target.value)} className="mt-1" />
+                </div>
+              </div>
+              <div>
+                <Label className="text-xs">Rate per day (₹) *</Label>
+                <Input type="number" min="0" value={nursingRate} onChange={(e) => setNursingRate(e.target.value)} placeholder="0" className="mt-1" />
+                {wardNursingRate === 0 && (
+                  <p className="text-[10px] text-amber-700 mt-1">
+                    This ward has no nursing rate configured — set one in Settings → Wards &amp; Beds,
+                    or just enter the amount here.
+                  </p>
+                )}
+                <p className="text-[10px] text-muted-foreground mt-1">
+                  GST-exempt. Insurers treat special nursing as non-payable, so this is normally
+                  a cash item.
+                </p>
+              </div>
+              <div className="text-xs text-muted-foreground flex justify-between border-t border-border/60 pt-2">
+                <span>Total</span>
+                <span className="font-semibold text-foreground">
+                  {fmt((parseFloat(nursingRate) || 0) * Math.max(1, parseInt(nursingDays, 10) || 1))}
+                </span>
+              </div>
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setShowNursing(false)}>Cancel</Button>
+            <Button onClick={handleAddNursing} disabled={savingNursing || nursingLoadingRate}>
+              {savingNursing && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              Add Nursing
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+};
+
+export default IPDFinancialTab;

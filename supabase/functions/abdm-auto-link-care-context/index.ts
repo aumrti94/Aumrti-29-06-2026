@@ -1,0 +1,272 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { sanitizeForLog } from "../_shared/phi-redactor.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+type EventType = "opd_completed" | "ipd_discharged" | "lab_reported" | "radiology_reported";
+
+interface CareContextMeta {
+  reference: string;
+  display: string;
+  context_type: string;
+}
+
+async function buildCareContextMeta(
+  sb: ReturnType<typeof createClient>,
+  eventType: EventType,
+  sourceId: string,
+  hospitalId: string,
+): Promise<CareContextMeta | null> {
+  switch (eventType) {
+    case "opd_completed": {
+      const { data } = await sb
+        .from("opd_tokens")
+        .select("token_number, visit_date, doctor:users!doctor_id(full_name)")
+        .eq("id", sourceId)
+        .eq("hospital_id", hospitalId)
+        .maybeSingle();
+      if (!data) return null;
+      const doctorName = (data.doctor as Record<string, unknown> | null)?.full_name ?? "Doctor";
+      const visitDate = new Date(data.visit_date as string).toLocaleDateString("en-IN");
+      return {
+        reference: `OPD-${sourceId}`,
+        display: `OPD Visit — ${doctorName} — ${visitDate}`,
+        context_type: "OPDRecord",
+      };
+    }
+
+    case "ipd_discharged": {
+      const { data } = await sb
+        .from("admissions")
+        .select("admission_date, discharge_date, ward, bed_number, doctor:users!doctor_id(full_name)")
+        .eq("id", sourceId)
+        .eq("hospital_id", hospitalId)
+        .maybeSingle();
+      if (!data) return null;
+      const doctorName = (data.doctor as Record<string, unknown> | null)?.full_name ?? "Doctor";
+      const admDate = new Date(data.admission_date as string).toLocaleDateString("en-IN");
+      const disDate = data.discharge_date
+        ? new Date(data.discharge_date as string).toLocaleDateString("en-IN")
+        : "ongoing";
+      return {
+        reference: `IPD-${sourceId}`,
+        display: `IPD Admission — ${doctorName} — ${admDate} to ${disDate}`,
+        context_type: "DischargeSummaryRecord",
+      };
+    }
+
+    case "lab_reported": {
+      // "lab_reports" has never existed. A reported lab is a lab_orders row; the test name lives
+      // on lab_test_master via lab_order_items, and the report timestamp is the item's
+      // validated_at. This read previously always failed, so no lab care-context was ever linked
+      // to ABDM.
+      const { data } = await sb
+        .from("lab_orders")
+        .select("id, order_date, lab_order_items(validated_at, lab_test_master(test_name))")
+        .eq("id", sourceId)
+        .eq("hospital_id", hospitalId)
+        .maybeSingle();
+      if (!data) return null;
+      const items = (data.lab_order_items ?? []) as Array<{
+        validated_at: string | null;
+        lab_test_master: { test_name: string | null } | null;
+      }>;
+      const testName = items.map((i) => i.lab_test_master?.test_name).filter(Boolean).join(", ") || "Lab Test";
+      const reportedAt = items.map((i) => i.validated_at).filter(Boolean).sort().pop() ?? data.order_date;
+      const reportedDate = reportedAt ? new Date(reportedAt as string).toLocaleDateString("en-IN") : "";
+      return {
+        reference: `LAB-${sourceId}`,
+        display: `Lab Report — ${testName} — ${reportedDate}`,
+        context_type: "DiagnosticReportRecord",
+      };
+    }
+
+    case "radiology_reported": {
+      const { data } = await sb
+        .from("radiology_reports")
+        .select("study_type, reported_at")
+        .eq("id", sourceId)
+        .eq("hospital_id", hospitalId)
+        .maybeSingle();
+      if (!data) return null;
+      const reportedDate = new Date(data.reported_at as string).toLocaleDateString("en-IN");
+      return {
+        reference: `RAD-${sourceId}`,
+        display: `Radiology Report — ${data.study_type} — ${reportedDate}`,
+        context_type: "DiagnosticReportRecord",
+      };
+    }
+
+    default:
+      return null;
+  }
+}
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+
+  try {
+    // ── Auth ─────────────────────────────────────────────────────────────────
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader) return json({ error: "unauthorized" }, 401);
+
+    const anonClient = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_ANON_KEY")!,
+      { global: { headers: { Authorization: authHeader } } },
+    );
+    const { data: { user }, error: authErr } = await anonClient.auth.getUser();
+    if (authErr || !user) return json({ error: "unauthorized" }, 401);
+
+    const sb = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+    );
+
+    const { data: userRow } = await sb
+      .from("users")
+      .select("hospital_id")
+      // auth_user_id, NOT id — the two diverged in migration 20260322111223.
+      .eq("auth_user_id", user.id)
+      .maybeSingle();
+    if (!userRow?.hospital_id) return json({ error: "user hospital not found" }, 403);
+    const callerHospitalId: string = userRow.hospital_id;
+
+    // ── Input ────────────────────────────────────────────────────────────────
+    const body = await req.json() as {
+      hospital_id: string;
+      patient_id: string;
+      event_type: EventType;
+      source_id: string;
+    };
+
+    if (body.hospital_id !== callerHospitalId) {
+      return json({ error: "cross-hospital access denied" }, 403);
+    }
+
+    const { patient_id, event_type, source_id } = body;
+    if (!patient_id || !event_type || !source_id) {
+      return json({ error: "patient_id, event_type, and source_id are required" }, 400);
+    }
+
+    // ── Check patient has active ABHA ────────────────────────────────────────
+    const { data: profile } = await sb
+      .from("patient_abha_profiles")
+      .select("abha_address, abha_number")
+      .eq("patient_id", patient_id)
+      .eq("hospital_id", callerHospitalId)
+      .maybeSingle();
+
+    if (!profile?.abha_address) {
+      return json({ skipped: true, reason: "no_abha" });
+    }
+
+    // ── Check HIP sharing enabled ────────────────────────────────────────────
+    const { data: cfg } = await sb
+      .from("hospital_abdm_config")
+      .select("feature_hip_sharing")
+      .eq("hospital_id", callerHospitalId)
+      .maybeSingle();
+
+    if (!cfg?.feature_hip_sharing) {
+      return json({ skipped: true, reason: "hip_sharing_disabled" });
+    }
+
+    // ── Build care context metadata from clinical event ──────────────────────
+    const meta = await buildCareContextMeta(sb, event_type, source_id, callerHospitalId);
+    if (!meta) {
+      return json({ skipped: true, reason: "source_record_not_found" });
+    }
+
+    // ── Avoid duplicate care contexts ────────────────────────────────────────
+    const { data: existing } = await sb
+      .from("abdm_care_contexts")
+      .select("id")
+      .eq("reference", meta.reference)
+      .eq("hospital_id", callerHospitalId)
+      .maybeSingle();
+
+    let careContextId: string;
+
+    if (existing) {
+      careContextId = existing.id as string;
+    } else {
+      const { data: inserted, error: insertErr } = await sb
+        .from("abdm_care_contexts")
+        .insert({
+          hospital_id: callerHospitalId,
+          patient_id,
+          reference: meta.reference,
+          display: meta.display,
+          context_type: meta.context_type,
+          source_id,
+          link_status: "unlinked",
+        })
+        .select("id")
+        .maybeSingle();
+
+      if (insertErr || !inserted) {
+        console.error("Failed to insert care context:", insertErr);
+        return json({ error: "failed to create care context" }, 500);
+      }
+
+      careContextId = inserted.id as string;
+    }
+
+    // ── Trigger HIP link-init to notify patient ──────────────────────────────
+    // Was `sb.functions.invoke(...)` on `sb`, the SERVICE-ROLE client — but
+    // abdm-hip-link-init deliberately requires a real Supabase user JWT (confirmed live: it
+    // rejects the service-role key itself with 401 "unauthorized"), the same defect class as
+    // KNOWN-BUG-187(b) (submit-pre-auth-hcx → hcx-claim-submit). This meant the "notify
+    // patient" step has always failed — for every hospital, every event, ever — while still
+    // reporting overall `success: true` with `linked: false`. This function already
+    // independently verified the caller belongs to `callerHospitalId` above, so forwarding
+    // that same already-verified bearer preserves the trust chain abdm-hip-link-init's own
+    // auth check expects. Found via Phase 6 edge-function testing.
+    const linkInitRes = await fetch(`${Deno.env.get("SUPABASE_URL")}/functions/v1/abdm-hip-link-init`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: authHeader },
+      body: JSON.stringify({
+        hospital_id: callerHospitalId,
+        patient_id,
+        care_context_ids: [careContextId],
+      }),
+    });
+    const linkResult = await linkInitRes.json().catch(() => ({}));
+    const linkErr = linkInitRes.ok ? null : (linkResult as any)?.error ?? `HTTP ${linkInitRes.status}`;
+
+    if (linkErr) {
+      // Care context was created — return partial success
+      console.warn("Care context created but link-init failed:", linkErr);
+      return json({
+        success: true,
+        care_context_id: careContextId,
+        linked: false,
+        warning: "Care context recorded; patient notification failed. Retry via HIP link.",
+      });
+    }
+
+    return json({
+      success: true,
+      care_context_id: careContextId,
+      linked: true,
+      transaction_id: (linkResult as Record<string, unknown>)?.transactionId,
+      message: `Care context created and link initiated for ${event_type}.`,
+    });
+  } catch (err) {
+    console.error("abdm-auto-link-care-context error:", sanitizeForLog(err instanceof Error ? err.message : String(err)));
+    return json({ error: "internal server error" }, 500);
+  }
+});

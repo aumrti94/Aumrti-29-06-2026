@@ -1,0 +1,221 @@
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { resolveAiConfig, callAiChat } from "../_shared/ai-config.ts";
+import { sanitizeForLog } from "../_shared/phi-redactor.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+
+  try {
+    // Auth verification — this endpoint returns PHI (diagnoses, allergies, medications),
+    // so it must never be reachable without a valid session.
+    const authHeader = req.headers.get("Authorization");
+    if (!authHeader?.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    const anonClient = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_ANON_KEY")!);
+    const { data: { user }, error: authError } = await anonClient.auth.getUser(authHeader.replace("Bearer ", ""));
+    if (authError || !user) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    let patient_id: string | undefined;
+    try {
+      ({ patient_id } = await req.json());
+    } catch {
+      return new Response(JSON.stringify({ error: "Invalid JSON body" }), {
+        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    if (!patient_id) {
+      return new Response(JSON.stringify({ error: "patient_id required" }), {
+        status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    const sb = createClient(
+      Deno.env.get("SUPABASE_URL")!,
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+    );
+
+    // Resolve hospital from the authenticated user — never trust hospital_id from the request body.
+    const { data: userData } = await sb
+      .from("users")
+      .select("hospital_id")
+      .eq("auth_user_id", user.id)
+      .maybeSingle();
+    if (!userData) {
+      return new Response(JSON.stringify({ error: "Forbidden" }), {
+        status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    const hospital_id = userData.hospital_id;
+
+    // Fetch patient record — scoped to the caller's own hospital, so a patient_id
+    // belonging to another hospital resolves to nothing rather than leaking PHI.
+    // Was "allergy_history" — that column has never existed (the real free-text column is
+    // "allergies"), so this select failed on every call, PostgREST's error was never checked,
+    // and `patient` was always falsy — every invocation of this function, for every patient,
+    // has returned 404 "Not found" since it shipped. Found via Phase 6 edge-function testing.
+    const { data: patient, error: patientErr } = await sb
+      .from("patients")
+      .select("full_name, dob, gender, allergies")
+      .eq("id", patient_id)
+      .eq("hospital_id", hospital_id)
+      .maybeSingle();
+
+    if (patientErr) {
+      console.error("[update-patient-ai-context] patient lookup failed:", sanitizeForLog(patientErr.message));
+    }
+
+    if (!patient) {
+      return new Response(JSON.stringify({ error: "Not found" }), {
+        status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Fetch recent OPD encounters (last 5)
+    const { data: encounters } = await sb
+      .from("opd_encounters")
+      .select("chief_complaint, diagnosis, icd10_code, soap_plan")
+      .eq("patient_id", patient_id)
+      .eq("hospital_id", hospital_id)
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    // Fetch active prescriptions
+    const { data: rxRows } = await sb
+      .from("prescriptions")
+      .select("items")
+      .eq("patient_id", patient_id)
+      .eq("hospital_id", hospital_id)
+      .order("created_at", { ascending: false })
+      .limit(3);
+
+    // Fetch care plans (chronic conditions)
+    const { data: carePlans } = await sb
+      .from("care_plans")
+      .select("condition, status")
+      .eq("patient_id", patient_id)
+      .eq("hospital_id", hospital_id)
+      .eq("status", "active");
+
+    // Fetch allergy records
+    const { data: allergies } = await sb
+      .from("allergy_records")
+      .select("allergen, severity, reaction")
+      .eq("patient_id", patient_id)
+      .eq("hospital_id", hospital_id)
+      .eq("status", "active")
+      .limit(10);
+
+    // Extract structured data
+    const chronicConditions = (carePlans || []).map((c: any) => c.condition).filter(Boolean);
+    const knownAllergies = (allergies || [])
+      .map((a: any) => `${a.allergen}${a.severity ? ` (${a.severity})` : ""}`)
+      .filter(Boolean);
+    if (patient?.allergies && knownAllergies.length === 0) {
+      knownAllergies.push(patient.allergies);
+    }
+
+    const currentMeds: string[] = [];
+    for (const rx of (rxRows || [])) {
+      const items = rx.items || [];
+      for (const item of items) {
+        const name = item.drug_name || item.name;
+        if (name && !currentMeds.includes(name)) currentMeds.push(name);
+      }
+    }
+
+    const recentDiagnoses = (encounters || [])
+      .flatMap((e: any) => {
+        const parts = [];
+        if (e.diagnosis) parts.push(e.diagnosis);
+        if (e.icd10_code) parts.push(e.icd10_code);
+        return parts;
+      })
+      .filter(Boolean)
+      .slice(0, 5);
+
+    // Build AI context summary
+    const config = await resolveAiConfig(hospital_id, "patient_context_summary", 200);
+    let contextSummary = "";
+
+    if (config) {
+      const patientAge = patient?.dob
+        ? Math.floor((Date.now() - new Date(patient.dob).getTime()) / 31557600000)
+        : null;
+
+      const promptData = {
+        name: patient?.full_name,
+        age: patientAge,
+        gender: patient?.gender,
+        chronicConditions,
+        knownAllergies,
+        currentMedications: currentMeds,
+        recentDiagnoses,
+        recentChiefComplaints: (encounters || []).map((e: any) => e.chief_complaint).filter(Boolean).slice(0, 3),
+      };
+
+      const messages = [
+        {
+          role: "system" as const,
+          content: "You are a clinical summarizer. Write a 2-3 sentence concise patient context summary for AI prompts. Focus on clinically relevant facts only.",
+        },
+        {
+          role: "user" as const,
+          content: `Patient data: ${JSON.stringify(promptData)}. Summarize for AI clinical context injection.`,
+        },
+      ];
+
+      contextSummary = await callAiChat(config, messages, 200, 0.3);
+    } else {
+      contextSummary = [
+        chronicConditions.length ? `Known conditions: ${chronicConditions.join(", ")}.` : "",
+        knownAllergies.length ? `Allergies: ${knownAllergies.join(", ")}.` : "",
+        currentMeds.length ? `Current medications: ${currentMeds.slice(0, 3).join(", ")}.` : "",
+      ].filter(Boolean).join(" ") || "No significant medical history recorded.";
+    }
+
+    // Upsert patient AI context
+    const { error } = await sb.from("patient_ai_context").upsert({
+      hospital_id,
+      patient_id,
+      chronic_conditions: chronicConditions,
+      known_allergies: knownAllergies,
+      current_medications: currentMeds,
+      recent_diagnoses: recentDiagnoses,
+      past_surgeries: [],
+      risk_flags: [],
+      context_summary: contextSummary,
+      last_updated: new Date().toISOString(),
+    }, { onConflict: "hospital_id,patient_id" });
+
+    if (error) throw error;
+
+    return new Response(JSON.stringify({
+      success: true,
+      context_summary: contextSummary,
+      chronic_conditions: chronicConditions,
+      known_allergies: knownAllergies,
+      current_medications: currentMeds,
+    }), { headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+  } catch (err) {
+    // Never return a raw error to the caller — it can carry table/constraint names or, since
+    // this function's own upsert payload is entirely patient clinical data, PHI-shaped content.
+    console.error("[update-patient-ai-context] failed:", sanitizeForLog(err instanceof Error ? err.message : String(err)));
+    return new Response(JSON.stringify({ error: "Internal error" }), {
+      status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+});

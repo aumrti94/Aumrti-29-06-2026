@@ -1,0 +1,1604 @@
+import React, { useState, useEffect, useCallback, useRef } from "react";
+import { generatePatientUhid } from "@/lib/patient-records";
+import { Link } from "react-router-dom";
+import { useDebounce } from "@/hooks/useDebounce";
+import { supabase } from "@/integrations/supabase/client";
+import { useToast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
+import { X, Search, CheckCircle2, ArrowLeft, CreditCard, Printer, UserPlus, AlertTriangle, ShieldCheck } from "lucide-react";
+import ABHARegistrationPanel from "@/components/abdm/ABHARegistrationPanel";
+import { autoPostJournalEntry } from "@/lib/accounting";
+import { generateBillNumber } from "@/hooks/useBillNumber";
+import { logAudit } from "@/lib/auditLog";
+import AddReferralDoctorModal from "@/components/shared/AddReferralDoctorModal";
+import { printBillById } from "@/lib/billPrint";
+import { getErrorMessage } from "@/lib/errorMessage";
+import OutstandingBalanceBanner from "@/components/billing/OutstandingBalanceBanner";
+import { FormError } from "@/components/ui/FormError";
+import { sendWhatsApp } from "@/lib/whatsapp-send";
+import { recordServiceCharge } from "@/lib/serviceBilling";
+import { roundCurrency } from "@/lib/currency";
+import {
+  DEFAULT_CONSULTATION_FEE,
+  FALLBACK_RATE,
+  NO_EPISODE,
+  computeConsultationFee,
+  fetchRevisitRules,
+  findFeeEpisode,
+  resolveConsultationRate,
+  toDateKey,
+  type ChargedTier,
+  type ConsultationRate,
+  type FeeEpisode,
+  type RevisitRule,
+} from "@/lib/consultationFee";
+
+export interface AppointmentSlotContext {
+  id: string;
+  doctor_id: string;
+  slot_date: string;
+  slot_time: string;
+  slot_duration_mins: number;
+  slot_type?: string | null;
+}
+
+export interface CheckinAppointmentContext {
+  id: string;
+  patient_id: string;
+  patient_name: string;
+  uhid: string;
+  phone: string | null;
+  doctor_id: string;
+  department_id: string | null;
+  consultation_fee: number | null;
+  visit_type?: string | null;
+  visit_purpose?: string | null;
+}
+
+interface Props {
+  hospitalId: string;
+  onClose: () => void;
+  onCreated: () => void;
+  defaultDeptId?: string;
+  /**
+   * "appointment" books a future appointment for `appointmentSlot`.
+   * "checkin" collects payment + issues a token for an arrived `checkinAppointment`.
+   */
+  mode?: "walk_in" | "appointment" | "checkin";
+  appointmentSlot?: AppointmentSlotContext | null;
+  appointmentDoctorName?: string;
+  checkinAppointment?: CheckinAppointmentContext | null;
+}
+
+interface FoundPatient {
+  id: string;
+  full_name: string;
+  uhid: string;
+  phone: string | null;
+  abha_id?: string | null;
+}
+
+const genders = ["male", "female", "other"] as const;
+const priorities = ["normal", "urgent", "elderly", "pregnant", "disabled"] as const;
+
+const priorityLabels: Record<string, { label: string; active: string }> = {
+  normal: { label: "Normal", active: "bg-slate-700 text-white" },
+  urgent: { label: "Urgent", active: "bg-red-600 text-white" },
+  elderly: { label: "Elderly", active: "bg-amber-600 text-white" },
+  pregnant: { label: "Pregnant", active: "bg-pink-600 text-white" },
+  disabled: { label: "Disabled", active: "bg-violet-600 text-white" },
+};
+
+const PAYMENT_MODES = [
+  { value: "cash", label: "💵 Cash" },
+  { value: "upi", label: "📱 UPI" },
+  { value: "card", label: "💳 Card" },
+];
+
+const WalkInModal: React.FC<Props> = ({ hospitalId, onClose, onCreated, defaultDeptId, mode = "walk_in", appointmentSlot, appointmentDoctorName, checkinAppointment }) => {
+  const { toast } = useToast();
+  const isAppointment = mode === "appointment";
+  const isCheckin = mode === "checkin";
+  const [step, setStep] = useState<"details" | "payment" | "receipt">("details");
+  const receiptRef = useRef<HTMLDivElement>(null);
+  // Search
+  const [phone, setPhone] = useState("");
+  const [foundPatient, setFoundPatient] = useState<FoundPatient | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [useExisting, setUseExisting] = useState(false);
+  const [searchResults, setSearchResults] = useState<FoundPatient[]>([]);
+
+  // New patient fields
+  const [fullName, setFullName] = useState("");
+  const [age, setAge] = useState("");
+  const [gender, setGender] = useState<string>("male");
+  const [showOptional, setShowOptional] = useState(false);
+  const [dob, setDob] = useState("");
+  const [bloodGroup, setBloodGroup] = useState("");
+  const [address, setAddress] = useState("");
+  const [allergies, setAllergies] = useState("");
+
+  // Token fields
+  const [departments, setDepartments] = useState<{ id: string; name: string }[]>([]);
+  const [doctors, setDoctors] = useState<{ id: string; full_name: string; department_id: string | null }[]>([]);
+  const [deptId, setDeptId] = useState("");
+  const [doctorId, setDoctorId] = useState("");
+  const [priority, setPriority] = useState("normal");
+  const [submitting, setSubmitting] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [dpdpConsent, setDpdpConsent] = useState(false);
+
+  // Duplicate detection state
+  const [dupeCandidate, setDupeCandidate] = useState<FoundPatient | null>(null);
+  const [showDupeConfirm, setShowDupeConfirm] = useState(false);
+  const [dupeResolveCallback, setDupeResolveCallback] = useState<(() => void) | null>(null);
+
+  // Same-day duplicate billing guard
+  const [showSameDayWarn, setShowSameDayWarn] = useState(false);
+  const [sameDayToken, setSameDayToken] = useState<{ token_number: string; status: string; department?: string } | null>(null);
+  const [referralSource, setReferralSource] = useState("");
+  const [referralDoctorId, setReferralDoctorId] = useState<string | null>(null);
+  const [showReferralModal, setShowReferralModal] = useState(false);
+
+  // Visit type / purpose
+  const [visitType, setVisitType] = useState<"new" | "revisit" | "followup" | "emergency">("new");
+  const [visitPurpose, setVisitPurpose] = useState<"new" | "revisit" | "follow_up" | "review" | "procedure">("new");
+  const [revisitOfTokenId, setRevisitOfTokenId] = useState<string | null>(null);
+  const [revisitSuggestion, setRevisitSuggestion] = useState<{ tokenId: string; date: string; doctor: string } | null>(null);
+
+  // Revisit discount
+  const [revisitDiscount, setRevisitDiscount] = useState(0);
+  const [revisitDiscountNote, setRevisitDiscountNote] = useState("");
+
+  // 21-M MLC
+  const [isMlc, setIsMlc] = useState(false);
+  const [policeStation, setPoliceStation] = useState("");
+  const [showAbhaLink, setShowAbhaLink] = useState(false);
+
+  // Payer
+  const [payerType, setPayerType] = useState("cash");
+  const [payerId, setPayerId] = useState<string | null>(null);
+  const [payerMasters, setPayerMasters] = useState<{ id: string; payer_name: string; payer_type: string }[]>([]);
+
+  // Payment fields.
+  // Everything about WHAT to charge now comes from @/lib/consultationFee — the same engine
+  // ConsultationWorkspace uses to post the final bill, so the desk and the ledger can no
+  // longer disagree. This component only holds the resolved result for display.
+  const [rate, setRate] = useState<ConsultationRate>(FALLBACK_RATE);
+  const [episode, setEpisode] = useState<FeeEpisode | null>(null);
+  const [revisitRules, setRevisitRules] = useState<{ enabled?: boolean; rules?: RevisitRule[] } | null>(null);
+  const [consultationFee, setConsultationFee] = useState(DEFAULT_CONSULTATION_FEE);
+  const [chargedTier, setChargedTier] = useState<ChargedTier>("new");
+  const [feeReason, setFeeReason] = useState("");
+  const [paymentMode, setPaymentMode] = useState("cash");
+  const [paymentRef, setPaymentRef] = useState("");
+  const [receiptData, setReceiptData] = useState<{
+    billId: string;
+    billNumber: string;
+    patientName: string;
+    uhid: string;
+    department: string;
+    doctor: string;
+    token: string;
+    fee: number;
+    paymentMode: string;
+    date: string;
+    paid: boolean;
+    discountNote?: string;
+  } | null>(null);
+  const [hospitalInfo, setHospitalInfo] = useState<{ name: string; address: string | null } | null>(null);
+
+  useEffect(() => {
+    if (hospitalId) {
+      supabase.from("hospitals").select("name, address").eq("id", hospitalId).maybeSingle().then(({ data }) => {
+        setHospitalInfo(data);
+      });
+      (supabase as any).from("payer_masters").select("id, payer_name, payer_type").eq("hospital_id", hospitalId).eq("is_active", true).order("payer_name")
+        .then(({ data }: any) => setPayerMasters(data || []));
+    }
+  }, [hospitalId]);
+
+  // Fetch departments + doctors
+  useEffect(() => {
+    supabase.from("departments").select("id, name").eq("hospital_id", hospitalId).eq("is_active", true).order("name", { ascending: true })
+      .then(({ data }) => setDepartments(data || []));
+    supabase.from("users").select("id, full_name, department_id").eq("hospital_id", hospitalId).eq("role", "doctor").eq("is_active", true).order("full_name", { ascending: true })
+      .then(({ data }) => setDoctors(data || []));
+  }, [hospitalId]);
+
+  // Auto-select department if defaultDeptId provided
+  useEffect(() => {
+    if (defaultDeptId) setDeptId(defaultDeptId);
+  }, [defaultDeptId]);
+
+  // Appointment mode: lock doctor to the chosen slot, and the department to that doctor's dept
+  useEffect(() => {
+    if (!isAppointment || !appointmentSlot) return;
+    setDoctorId(appointmentSlot.doctor_id);
+    const doc = doctors.find((d) => d.id === appointmentSlot.doctor_id);
+    if (doc?.department_id) setDeptId(doc.department_id);
+  }, [isAppointment, appointmentSlot, doctors]);
+
+  // Check-in mode: patient + doctor are known — preset everything and go straight to payment.
+  // Seed visit type/purpose from the appointment so the SAME walk-in fee engine
+  // (base / follow-up-within-validity / revisit-discount) computes the consultation fee.
+  useEffect(() => {
+    if (!isCheckin || !checkinAppointment) return;
+    setUseExisting(true);
+    setFoundPatient({ id: checkinAppointment.patient_id, full_name: checkinAppointment.patient_name, uhid: checkinAppointment.uhid, phone: checkinAppointment.phone });
+    setDoctorId(checkinAppointment.doctor_id);
+    if (checkinAppointment.department_id) setDeptId(checkinAppointment.department_id);
+    // The appointment's stored fee is only a seed for the first paint. The fee effect below
+    // re-prices against the doctor's CURRENT rate and the patient's episode, because an
+    // appointment booked weeks ago may now be inside or outside its validity window.
+    if (checkinAppointment.consultation_fee != null) {
+      setConsultationFee(checkinAppointment.consultation_fee);
+    }
+    const purpose = (checkinAppointment.visit_purpose || "new") as typeof visitPurpose;
+    setVisitPurpose(["new", "revisit", "follow_up", "review", "procedure"].includes(purpose) ? purpose : "new");
+    const isFollowUp = checkinAppointment.visit_type === "follow_up" || ["follow_up", "review", "revisit"].includes(checkinAppointment.visit_purpose || "");
+    setVisitType(isFollowUp ? "followup" : "new");
+    setStep("payment");
+  }, [isCheckin, checkinAppointment]);
+
+  // Emergency visits get a separate "URG" token series; everything else uses "A".
+  const tokenPrefix = visitType === "emergency" ? "URG" : "A";
+
+  // ── Consultation fee ────────────────────────────────────────────────────────
+  // Two steps, both delegated to @/lib/consultationFee so the desk, the consultation
+  // workspace and the unit tests all price a visit identically.
+  //
+  //   1. resolveConsultationRate — doctor → department → global → default ladder.
+  //   2. findFeeEpisode + computeConsultationFee — apply the doctor's follow-up rate when
+  //      the patient is inside the validity window of their anchor consultation AND has
+  //      not used up the allowed number of follow-ups.
+  //
+  // For an appointment the price is evaluated as of the SLOT DATE, not today, so a booking
+  // made for next month is quoted at the price it will actually cost then.
+  const pricingDate = isAppointment && appointmentSlot ? appointmentSlot.slot_date : toDateKey();
+
+  useEffect(() => {
+    if (!hospitalId) return;
+    let cancelled = false;
+    (async () => {
+      const resolved = await resolveConsultationRate({ hospitalId, doctorId, departmentId: deptId });
+      if (!cancelled) setRate(resolved);
+    })();
+    return () => { cancelled = true; };
+  }, [hospitalId, doctorId, deptId]);
+
+  useEffect(() => {
+    if (!hospitalId) return;
+    let cancelled = false;
+    (async () => {
+      const rules = await fetchRevisitRules(hospitalId);
+      if (!cancelled) setRevisitRules(rules);
+    })();
+    return () => { cancelled = true; };
+  }, [hospitalId]);
+
+  // Find the patient's current episode with this doctor. The lookback is driven by the
+  // doctor's own validity_days — the previous implementation hardcoded 30 days, which
+  // silently disabled any validity window longer than a month.
+  useEffect(() => {
+    const patientId = useExisting ? foundPatient?.id : null;
+    if (!hospitalId || !patientId || !doctorId) {
+      setEpisode(null);
+      setRevisitSuggestion(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const found = await findFeeEpisode({
+        hospitalId,
+        patientId,
+        doctorId,
+        validityDays: rate.followUpValidityDays,
+        followUpMaxVisits: rate.followUpMaxVisits,
+        asOfDate: pricingDate,
+      });
+      if (cancelled) return;
+      setEpisode(found);
+      setRevisitSuggestion(
+        found.anchorDate
+          ? { tokenId: found.anchorTokenId || "", date: found.anchorDate, doctor: found.anchorDoctorName || "" }
+          : null
+      );
+      // Reflect the detected episode in the visit-type controls so the form reads
+      // consistently with the price. Only auto-flip when the desk has not already chosen
+      // something more specific — an emergency stays an emergency.
+      //
+      // Functional updates, not `if (visitType === "new")`: this effect must not depend on
+      // visitType (it would re-run and re-flip every time the desk changed the dropdown),
+      // and a captured value would be stale by the time the query resolves. The updater
+      // always sees the current state.
+      if (found.anchorDate && found.withinValidity && !found.capReached) {
+        setVisitType((prev) => (prev === "new" ? "followup" : prev));
+        setVisitPurpose((prev) => (prev === "new" ? "follow_up" : prev));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [
+    hospitalId, useExisting, foundPatient?.id, doctorId, pricingDate,
+    rate.followUpValidityDays, rate.followUpMaxVisits,
+  ]);
+
+  // Single source of truth for the displayed price. Pure computation — no I/O — so it can
+  // re-run on every form change without hammering the database.
+  useEffect(() => {
+    const result = computeConsultationFee({
+      rate,
+      episode: episode ?? NO_EPISODE,
+      visitType,
+      visitPurpose,
+      revisitRules,
+    });
+    setConsultationFee(result.fee);
+    setChargedTier(result.tier);
+    setFeeReason(result.reason);
+    setRevisitDiscount(result.revisitDiscount);
+    setRevisitDiscountNote(result.revisitDiscountNote);
+  }, [rate, episode, visitType, visitPurpose, revisitRules]);
+
+  // Phone/name/UHID search
+  const searchPatient = useCallback(async (val: string) => {
+    if (val.length < 3) { setFoundPatient(null); setSearchResults([]); return; }
+    setSearching(true);
+    const { data } = await supabase
+      .from("patients")
+      .select("id, full_name, uhid, phone, abha_id")
+      .eq("hospital_id", hospitalId)
+      .eq("is_active", true)
+      .or(`phone.ilike.%${val}%,full_name.ilike.%${val}%,uhid.ilike.%${val}%`)
+      .limit(5);
+    const results = data || [];
+    setSearchResults(results);
+    setFoundPatient(results.length === 1 ? results[0] : null);
+    setSearching(false);
+  }, [hospitalId]);
+
+  const debouncedPhone = useDebounce(phone, 300);
+  useEffect(() => {
+    // `isCheckin` is checked as well as `useExisting`, and that is not redundant.
+    // On mount both effects run in the SAME commit, so this one still sees the initial
+    // `useExisting === false` even though the check-in seeding effect above has already
+    // queued setUseExisting(true). It would then call searchPatient("") → which does
+    // setFoundPatient(null) → wiping the patient the seeding effect just set, leaving the
+    // payment screen and the printed receipt with a blank name. `isCheckin` is a prop, so
+    // it is correct on the very first render and closes that window.
+    if (useExisting || isCheckin) return;
+    searchPatient(debouncedPhone);
+  }, [debouncedPhone, searchPatient, useExisting, isCheckin]);
+
+  const filteredDoctors = deptId ? doctors.filter((d) => d.department_id === deptId) : doctors;
+  const selectedDeptName = departments.find(d => d.id === deptId)?.name || "—";
+  const selectedDoctorName = doctors.find(d => d.id === doctorId)?.full_name || "—";
+  const patientDisplayName = useExisting ? foundPatient?.full_name || "" : fullName;
+
+  const handleProceedToPayment = async () => {
+    if (!useExisting && !fullName.trim()) {
+      toast({ title: "Patient name is required", variant: "destructive" });
+      return;
+    }
+    if (!deptId) {
+      toast({ title: "Department is required", description: "Please select a department before proceeding", variant: "destructive" });
+      return;
+    }
+    if (!doctorId) {
+      toast({ title: "Doctor is required", description: "Please select a doctor before proceeding", variant: "destructive" });
+      return;
+    }
+    if (!useExisting && !dpdpConsent) {
+      toast({ title: "DPDP consent required", description: "Patient must consent to data collection before registration", variant: "destructive" });
+      return;
+    }
+
+    // Duplicate billing guard: warn if this existing patient already has an active OPD token today
+    if (useExisting && foundPatient) {
+      const today = new Date().toISOString().split("T")[0];
+      const { data: todayToken } = await (supabase as any)
+        .from("opd_tokens")
+        .select("token_number, status, departments(name)")
+        .eq("hospital_id", hospitalId)
+        .eq("patient_id", foundPatient.id)
+        .eq("visit_date", today)
+        .in("status", ["waiting", "in_consultation"])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (todayToken) {
+        setSameDayToken({
+          token_number: todayToken.token_number,
+          status: todayToken.status,
+          department: (todayToken as any).departments?.name,
+        });
+        setShowSameDayWarn(true);
+        return;
+      }
+    }
+
+    setStep("payment");
+  };
+
+  const createPatient = async (): Promise<string> => {
+    // An existing patient is selected — never fall through to creating a new one.
+    // (The debounced search can transiently null foundPatient; guard against the
+    // resulting blank/ghost patient instead of silently inserting one.)
+    if (useExisting) {
+      if (!foundPatient) throw new Error("The selected patient was lost — please re-select the patient.");
+      return foundPatient.id;
+    }
+    if (!fullName.trim()) throw new Error("Patient name is required.");
+
+    // Duplicate detection — check for existing patients with same phone or name+gender
+    const { data: potentialDupes } = await supabase
+      .from("patients")
+      .select("id, full_name, uhid, phone")
+      .eq("hospital_id", hospitalId)
+      // Deleted patients are excluded: the dupe dialog offers "use existing", which would
+      // otherwise pull a soft-deleted record back into active clinical use.
+      .eq("is_active", true)
+      .or(`phone.eq.${phone},full_name.ilike.%${fullName.trim()}%`)
+      .limit(5);
+
+    const matchedDupe = (potentialDupes || []).find(p => {
+      if (phone && p.phone === phone) return true;
+      if (p.full_name?.toLowerCase() === fullName.trim().toLowerCase() && p.phone) return true;
+      return false;
+    });
+
+    if (matchedDupe) {
+      // Show confirmation and wait for resolution
+      return new Promise<string>((resolve, reject) => {
+        setDupeCandidate(matchedDupe);
+        setDupeResolveCallback(() => () => {
+          // "Create New Anyway" was clicked — proceed with insert
+          setShowDupeConfirm(false);
+          setDupeCandidate(null);
+          insertNewPatient().then(resolve).catch(reject);
+        });
+        setShowDupeConfirm(true);
+      });
+    }
+
+    return insertNewPatient();
+  };
+
+  const handleUseDupePatient = () => {
+    if (dupeCandidate) {
+      setFoundPatient(dupeCandidate);
+      setUseExisting(true);
+      setShowDupeConfirm(false);
+      setDupeCandidate(null);
+      // Re-trigger the relevant flow with the existing patient
+      if (isAppointment) handleBookAppointment();
+      else handlePayAndIssue(false);
+    }
+  };
+
+  const insertNewPatient = async (): Promise<string> => {
+    const uhid = await generatePatientUhid(hospitalId);
+
+    const patientData: {
+      hospital_id: string;
+      full_name: string;
+      uhid: string;
+      phone: string | null;
+      gender: "male" | "female" | "other";
+      dob?: string;
+      blood_group?: string;
+      address?: string;
+    } = {
+      hospital_id: hospitalId,
+      full_name: fullName.trim(),
+      uhid,
+      phone: phone || null,
+      gender: gender as "male" | "female" | "other",
+    };
+    if (age) {
+      const y = new Date().getFullYear() - parseInt(age);
+      patientData.dob = `${y}-01-01`;
+    }
+    if (dob) patientData.dob = dob;
+    if (bloodGroup) patientData.blood_group = bloodGroup;
+    if (address) patientData.address = address;
+    (patientData as any).allergies = allergies.trim() || "NKDA";
+    if (referralSource) (patientData as any).referral_source = referralSource;
+
+    const { data: newPatient, error } = await supabase.from("patients").insert([patientData]).select("id").maybeSingle();
+    if (error) throw error;
+    return newPatient.id;
+  };
+
+  // Book a future appointment (no bill, no queue token) using the same registration form.
+  const handleBookAppointment = async () => {
+    if (!appointmentSlot) return;
+    if (!useExisting && !fullName.trim()) {
+      toast({ title: "Patient name is required", variant: "destructive" });
+      return;
+    }
+    if (!useExisting && !dpdpConsent) {
+      toast({ title: "DPDP consent required", description: "Patient must consent to data collection before registration", variant: "destructive" });
+      return;
+    }
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const patientId = await createPatient();
+
+      // Duplicate guard: same patient already has an active appointment with this doctor on this day
+      const { data: existingAppt } = await (supabase as any)
+        .from("appointments")
+        .select("id")
+        .eq("hospital_id", hospitalId)
+        .eq("patient_id", patientId)
+        .eq("doctor_id", appointmentSlot.doctor_id)
+        .eq("appointment_date", appointmentSlot.slot_date)
+        .in("status", ["scheduled", "confirmed", "arrived"])
+        .limit(1)
+        .maybeSingle();
+      if (existingAppt) {
+        setSubmitting(false);
+        toast({ title: "Already booked", description: "This patient already has an appointment with this doctor on this day.", variant: "destructive" });
+        return;
+      }
+
+      // Log DPDP consent for new patients
+      if (!useExisting) {
+        try {
+          const { getDPDPConsentText } = await import("@/lib/compliance-checks");
+          const { data: hospitalData } = await supabase.from("hospitals").select("name").eq("id", hospitalId).maybeSingle();
+          const consentText = getDPDPConsentText(hospitalData?.name || "Hospital");
+          await (supabase as any).from("patient_consents").insert({
+            hospital_id: hospitalId,
+            patient_id: patientId,
+            consent_type: "data_collection",
+            consent_given: true,
+            consent_text: consentText,
+          });
+        } catch (e) {
+          console.error("DPDP consent log failed:", e);
+        }
+      }
+
+      const { data: { user } } = await supabase.auth.getUser();
+      const { data: userData } = await supabase.from("users").select("id").eq("auth_user_id", user?.id || "").maybeSingle();
+      const userId = userData?.id || null;
+
+      // Compute slot end time; map walk-in visit type → appointments allowed set (new/follow_up/review)
+      const [sh, sm] = appointmentSlot.slot_time.split(":").map(Number);
+      const endTotal = sh * 60 + sm + (appointmentSlot.slot_duration_mins || 15);
+      const slotEnd = `${String(Math.floor(endTotal / 60) % 24).padStart(2, "0")}:${String(endTotal % 60).padStart(2, "0")}:00`;
+      const apptVisitType = visitType === "revisit" || visitType === "followup" ? "follow_up" : "new";
+
+      const coreRow = {
+        hospital_id: hospitalId,
+        patient_id: patientId,
+        doctor_id: appointmentSlot.doctor_id,
+        appointment_date: appointmentSlot.slot_date,
+        slot_time: appointmentSlot.slot_time,
+        slot_end_time: slotEnd,
+        slot_id: appointmentSlot.id,
+        status: "scheduled",
+        visit_type: apptVisitType,
+        consultation_fee: consultationFee,
+        booked_by: userId,
+        booked_via: "reception",
+        booking_source: "front_desk",
+        appointment_type: "opd",
+      };
+      const extraRow = {
+        department_id: deptId || null,
+        priority,
+        visit_purpose: visitPurpose,
+        is_mlc: isMlc,
+        police_station: isMlc ? policeStation || null : null,
+        payer_type: payerType,
+        payer_id: payerId || null,
+        referral_doctor_id: referralDoctorId || null,
+      };
+
+      // Insert with the full field set; if the extra columns are not yet migrated, retry with core only.
+      let aerr = (await (supabase as any).from("appointments").insert({ ...coreRow, ...extraRow })).error;
+      if (aerr && /column|schema cache|PGRST204|does not exist/i.test(aerr.message || "")) {
+        aerr = (await (supabase as any).from("appointments").insert(coreRow)).error;
+      }
+      if (aerr) {
+        if (/unique|duplicate|appointments_unique_slot/i.test(aerr.message || "")) {
+          throw new Error("This slot is already booked. Please pick another slot.");
+        }
+        throw aerr;
+      }
+
+      if (!useExisting) logAudit({ action: "created", module: "opd", entityType: "patient", entityId: patientId });
+
+      // Increment slot booked_count — best-effort
+      try {
+        const { data: slotRow } = await (supabase as any).from("doctor_slots").select("booked_count").eq("id", appointmentSlot.id).maybeSingle();
+        await (supabase as any).from("doctor_slots").update({ booked_count: (slotRow?.booked_count || 0) + 1 }).eq("id", appointmentSlot.id);
+      } catch (e) { console.warn("booked_count update failed", e); }
+
+      // WhatsApp confirmation — best-effort
+      try {
+        const { data: pat } = await supabase.from("patients").select("full_name, phone").eq("id", patientId).maybeSingle();
+        if (pat?.phone) {
+          const dateStr = new Date(appointmentSlot.slot_date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" });
+          const msg = `Dear ${pat.full_name}, your appointment with Dr. ${appointmentDoctorName || selectedDoctorName} on ${dateStr} at ${appointmentSlot.slot_time.slice(0, 5)} is confirmed. — ${hospitalInfo?.name || ""}`;
+          await sendWhatsApp({ hospitalId, phone: pat.phone, message: msg });
+        }
+      } catch (e) { console.warn("WhatsApp send failed", e); }
+
+      toast({ title: "Appointment booked ✓" });
+      onCreated();
+      onClose();
+    } catch (err: unknown) {
+      const msg = getErrorMessage(err);
+      setFormError(msg);
+      toast({ title: "Booking failed", description: msg, variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handlePayAndIssue = async (skipPayment = false) => {
+    setSubmitting(true);
+    setFormError(null);
+    try {
+      const patientId = await createPatient();
+
+      // Log DPDP consent for new patients
+      if (!useExisting) {
+        try {
+          const { getDPDPConsentText } = await import("@/lib/compliance-checks");
+          const { data: hospitalData } = await supabase.from("hospitals").select("name").eq("id", hospitalId).maybeSingle();
+          const consentText = getDPDPConsentText(hospitalData?.name || "Hospital");
+          await (supabase as any).from("patient_consents").insert({
+            hospital_id: hospitalId,
+            patient_id: patientId,
+            consent_type: "data_collection",
+            consent_given: true,
+            consent_text: consentText,
+          });
+        } catch (e) {
+          console.error("DPDP consent log failed:", e);
+        }
+      }
+
+      const { data: { user } } = await supabase.auth.getUser();
+      const { data: userData } = await supabase
+        .from("users").select("id").eq("auth_user_id", user?.id || "").maybeSingle();
+      const userId = userData?.id || null;
+
+      const today = new Date().toISOString().split("T")[0];
+
+      const fee = consultationFee;
+      const isPaid = !skipPayment && fee > 0;
+      const discountNote = revisitDiscountNote;
+
+      // Look up GST from service_master (same gst_applicable/gst_percent
+      // pattern used elsewhere) instead of omitting GST fields entirely.
+      // `fee` is treated as GST-inclusive — what the patient actually pays
+      // is unchanged, this only correctly decomposes it into taxable + GST
+      // for the ledger/GST invoice when the consultation fee is configured
+      // as GST-applicable.
+      //
+      // Resolved with the SAME doctor → dept → global precedence as the fee itself, and with
+      // limit(1) rather than maybeSingle(): every doctor now owns a consultation row, so a
+      // bare item_type='consultation' maybeSingle() throws "multiple rows returned" and takes
+      // the whole payment down.
+      const gstBase = () =>
+        (supabase as any)
+          .from("service_master")
+          .select("gst_percent, gst_applicable")
+          .eq("hospital_id", hospitalId)
+          .eq("item_type", "consultation")
+          .eq("is_active", true);
+      let consultSvc: { gst_percent?: number | null; gst_applicable?: boolean | null } | null = null;
+      if (doctorId) {
+        const { data } = await gstBase().eq("doctor_id", doctorId).limit(1);
+        consultSvc = data?.[0] ?? null;
+      }
+      if (!consultSvc && deptId) {
+        const { data } = await gstBase().eq("department_id", deptId).is("doctor_id", null).limit(1);
+        consultSvc = data?.[0] ?? null;
+      }
+      if (!consultSvc) {
+        const { data } = await gstBase().is("doctor_id", null).is("department_id", null).limit(1);
+        consultSvc = data?.[0] ?? null;
+      }
+      const gstPct = consultSvc?.gst_applicable ? (Number(consultSvc.gst_percent) || 0) : 0;
+      const taxableFee = gstPct > 0 ? roundCurrency(fee / (1 + gstPct / 100)) : fee;
+      const gstAmt = roundCurrency(fee - taxableFee);
+
+      // Create bill
+      const { data: bill, error: billErr } = await supabase.from("bills").insert({
+        hospital_id: hospitalId,
+        patient_id: patientId,
+        // bill_number omitted: minted by the bills BEFORE INSERT trigger (20261008000161)
+        // inside this transaction, so a failed insert cannot burn a number. bill_type 'opd'
+        // still puts it on the OPD series. Read back below for the receipt and audit trail.
+        bill_type: "opd",
+        bill_date: today,
+        subtotal: taxableFee,
+        gst_amount: gstAmt,
+        total_amount: fee,
+        patient_payable: fee,
+        paid_amount: isPaid ? fee : 0,
+        balance_due: isPaid ? 0 : fee,
+        payment_status: isPaid ? "paid" : "unpaid",
+        bill_status: "final",
+        created_by: userId,
+        // `as any`: the generated types still mark bill_number NOT NULL with no default,
+        // since they cannot see the BEFORE INSERT trigger that supplies it.
+      } as any).select("id, bill_number").maybeSingle();
+      if (billErr) throw billErr;
+      const billNumber = (bill as any).bill_number as string;
+
+      // Audit: patient + bill creation
+      if (!useExisting) logAudit({ action: "created", module: "opd", entityType: "patient", entityId: patientId });
+      logAudit({ action: "created", module: "billing", entityType: "bill", entityId: bill.id, details: { billNumber, amount: fee } });
+
+      // Insert line item
+      await supabase.from("bill_line_items").insert({
+        hospital_id: hospitalId,
+        bill_id: bill.id,
+        description: discountNote ? `Consultation Fee (${discountNote})` : "Consultation Fee",
+        item_type: "consultation",
+        unit_rate: revisitDiscount > 0 ? rate.fee : fee,
+        quantity: 1,
+        discount_amount: revisitDiscount > 0 ? revisitDiscount : undefined,
+        taxable_amount: taxableFee,
+        gst_percent: gstPct,
+        gst_amount: gstAmt,
+        total_amount: fee,
+        source_module: "opd_walkin",
+        source_dedupe_key: `opd_consult_walkin:${bill.id}`,
+      } as any);
+
+      recordServiceCharge({
+        hospitalId, patientId,
+        serviceModule: "opd_walkin",
+        serviceName: discountNote ? `Consultation Fee (${discountNote})` : "Consultation Fee",
+        unitRate: revisitDiscount > 0 ? rate.fee : fee,
+        gstPercent: gstPct, gstAmount: gstAmt,
+        totalAmount: fee,
+        billId: bill.id,
+        performedBy: userId,
+      });
+
+      // Insert payment if paid
+      if (isPaid) {
+        await supabase.from("bill_payments").insert({
+          hospital_id: hospitalId,
+          bill_id: bill.id,
+          payment_mode: paymentMode,
+          amount: fee,
+          transaction_id: paymentRef || null,
+          received_by: userId,
+        });
+
+        // Auto-post journal entry
+        await autoPostJournalEntry({
+          triggerEvent: `bill_payment_${paymentMode}`,
+          sourceModule: "billing",
+          sourceId: bill.id,
+          amount: fee,
+          description: `OPD Consultation - Bill ${billNumber} - ${paymentMode}`,
+          hospitalId,
+          postedBy: userId || "",
+        });
+      }
+
+      // Revenue recognition journal entry
+      await autoPostJournalEntry({
+        triggerEvent: "bill_finalized_opd",
+        sourceModule: "billing",
+        sourceId: bill.id,
+        amount: fee,
+        description: `OPD Revenue - Bill ${billNumber}`,
+        hospitalId,
+        postedBy: userId || "",
+      });
+
+      // token_number is deliberately NOT sent. The BEFORE INSERT trigger added in
+      // 20261015000001_opd_token_sequence.sql allocates it inside this insert's transaction,
+      // serialised on the per-hospital/doctor/day sequence row.
+      //
+      // The old code called rpc('generate_token_number') here and treated the result as
+      // atomic — but that function had never been created, and supabase-js RESOLVES an
+      // unknown RPC instead of throwing, so the catch never fired and it silently fell back
+      // to a client-side "read last token, add one" preview whose initial state was the
+      // literal string "A-1". That is what produced two patients holding A-1.
+      const { data: tokenRow, error: tokenErr } = await (supabase as any).from("opd_tokens").insert({
+        hospital_id: hospitalId,
+        patient_id: patientId,
+        doctor_id: doctorId || null,
+        department_id: deptId || null,
+        token_prefix: tokenPrefix,
+        visit_date: today,
+        status: "waiting",
+        priority,
+        visit_type: visitType,
+        visit_purpose: visitPurpose,
+        // Which rate actually billed — this is what findFeeEpisode counts to enforce the
+        // doctor's follow-up allowance on the patient's next visit.
+        charged_tier: chargedTier,
+        revisit_of_token_id: revisitOfTokenId || null,
+        is_mlc: isMlc,
+        payer_type: payerType,
+        payer_id: payerId || null,
+        ...(isCheckin && checkinAppointment ? { appointment_id: checkinAppointment.id } : {}),
+      }).select("token_number").maybeSingle();
+      if (tokenErr) throw tokenErr;
+      const atomicToken = tokenRow?.token_number || "";
+
+      // Check-in: mark the appointment as in-consultation so it leaves the actionable queue
+      if (isCheckin && checkinAppointment) {
+        await (supabase as any).from("appointments").update({ status: "in_consultation" }).eq("id", checkinAppointment.id);
+      }
+
+      // Sync referral to CRM: create patient_acquisition + increment referral_doctors counters
+      if (referralDoctorId) {
+        const today2 = new Date().toISOString().split("T")[0];
+        await supabase.from("patient_acquisition").insert({
+          hospital_id: hospitalId,
+          patient_id: patientId,
+          source: "referral_doctor",
+          referral_doctor_id: referralDoctorId,
+          first_visit_date: today2,
+          first_visit_revenue: fee,
+          is_new_patient: !useExisting,
+        } as any);
+
+        // Increment referral count and revenue on the referral doctor
+        const { data: rd } = await supabase
+          .from("referral_doctors")
+          .select("total_referrals, total_revenue")
+          .eq("id", referralDoctorId)
+          .maybeSingle();
+        if (rd) {
+          await supabase.from("referral_doctors").update({
+            total_referrals: (rd.total_referrals || 0) + 1,
+            total_revenue: (rd.total_revenue || 0) + fee,
+            last_referral_at: new Date().toISOString(),
+          }).eq("id", referralDoctorId);
+        }
+      }
+      const rData = {
+        billId: bill.id,
+        billNumber,
+        patientName: patientDisplayName || "—",
+        uhid: useExisting ? foundPatient?.uhid || "" : "New",
+        department: selectedDeptName,
+        doctor: doctorId ? `Dr. ${selectedDoctorName}` : "—",
+        token: atomicToken,
+        fee,
+        paymentMode: isPaid ? paymentMode : "—",
+        date: today,
+        paid: isPaid,
+        discountNote: discountNote || undefined,
+      };
+      setReceiptData(rData);
+      setStep("receipt");
+
+      const statusMsg = isPaid
+        ? `Token ${atomicToken} issued · ₹${fee.toLocaleString("en-IN")} collected ✓`
+        : `Token ${atomicToken} issued · Payment pending`;
+      toast({ title: statusMsg });
+    } catch (err: unknown) {
+      const msg = getErrorMessage(err);
+      setFormError(msg);
+      toast({ title: "Registration failed", description: msg, variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handlePrintReceipt = async () => {
+    if (!receiptData) return;
+    // Print the structured OPD bill (same template as every module). Token / department /
+    // doctor go INTO the bill-details grid rather than a separate banner, to save space.
+    const ok = await printBillById(receiptData.billId, hospitalId, {
+      extraMeta: [
+        { label: "Token", value: receiptData.token },
+        { label: "Department", value: receiptData.department },
+        { label: "Consulting Doctor", value: receiptData.doctor && receiptData.doctor !== "—" ? receiptData.doctor : null },
+      ],
+      extraSections: `<div style="text-align:center;font-size:11px;color:#94a3b8;margin-top:6px;">Thank you for visiting. Get well soon!</div>`,
+    });
+    if (!ok) toast({ title: "Could not open the bill for printing", variant: "destructive" });
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={onClose}>
+      <div className="bg-white rounded-2xl p-7 w-full max-w-[440px] shadow-xl relative max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <button onClick={onClose} className="absolute top-4 right-4 text-slate-400 hover:text-slate-600"><X className="h-5 w-5" /></button>
+
+        {step === "details" ? (
+          <>
+            <h2 className="text-lg font-bold text-slate-900">{isAppointment ? "Book Appointment" : "Quick Registration"}</h2>
+            <p className="text-[13px] text-slate-500 mt-0.5">{isAppointment ? "Register / select a patient for this slot" : "Register patient in under 30 seconds"}</p>
+
+            {isAppointment && appointmentSlot && (
+              <div className="mt-3 text-[13px] bg-slate-50 border border-slate-200 rounded-lg p-2.5 space-y-0.5">
+                <div><span className="font-semibold text-slate-700">Dr.</span> {appointmentDoctorName || selectedDoctorName}</div>
+                <div>
+                  <span className="font-semibold text-slate-700">Date:</span> {new Date(appointmentSlot.slot_date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })}
+                  {" · "}
+                  <span className="font-semibold text-slate-700">Time:</span> {appointmentSlot.slot_time.slice(0, 5)}
+                </div>
+              </div>
+            )}
+
+            {/* Search */}
+            <div className="mt-5">
+              <label className="text-xs font-medium text-slate-600">Search Patient (Name, Phone, or UHID)</label>
+              <div className="relative mt-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
+                <input
+                  type="text"
+                  value={phone}
+                  onChange={(e) => { setPhone(e.target.value); setUseExisting(false); setFoundPatient(null); }}
+                  placeholder="Search by name, phone, or UHID..."
+                  className="w-full h-10 pl-9 pr-3 border border-slate-200 rounded-lg text-sm focus:border-[#1A2F5A] focus:ring-2 focus:ring-[#1A2F5A]/10 outline-none"
+                />
+              </div>
+              {searchResults.length > 0 && !useExisting && (
+                <div className="mt-2 border border-slate-200 rounded-lg overflow-hidden">
+                  {searchResults.map((p) => (
+                    <button key={p.id} onClick={async () => {
+                      setFoundPatient(p); setUseExisting(true); setSearchResults([]);
+                      const { count } = await supabase.from("opd_tokens").select("id", { count: "exact", head: true }).eq("patient_id", p.id);
+                      if (count && count > 0) setVisitType("revisit");
+                    }}
+                      className="w-full text-left px-3 py-2 hover:bg-emerald-50 border-b border-slate-100 last:border-0 flex items-center gap-2">
+                      <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500 flex-shrink-0" />
+                      <div>
+                        <p className="text-sm font-medium text-slate-800">{p.full_name}</p>
+                        <p className="text-[11px] text-slate-500">{p.uhid} · {p.phone || "No phone"}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+              {useExisting && foundPatient && (
+                <div className="mt-2 space-y-2">
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                        <span className="text-xs font-medium text-emerald-700">Patient selected</span>
+                      </div>
+                      {foundPatient.abha_id && (
+                        <span className="text-[10px] flex items-center gap-1 text-emerald-700 font-semibold">
+                          <ShieldCheck className="h-3 w-3" /> ABHA ✓
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-sm font-medium text-slate-800 mt-1">{foundPatient.full_name} · {foundPatient.uhid}</p>
+                    <div className="flex items-center gap-3 mt-1">
+                      <button onClick={() => { setUseExisting(false); setFoundPatient(null); setShowAbhaLink(false); }} className="text-[11px] text-slate-500 hover:underline">Change</button>
+                      {!foundPatient.abha_id && (
+                        <button
+                          onClick={() => setShowAbhaLink(!showAbhaLink)}
+                          className="text-[11px] text-blue-600 hover:underline font-medium flex items-center gap-1"
+                        >
+                          {showAbhaLink ? "Hide ABHA" : "+ Link / Create ABHA"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <OutstandingBalanceBanner patientId={foundPatient.id} hospitalId={hospitalId} />
+                  {showAbhaLink && !foundPatient.abha_id && (
+                    <div className="p-3 border border-blue-200 rounded-lg bg-blue-50/30">
+                      <ABHARegistrationPanel
+                        patientId={foundPatient.id}
+                        patientName={foundPatient.full_name}
+                        patientMobile={foundPatient.phone || ""}
+                        onComplete={(abhaNumber) => {
+                          setFoundPatient((prev) => prev ? { ...prev, abha_id: abhaNumber } : prev);
+                          setShowAbhaLink(false);
+                        }}
+                        onSkip={() => setShowAbhaLink(false)}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* New patient fields */}
+            {!useExisting && (
+              <div className="mt-4 space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-600">Full Name *</label>
+                  <input value={fullName} onChange={(e) => setFullName(e.target.value)} className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 focus:border-[#1A2F5A] focus:ring-2 focus:ring-[#1A2F5A]/10 outline-none" placeholder="Patient full name" />
+                </div>
+                <div className="flex gap-3">
+                  <div className="w-24">
+                    <label className="text-xs font-medium text-slate-600">Age</label>
+                    <input type="number" value={age} onChange={(e) => setAge(e.target.value)} min={0} max={120} className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 focus:border-[#1A2F5A] focus:ring-2 focus:ring-[#1A2F5A]/10 outline-none" placeholder="Age" />
+                  </div>
+                  <div className="flex-1">
+                    <label className="text-xs font-medium text-slate-600">Gender</label>
+                    <div className="flex gap-1.5 mt-1">
+                      {genders.map((g) => (
+                        <button key={g} onClick={() => setGender(g)}
+                          className={cn("flex-1 h-10 rounded-lg text-xs font-medium capitalize transition-colors",
+                            gender === g ? "bg-[#1A2F5A] text-white" : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                          )}>
+                          {g}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  {!showOptional && (
+                    <button onClick={() => setShowOptional(true)} className="text-xs text-[#1A2F5A] font-medium hover:underline">
+                      + Add more details (optional)
+                    </button>
+                  )}
+                  <a href="/patients?register=true" target="_blank" rel="noopener noreferrer" className="text-xs text-slate-500 hover:text-[#1A2F5A] hover:underline">
+                    Need full registration? →
+                  </a>
+                </div>
+                {showOptional && (
+                  <div className="space-y-3 pt-1">
+                    <div className="flex gap-3">
+                      <div className="flex-1">
+                        <label className="text-xs font-medium text-slate-600">DOB</label>
+                        <input type="date" value={dob} onChange={(e) => setDob(e.target.value)} className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 outline-none" />
+                      </div>
+                      <div className="w-28">
+                        <label className="text-xs font-medium text-slate-600">Blood Group</label>
+                        <select value={bloodGroup} onChange={(e) => setBloodGroup(e.target.value)} className="w-full h-10 px-2 border border-slate-200 rounded-lg text-sm mt-1 outline-none">
+                          <option value="">—</option>
+                          {["A+","A-","B+","B-","AB+","AB-","O+","O-"].map((bg) => <option key={bg} value={bg}>{bg}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs font-medium text-slate-600">Address</label>
+                      <input value={address} onChange={(e) => setAddress(e.target.value)} className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 outline-none" placeholder="Address (optional)" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-medium text-slate-600">Known Allergies</label>
+                      <input value={allergies} onChange={(e) => setAllergies(e.target.value)} className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 outline-none" placeholder="e.g., Penicillin, Sulfa, NKDA (No Known Drug Allergies)" />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Department + Doctor */}
+            <div className="flex gap-3 mt-4">
+              <div className="flex-1">
+                <label className="text-xs font-medium text-slate-600">Department</label>
+                <select value={deptId} disabled={isAppointment} onChange={(e) => { setDeptId(e.target.value); setDoctorId(""); }} className="w-full h-10 px-2 border border-slate-200 rounded-lg text-sm mt-1 outline-none disabled:bg-slate-100 disabled:text-slate-500">
+                  <option value="">Select...</option>
+                  {departments.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+                </select>
+                {departments.length === 0 && (
+                  <Link to="/settings/departments" className="text-[10px] text-amber-600 hover:underline mt-0.5 block">No departments — add in Settings →</Link>
+                )}
+              </div>
+              <div className="flex-1">
+                <label className="text-xs font-medium text-slate-600">Doctor</label>
+                <select value={doctorId} disabled={isAppointment} onChange={(e) => setDoctorId(e.target.value)} className="w-full h-10 px-2 border border-slate-200 rounded-lg text-sm mt-1 outline-none disabled:bg-slate-100 disabled:text-slate-500">
+                  <option value="">Select...</option>
+                  {filteredDoctors.map((d) => <option key={d.id} value={d.id}>Dr. {d.full_name}</option>)}
+                </select>
+                {doctors.length === 0 && (
+                  <Link to="/settings/staff" className="text-[10px] text-amber-600 hover:underline mt-0.5 block">No doctors — add in Settings →</Link>
+                )}
+              </div>
+            </div>
+
+            {/* Referral */}
+            <div className="mt-3">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-slate-600">Referral</label>
+                <button
+                  onClick={() => setShowReferralModal(true)}
+                  className="text-xs text-[#0E7B7B] font-medium hover:underline flex items-center gap-1"
+                >
+                  <UserPlus className="h-3 w-3" />
+                  + Referral
+                </button>
+              </div>
+              {referralSource && (
+                <div className="mt-1 px-3 py-1.5 bg-teal-50 border border-teal-200 rounded-lg text-xs text-teal-800 flex items-center justify-between">
+                  <span>Referred by: <strong>{referralSource}</strong></span>
+                  <button onClick={() => { setReferralSource(""); setReferralDoctorId(null); }} className="text-teal-500 hover:text-teal-700 ml-2">✕</button>
+                </div>
+              )}
+            </div>
+            <div className="mt-4">
+              <label className="text-xs font-medium text-slate-600">Priority</label>
+              <div className="flex gap-1.5 mt-1">
+                {priorities.map((p) => (
+                  <button key={p} onClick={() => setPriority(p)}
+                    className={cn("flex-1 h-8 rounded-lg text-[11px] font-medium capitalize transition-colors",
+                      priority === p ? priorityLabels[p].active : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    )}>
+                    {priorityLabels[p].label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Visit Type */}
+            <div className="mt-4">
+              <label className="text-xs font-medium text-slate-600">Visit Type</label>
+              <div className="flex gap-1.5 mt-1">
+                {(["new", "revisit", "followup", "emergency"] as const).map((vt) => (
+                  <button key={vt} onClick={() => setVisitType(vt)}
+                    className={cn("flex-1 h-8 rounded-lg text-[11px] font-medium capitalize transition-colors",
+                      visitType === vt
+                        ? vt === "emergency" ? "bg-red-600 text-white"
+                          : vt === "revisit" ? "bg-amber-600 text-white"
+                          : vt === "followup" ? "bg-violet-600 text-white"
+                          : "bg-[#1A2F5A] text-white"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    )}>
+                    {vt === "followup" ? "Follow-up" : vt.charAt(0).toUpperCase() + vt.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Visit Purpose */}
+            <div className="mt-3">
+              <label className="text-xs font-medium text-slate-600">Visit Purpose</label>
+              <select
+                value={visitPurpose}
+                onChange={(e) => setVisitPurpose(e.target.value as typeof visitPurpose)}
+                className="w-full h-9 px-2 mt-1 border border-slate-200 rounded-lg text-xs outline-none bg-white"
+              >
+                <option value="new">New Consultation</option>
+                <option value="revisit">Revisit (same problem)</option>
+                <option value="follow_up">Follow-Up</option>
+                <option value="review">Review</option>
+                <option value="procedure">Procedure</option>
+              </select>
+            </div>
+
+            {/* Revisit auto-detection suggestion */}
+            {revisitSuggestion && (
+              <div className="mt-2 p-2.5 bg-amber-50 border border-amber-300 rounded-lg">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <p className="text-[11px] font-semibold text-amber-800">
+                      Possible revisit detected
+                    </p>
+                    <p className="text-[11px] text-amber-700 mt-0.5">
+                      Last visit: {new Date(revisitSuggestion.date).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}
+                      {revisitSuggestion.doctor ? ` · Dr. ${revisitSuggestion.doctor}` : ""}
+                    </p>
+                    {revisitDiscountNote && (
+                      <p className="text-[11px] text-emerald-700 font-semibold mt-0.5">
+                        🏷 {revisitDiscountNote} · Fee: ₹{consultationFee.toLocaleString("en-IN")}
+                        {revisitDiscount > 0 && <span className="line-through text-slate-400 ml-1 font-normal">₹{rate.fee.toLocaleString("en-IN")}</span>}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-1.5 flex-shrink-0">
+                    <button
+                      onClick={() => {
+                        setRevisitOfTokenId(revisitSuggestion.tokenId);
+                        if (visitPurpose === "new") setVisitPurpose("revisit");
+                        setRevisitSuggestion(null);
+                      }}
+                      className="text-[10px] bg-amber-600 text-white px-2 py-1 rounded font-semibold hover:bg-amber-700"
+                    >
+                      Link Visit
+                    </button>
+                    <button
+                      onClick={() => setRevisitSuggestion(null)}
+                      className="text-[10px] text-amber-600 border border-amber-300 px-2 py-1 rounded hover:bg-amber-50"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* MLC Flag */}
+            <div className="mt-3 flex items-start gap-3">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input type="checkbox" checked={isMlc} onChange={(e) => setIsMlc(e.target.checked)}
+                  className="rounded border-slate-300 accent-red-600" />
+                <span className="text-xs font-medium text-slate-700">Medico-Legal Case (MLC)</span>
+              </label>
+              {isMlc && (
+                <input value={policeStation} onChange={(e) => setPoliceStation(e.target.value)}
+                  placeholder="Police station name"
+                  className="flex-1 h-8 px-2 border border-red-300 rounded-lg text-xs outline-none focus:border-red-500 focus:ring-1 focus:ring-red-200" />
+              )}
+            </div>
+            {isMlc && (
+              <div className="mt-1 px-3 py-2 bg-red-50 border border-red-200 rounded-lg">
+                <p className="text-[11px] text-red-700 font-medium">MLC — Inform police within 24 hours. Maintain MLC register.</p>
+              </div>
+            )}
+
+            {/* Payer Type */}
+            <div className="mt-3">
+              <label className="text-xs font-medium text-slate-600">Payer Type</label>
+              <div className="flex gap-2 mt-1">
+                <select value={payerType} onChange={(e) => { setPayerType(e.target.value); setPayerId(null); }}
+                  className="flex-1 h-9 px-2 border border-slate-200 rounded-lg text-xs outline-none">
+                  <option value="cash">Cash</option>
+                  <option value="credit">Credit / Deferred</option>
+                  <option value="corporate">Corporate</option>
+                  <option value="tpa">TPA / Insurance</option>
+                  <option value="pmjay">PMJAY / Ayushman</option>
+                  <option value="cghs">CGHS</option>
+                  <option value="esi">ESI</option>
+                  <option value="state_scheme">State Scheme</option>
+                  <option value="other">Other</option>
+                </select>
+                {payerType !== "cash" && (
+                  <select value={payerId || ""} onChange={(e) => setPayerId(e.target.value || null)}
+                    className="flex-1 h-9 px-2 border border-slate-200 rounded-lg text-xs outline-none">
+                    <option value="">Select payer…</option>
+                    {payerMasters.filter((pm) => pm.payer_type === payerType).map((pm) => (
+                      <option key={pm.id} value={pm.id}>{pm.payer_name}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+            </div>
+
+            {/* DPDP Consent */}
+            {!useExisting && (
+              <div className="mt-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                <label className="flex items-start gap-2.5 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={dpdpConsent}
+                    onChange={(e) => setDpdpConsent(e.target.checked)}
+                    className="mt-0.5 rounded border-blue-300 accent-blue-600"
+                  />
+                  <span className="text-xs text-blue-900 leading-relaxed">
+                    Patient consents to collection and processing of personal and health data
+                    as required for medical treatment, billing, and regulatory compliance
+                    under the <strong>Digital Personal Data Protection Act, 2023</strong>.
+                  </span>
+                </label>
+              </div>
+            )}
+
+            {/* Walk-in only — appointments get a token at check-in.
+                No number is shown here on purpose. It is allocated by the database when the
+                payment is saved, so anything displayed beforehand would be a guess that goes
+                stale the moment another desk registers a patient for the same doctor. Showing
+                that guess is exactly what used to hand two patients the same "A-1". */}
+            {!isAppointment && (
+              <div className="mt-4 p-3 bg-slate-50 rounded-lg border border-slate-100 text-center">
+                <span className="text-xs text-slate-500">
+                  Token number is assigned on payment
+                </span>
+              </div>
+            )}
+
+            <FormError message={formError} />
+
+            {/* Primary action */}
+            {isAppointment ? (
+              <button
+                onClick={handleBookAppointment}
+                disabled={submitting}
+                className="w-full h-11 mt-4 bg-[#1A2F5A] text-white rounded-lg text-[13px] font-semibold hover:bg-[#152647] active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-60"
+              >
+                {submitting ? "Booking…" : "Book Appointment"}
+              </button>
+            ) : (
+              <button
+                onClick={handleProceedToPayment}
+                className="w-full h-11 mt-4 bg-[#1A2F5A] text-white rounded-lg text-[13px] font-semibold hover:bg-[#152647] active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+              >
+                <CreditCard className="h-4 w-4" />
+                Proceed to Payment →
+              </button>
+            )}
+          </>
+        ) : step === "payment" ? (
+          /* ══════════ STEP 2: PAYMENT ══════════ */
+          <>
+            <h2 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+              <CreditCard className="h-5 w-5 text-[#0E7B7B]" />
+              Collect Consultation Fee
+            </h2>
+            <p className="text-[13px] text-slate-500 mt-0.5">Pay before token issuance</p>
+
+            {/* Patient summary */}
+            <div className="mt-5 p-3 bg-slate-50 rounded-lg border border-slate-100 space-y-1">
+              <div className="flex justify-between text-sm">
+                <span className="text-slate-500">Patient</span>
+                <span className="font-medium text-slate-800">{patientDisplayName || "—"}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-slate-500">Department</span>
+                <span className="font-medium text-slate-800">{selectedDeptName}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-slate-500">Doctor</span>
+                <span className="font-medium text-slate-800">{doctorId ? `Dr. ${selectedDoctorName}` : "—"}</span>
+              </div>
+              <div className="flex justify-between text-sm">
+                <span className="text-slate-500">Token</span>
+                <span className="text-slate-400 text-xs italic self-center">assigned on payment</span>
+              </div>
+            </div>
+
+            {/* Consultation Fee — read-only to prevent front-desk manipulation */}
+            <div className="mt-4">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-medium text-slate-600">Consultation Fee (₹)</label>
+                <span className={cn("text-[10px] font-medium px-1.5 py-0.5 rounded",
+                  chargedTier === "emergency" ? "bg-red-100 text-red-700" :
+                  chargedTier === "follow_up" ? "bg-violet-100 text-violet-700" :
+                  rate.source === "doctor" ? "bg-emerald-100 text-emerald-700" :
+                  rate.source === "dept" ? "bg-blue-100 text-blue-700" :
+                  rate.source === "global" ? "bg-slate-100 text-slate-600" :
+                  "bg-amber-100 text-amber-700"
+                )}>
+                  {chargedTier === "emergency"
+                    ? "Emergency rate"
+                    : chargedTier === "follow_up"
+                    ? `Follow-up rate (within ${rate.followUpValidityDays}d)`
+                    : rate.source === "doctor" ? "Doctor rate"
+                    : rate.source === "dept" ? "Dept rate"
+                    : rate.source === "global" ? "Global rate"
+                    : "Default rate"}
+                </span>
+              </div>
+              <div className={cn(
+                "w-full h-12 px-4 border rounded-lg text-lg font-bold mt-1 flex items-center select-none",
+                chargedTier === "emergency"
+                  ? "bg-red-50 border-red-200 text-red-800"
+                  : chargedTier === "follow_up"
+                  ? "bg-violet-50 border-violet-200 text-violet-800"
+                  : "bg-slate-50 border-slate-200 text-slate-800"
+              )}>
+                ₹{consultationFee.toLocaleString("en-IN")}
+                {rate.fee !== consultationFee && (
+                  <span className="ml-2 text-sm font-normal line-through text-slate-400">
+                    ₹{rate.fee.toLocaleString("en-IN")}
+                  </span>
+                )}
+              </div>
+              {/* Why this amount. A desk expecting the cheaper follow-up rate needs to see
+                  whether the allowance ran out or the validity window expired. */}
+              {feeReason && (
+                <p className="text-[11px] text-slate-500 mt-1.5 leading-snug">{feeReason}</p>
+              )}
+              {/* The ₹500 fallback used to be applied silently behind a small badge, which is
+                  how a doctor with no configured rate looked like a working "global price". */}
+              {rate.source === "default" && (
+                <div className="mt-2 flex items-start gap-1.5 rounded-md bg-amber-50 border border-amber-200 px-2.5 py-2">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-600 mt-px flex-shrink-0" />
+                  <p className="text-[11px] text-amber-800 leading-snug">
+                    No consultation fee is configured for this doctor, department, or hospital —
+                    charging the ₹{DEFAULT_CONSULTATION_FEE} default. Set it in
+                    Settings → Doctors &amp; Staff.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Payment Mode */}
+            <div className="mt-4">
+              <label className="text-xs font-medium text-slate-600">Payment Mode</label>
+              <div className="flex gap-2 mt-1.5">
+                {PAYMENT_MODES.map((m) => (
+                  <button
+                    key={m.value}
+                    onClick={() => setPaymentMode(m.value)}
+                    className={cn(
+                      "flex-1 h-11 rounded-lg text-sm font-medium transition-colors",
+                      paymentMode === m.value
+                        ? "bg-[#0E7B7B] text-white shadow-md"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    )}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Reference for UPI/Card */}
+            {paymentMode !== "cash" && (
+              <div className="mt-3">
+                <label className="text-xs font-medium text-slate-600">Reference / Txn ID</label>
+                <input
+                  value={paymentRef}
+                  onChange={(e) => setPaymentRef(e.target.value)}
+                  placeholder="Transaction reference..."
+                  className="w-full h-10 px-3 border border-slate-200 rounded-lg text-sm mt-1 focus:border-[#0E7B7B] focus:ring-2 focus:ring-[#0E7B7B]/10 outline-none"
+                />
+              </div>
+            )}
+
+            <FormError message={formError} className="mt-4" />
+
+            {/* Pay & Issue Token */}
+            <button
+              onClick={() => handlePayAndIssue(false)}
+              disabled={submitting}
+              className="w-full h-12 mt-5 bg-[#0E7B7B] text-white rounded-lg text-[14px] font-bold hover:bg-[#0a6565] active:scale-[0.98] transition-all disabled:opacity-60 flex items-center justify-center gap-2"
+            >
+              {submitting ? "Processing..." : `💳 Pay ₹${consultationFee.toLocaleString("en-IN")} & Issue Token →`}
+            </button>
+
+            {/* Back */}
+            <div className="flex items-center mt-3">
+              <button
+                onClick={() => setStep("details")}
+                className="text-xs text-slate-500 hover:text-slate-700 flex items-center gap-1"
+              >
+                <ArrowLeft className="h-3 w-3" /> Back to details
+              </button>
+            </div>
+          </>
+        ) : (
+          /* ══════════ STEP 3: RECEIPT ══════════ */
+          <>
+            <h2 className="text-lg font-bold text-emerald-700 flex items-center gap-2">
+              <CheckCircle2 className="h-5 w-5" />
+              Token Issued Successfully
+            </h2>
+
+            {/* Printable Receipt */}
+            <div ref={receiptRef} className="mt-4 border border-slate-200 rounded-lg p-5 bg-white" id="opd-receipt">
+              <div className="text-center border-b border-dashed border-slate-300 pb-3 mb-3">
+                <p className="text-sm font-bold text-slate-800">OPD CONSULTATION RECEIPT</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">{receiptData?.date}</p>
+              </div>
+
+              <div className="space-y-1.5 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Bill No.</span>
+                  <span className="font-mono font-medium text-slate-800">{receiptData?.billNumber}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Patient</span>
+                  <span className="font-medium text-slate-800">{receiptData?.patientName}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">UHID</span>
+                  <span className="font-mono text-slate-800">{receiptData?.uhid}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Department</span>
+                  <span className="text-slate-800">{receiptData?.department}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-500">Doctor</span>
+                  <span className="text-slate-800">{receiptData?.doctor}</span>
+                </div>
+              </div>
+
+              <div className="border-t border-dashed border-slate-300 mt-3 pt-3 space-y-1.5">
+                <div className="flex justify-between text-sm">
+                  <span className="text-slate-500">Token</span>
+                  <span className="text-lg font-bold text-[#1A2F5A]">{receiptData?.token}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-slate-500">Consultation Fee</span>
+                  <span className="font-bold text-slate-800">₹{receiptData?.fee?.toLocaleString("en-IN")}</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-slate-500">Payment</span>
+                  <span className={cn("font-medium", receiptData?.paid ? "text-emerald-600" : "text-amber-600")}>
+                    {receiptData?.paid ? `Paid (${receiptData.paymentMode})` : "Pending"}
+                  </span>
+                </div>
+              </div>
+
+              <div className="border-t border-dashed border-slate-300 mt-3 pt-2 text-center">
+                <p className="text-[10px] text-slate-400">Thank you for visiting. Get well soon!</p>
+              </div>
+            </div>
+
+            {/* Print + Done buttons */}
+            <div className="flex gap-3 mt-4">
+              <button
+                onClick={handlePrintReceipt}
+                className="flex-1 h-11 bg-[#1A2F5A] text-white rounded-lg text-[13px] font-semibold hover:bg-[#152647] active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+              >
+                <Printer className="h-4 w-4" /> Print Receipt
+              </button>
+              <button
+                onClick={() => { onCreated(); onClose(); }}
+                className="flex-1 h-11 bg-slate-100 text-slate-700 rounded-lg text-[13px] font-semibold hover:bg-slate-200 active:scale-[0.98] transition-all"
+              >
+                Done
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+      <div onClick={(e) => e.stopPropagation()}>
+        <AddReferralDoctorModal
+          open={showReferralModal}
+          onClose={() => setShowReferralModal(false)}
+          onSaved={(name, id) => { setReferralSource(name); setReferralDoctorId(id || null); }}
+          hospitalId={hospitalId}
+        />
+
+        {/* Duplicate patient confirmation dialog */}
+        {showSameDayWarn && sameDayToken && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40" onClick={() => setShowSameDayWarn(false)}>
+            <div className="bg-background rounded-xl p-6 w-full max-w-[380px] shadow-2xl" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center gap-2 mb-3">
+                <AlertTriangle className="h-5 w-5 text-amber-500" />
+                <h3 className="text-sm font-bold text-foreground">Patient already in queue today</h3>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">
+                <strong>{foundPatient?.full_name}</strong> already has active token{" "}
+                <strong>{sameDayToken.token_number}</strong>
+                {sameDayToken.department ? ` — ${sameDayToken.department}` : ""}.
+                Status: <span className="capitalize">{sameDayToken.status.replace(/_/g, " ")}</span>.
+              </p>
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2 mb-4">
+                Registering again will create a second consultation bill for the same patient visit.
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShowSameDayWarn(false)}
+                  className="flex-1 h-9 text-xs font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { setShowSameDayWarn(false); setStep("payment"); }}
+                  className="flex-1 h-9 text-xs font-medium rounded-lg border border-border text-foreground hover:bg-muted"
+                >
+                  Register Anyway
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showDupeConfirm && dupeCandidate && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40" onClick={() => setShowDupeConfirm(false)}>
+            <div className="bg-background rounded-xl p-6 w-full max-w-[380px] shadow-2xl" onClick={(e) => e.stopPropagation()}>
+              <div className="flex items-center gap-2 mb-3">
+                <AlertTriangle className="h-5 w-5 text-amber-500" />
+                <h3 className="text-sm font-bold text-foreground">Possible Duplicate Patient</h3>
+              </div>
+              <p className="text-xs text-muted-foreground mb-3">A patient with similar details already exists:</p>
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4">
+                <p className="text-sm font-medium text-foreground">{dupeCandidate.full_name}</p>
+                <p className="text-xs text-muted-foreground">{dupeCandidate.uhid} · Phone: {dupeCandidate.phone || "—"}</p>
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleUseDupePatient}
+                  className="flex-1 h-9 text-xs font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90"
+                >
+                  Use Existing Patient
+                </button>
+                <button
+                  onClick={() => { if (dupeResolveCallback) dupeResolveCallback(); }}
+                  className="flex-1 h-9 text-xs font-medium rounded-lg border border-border text-foreground hover:bg-muted"
+                >
+                  Create New Anyway
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default WalkInModal;

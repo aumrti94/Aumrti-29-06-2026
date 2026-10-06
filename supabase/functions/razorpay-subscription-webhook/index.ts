@@ -1,0 +1,832 @@
+/**
+ * razorpay-subscription-webhook
+ *
+ * Receives subscription lifecycle events from Razorpay and updates
+ * hospital_subscriptions accordingly.
+ *
+ * Separate from the existing razorpay-webhook (which handles patient billing).
+ * Register THIS URL in Razorpay Dashboard → Webhooks for subscription events:
+ *   https://[project-ref].supabase.co/functions/v1/razorpay-subscription-webhook
+ *
+ * Required Supabase secrets:
+ *   RAZORPAY_SUBSCRIPTION_WEBHOOK_SECRET — from Razorpay Dashboard → Webhooks
+ *
+ * Events handled:
+ *   subscription.activated  → status = 'active', set billing period
+ *   subscription.charged    → status = 'active', update billing period
+ *   subscription.halted     → status = 'past_due'   (payment failed, retrying)
+ *   subscription.cancelled  → status = 'cancelled'
+ *   subscription.completed  → status = 'cancelled'  (all charges done)
+ *   subscription.paused     → status = 'suspended'
+ *   subscription.resumed    → status = 'active'
+ *
+ * Payment-level events (no subscription entity in the payload):
+ *   payment.failed          → records a 'payment_attempt' row (status 'failed')
+ *   refund.created          → records a 'credit_note' row, marks the original
+ *   refund.processed          invoice refunded / partially_refunded
+ *
+ * Why those matter: only successful charges were ever recorded, so a hospital
+ * whose card was declined had no trace of it anywhere, and a refund left the
+ * original invoice still reading "paid". Payment history could not be trusted
+ * for support or for reconciliation.
+ *
+ * Note on retries: the idempotency insert into razorpay_webhook_log happens
+ * BEFORE the event-type filter, so event ids seen (and ignored) before this
+ * deploy are already burned and will not be reprocessed. Harmless here — there
+ * were zero invoices when this shipped.
+ */
+
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import {
+  computePeriodEnd,
+  resolveEffectivePrice,
+  razorpayPeriodForCycle,
+  type BillingCycle,
+} from "../_shared/platform-billing.ts";
+import { getRazorpaySubscriptionKeys } from "../_shared/platform-razorpay-config.ts";
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+// Map Razorpay subscription events to our status values
+const EVENT_STATUS: Record<string, string> = {
+  "subscription.activated":  "active",
+  "subscription.charged":    "active",
+  "subscription.halted":     "past_due",
+  "subscription.cancelled":  "cancelled",
+  "subscription.completed":  "cancelled",
+  "subscription.paused":     "suspended",
+  "subscription.resumed":    "active",
+  "subscription.pending":    "trial",   // created but not yet paid
+};
+
+// Payment-level events arrive WITHOUT a subscription entity, so they are routed
+// separately from the status-mapping flow above. payment.captured is included
+// for AI-wallet top-ups (a one-time order, not a subscription charge); ordinary
+// subscription-renewal captures are ignored here (subscription.charged owns them).
+const PAYMENT_EVENTS = new Set(["payment.captured", "payment.failed", "refund.created", "refund.processed"]);
+
+/** Card last4 / UPI VPA / bank — whatever Razorpay gives us for this method. */
+function paymentMethodDetail(p: any): string | null {
+  if (!p) return null;
+  if (p.card?.last4) return `•••• ${p.card.last4}${p.card.network ? ` ${p.card.network}` : ""}`;
+  if (p.vpa) return String(p.vpa);
+  if (p.bank) return String(p.bank);
+  if (p.wallet) return String(p.wallet);
+  return null;
+}
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
+
+  let rawBody = "";
+
+  try {
+
+  rawBody = await req.text();
+  const signature = req.headers.get("x-razorpay-signature");
+
+  const db = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  // Razorpay keys: /platform-configured row first, env vars as fallback.
+  const { keyId: rzpKeyId, keySecret: rzpSecret, webhookSecret: secret } =
+    await getRazorpaySubscriptionKeys(db);
+
+  // ── HMAC-SHA256 signature verification ───────────────────────────────────
+  // Fails CLOSED: an unconfigured secret must reject every request, not skip the check —
+  // otherwise a misconfigured environment would silently accept forged subscription/refund
+  // events from anyone who finds this URL.
+  if (!secret) {
+    console.error("RAZORPAY_SUBSCRIPTION_WEBHOOK_SECRET not set — rejecting request");
+    return new Response("Webhook secret not configured", { status: 500 });
+  }
+  if (!signature) {
+    console.warn("Missing x-razorpay-signature header");
+    return new Response("Missing signature", { status: 401 });
+  }
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac  = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(rawBody));
+  const computed = Array.from(new Uint8Array(mac))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  if (computed !== signature) {
+    console.error("Signature mismatch — possible forgery attempt");
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  let payload: any;
+  try {
+    payload = JSON.parse(rawBody);
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+
+  const event = payload?.event as string;
+  const subEntity = payload?.payload?.subscription?.entity;
+  const paymentEntity = payload?.payload?.payment?.entity;
+
+  // ── Webhook-level idempotency (prevents double-processing on retries) ──
+  // Shares razorpay_webhook_log with razorpay-webhook — Razorpay event IDs
+  // are unique per account regardless of which endpoint receives them.
+  const webhookId = req.headers.get("x-razorpay-event-id");
+  if (webhookId) {
+    const { error: dedupError } = await db
+      .from("razorpay_webhook_log")
+      .insert({ webhook_id: webhookId, event: event ?? "unknown" });
+
+    if (dedupError?.code === "23505") {
+      return new Response(JSON.stringify({ ok: true, skipped: "duplicate" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────
+
+  // ── Payment-level events ──────────────────────────────────────────────────
+  // These carry a payment (or refund) entity and NO subscription entity, so they
+  // must be routed and returned before the subscription flow's `!subEntity`
+  // guard, which would otherwise silently drop them.
+  if (PAYMENT_EVENTS.has(event)) {
+    const refundEntity = payload?.payload?.refund?.entity;
+
+    // ── AI-wallet top-up ──
+    // A one-time order tagged notes.purpose='ai_wallet_topup' (create-ai-wallet-topup).
+    // Ordinary subscription-renewal captures have no such note and are ignored,
+    // so this does not double-count against subscription.charged.
+    if (event === "payment.captured") {
+      const p = paymentEntity;
+      const notes = p?.notes ?? {};
+      if (notes.purpose !== "ai_wallet_topup" || !notes.hospital_id) {
+        return new Response(JSON.stringify({ status: "ignored", event }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      const amountInr = (p?.amount ?? 0) / 100;
+      // Idempotent on the payment id (partial unique index + in-function guard).
+      const { data: newBalance } = await db.rpc("apply_ai_wallet_delta", {
+        p_hospital_id: notes.hospital_id,
+        p_amount_inr:  amountInr,
+        p_type:        "topup",
+        p_feature_key: null,
+        p_source:      p?.id ?? null,
+        p_metadata:    { razorpay_payment_id: p?.id ?? null, method: p?.method ?? null },
+      });
+
+      const { error: topupLogErr } = await db.from("subscription_events").insert({
+        hospital_id: notes.hospital_id,
+        event_type:  "ai_wallet_topup",
+        razorpay_event: event,
+        metadata: { razorpay_payment_id: p?.id ?? null, amount_inr: amountInr, balance_after_inr: newBalance ?? null },
+      });
+      if (topupLogErr) console.error("razorpay-subscription-webhook: logging ai_wallet_topup event failed:", topupLogErr.message);
+
+      console.log(`✓ AI wallet top-up ₹${amountInr} → hospital ${notes.hospital_id}`);
+      return new Response(JSON.stringify({ status: "processed", event, hospitalId: notes.hospital_id }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (event === "payment.failed") {
+      const p = paymentEntity;
+      const notes = p?.notes ?? {};
+      let hospId: string | undefined = notes.hospital_id;
+      let planName: string = notes.plan_name || "Subscription";
+      let subRow: any = null;
+
+      // Fallback: route via the subscription this payment belongs to.
+      const subId = p?.subscription_id ?? notes.subscription_id;
+      if (!hospId && subId) {
+        const { data } = await db
+          .from("hospital_subscriptions")
+          .select("id, hospital_id, billing_cycle, subscription_plans(name)")
+          .eq("razorpay_subscription_id", subId)
+          .maybeSingle();
+        subRow = data;
+        hospId = data?.hospital_id;
+        planName = (data as any)?.subscription_plans?.name ?? planName;
+      }
+
+      if (!hospId) {
+        console.warn("payment.failed with no routable hospital_id — skipping");
+        return new Response("ok", { status: 200 });
+      }
+
+      const { data: docNo } = await db.rpc("next_document_number", {
+        p_hospital_id: hospId,
+        p_kind: "payment_attempt",
+      });
+
+      // plan_name is NOT NULL on this table, hence the fallbacks above.
+      await db.from("subscription_invoices").insert({
+        hospital_id:              hospId,
+        invoice_number:           docNo,
+        invoice_type:             "payment_attempt",
+        status:                   "failed",
+        plan_name:                planName,
+        amount_inr:               (p?.amount ?? 0) / 100,
+        razorpay_payment_id:      p?.id ?? null,
+        razorpay_subscription_id: subId ?? null,
+        subscription_id:          subRow?.id ?? null,
+        billing_cycle:            subRow?.billing_cycle ?? null,
+        payment_method:           p?.method ?? null,
+        payment_method_detail:    paymentMethodDetail(p),
+        failure_code:             p?.error_code ?? null,
+        failure_reason:           p?.error_description ?? p?.error_reason ?? null,
+      });
+
+      const { error: failLogErr } = await db.from("subscription_events").insert({
+        hospital_id: hospId,
+        event_type:  "payment_failed",
+        razorpay_event: event,
+        metadata: {
+          razorpay_payment_id: p?.id ?? null,
+          error_code: p?.error_code ?? null,
+          error_description: p?.error_description ?? null,
+        },
+      });
+      if (failLogErr) console.error("razorpay-subscription-webhook: logging payment_failed event failed:", failLogErr.message);
+
+      console.log(`✓ ${event} → hospital ${hospId} → attempt recorded`);
+      return new Response(JSON.stringify({ status: "processed", event, hospitalId: hospId }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // ── Refunds ──
+    // The refund entity carries the original payment id, which is the reliable
+    // way back to the hospital: the invoice we already wrote for that charge.
+    const paymentId = refundEntity?.payment_id ?? paymentEntity?.id;
+    if (!paymentId) {
+      console.warn(`${event} with no payment_id — skipping`);
+      return new Response("ok", { status: 200 });
+    }
+
+    const { data: original } = await db
+      .from("subscription_invoices")
+      .select("id, hospital_id, plan_name, amount_inr, billing_cycle, subscription_id, razorpay_subscription_id")
+      .eq("razorpay_payment_id", paymentId)
+      .eq("invoice_type", "tax_invoice")
+      .maybeSingle();
+
+    if (!original) {
+      console.warn(`${event}: no original invoice for payment ${paymentId} — skipping`);
+      return new Response("ok", { status: 200 });
+    }
+
+    const refundInr = (refundEntity?.amount ?? 0) / 100;
+    const fullyRefunded = refundInr >= Number(original.amount_inr);
+
+    const { data: cnNo } = await db.rpc("next_document_number", {
+      p_hospital_id: original.hospital_id,
+      p_kind: "credit_note",
+    });
+
+    await db.from("subscription_invoices").insert({
+      hospital_id:              original.hospital_id,
+      invoice_number:           cnNo,
+      invoice_type:             "credit_note",
+      status:                   "refunded",
+      plan_name:                original.plan_name,
+      amount_inr:               refundInr,
+      refund_amount_inr:        refundInr,
+      refunded_at:              new Date().toISOString(),
+      razorpay_refund_id:       refundEntity?.id ?? null,
+      razorpay_payment_id:      paymentId,
+      razorpay_subscription_id: original.razorpay_subscription_id,
+      subscription_id:          original.subscription_id,
+      billing_cycle:            original.billing_cycle,
+    });
+
+    // The original tax invoice must stop reading "paid".
+    await db.from("subscription_invoices")
+      .update({
+        status:            fullyRefunded ? "refunded" : "partially_refunded",
+        refund_amount_inr: refundInr,
+        refunded_at:       new Date().toISOString(),
+        razorpay_refund_id: refundEntity?.id ?? null,
+      })
+      .eq("id", original.id);
+
+    const { error: refundLogErr } = await db.from("subscription_events").insert({
+      hospital_id: original.hospital_id,
+      event_type:  "refund",
+      razorpay_event: event,
+      metadata: {
+        razorpay_payment_id: paymentId,
+        razorpay_refund_id: refundEntity?.id ?? null,
+        refund_amount_inr: refundInr,
+        fully_refunded: fullyRefunded,
+      },
+    });
+    if (refundLogErr) console.error("razorpay-subscription-webhook: logging refund event failed:", refundLogErr.message);
+
+    console.log(`✓ ${event} → hospital ${original.hospital_id} → credit note ${cnNo}`);
+    return new Response(JSON.stringify({ status: "processed", event }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  // Ignore events we don't handle
+  if (!EVENT_STATUS[event]) {
+    console.log(`Ignored event: ${event}`);
+    return new Response(JSON.stringify({ status: "ignored", event }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  if (!subEntity) {
+    console.warn("No subscription entity in payload");
+    return new Response("ok", { status: 200 });
+  }
+
+  const razorpaySubId: string = subEntity.id;
+  const notes = subEntity.notes ?? {};
+  const hospitalId: string | undefined = notes.hospital_id;
+  const planId: string | undefined = notes.plan_id;
+  const couponCode: string | undefined = notes.coupon_code;
+
+  if (!hospitalId) {
+    console.warn("No hospital_id in subscription notes — cannot route event");
+    return new Response("ok", { status: 200 });
+  }
+
+  const newStatus = EVENT_STATUS[event];
+
+  // ── Build update payload ──────────────────────────────────────────────────
+  const update: Record<string, unknown> = {
+    status: newStatus,
+    updated_at: new Date().toISOString(),
+  };
+
+  // The cycle we put in the subscription notes at checkout — Razorpay echoes
+  // notes back on every event, so this is how a renewal knows whether it is a
+  // monthly or annual charge.
+  const cycle: BillingCycle = notes.billing_cycle === "yearly" ? "yearly" : "monthly";
+
+  // Payment-failure buffer anchor (mirrors resolveSubscriptionAccess):
+  //   • halted → the renewal just failed, start the buffer clock.
+  //   • back to active (activated / charged / resumed) → the account recovered,
+  //     clear the anchor so a later failure starts a fresh buffer.
+  if (event === "subscription.halted") {
+    update.past_due_since = new Date().toISOString();
+  } else if (["subscription.activated", "subscription.charged", "subscription.resumed"].includes(event)) {
+    update.past_due_since = null;
+  }
+
+  // Set billing period when subscription activates or renews
+  if (["subscription.activated", "subscription.charged"].includes(event)) {
+    const periodStart = subEntity.current_start
+      ? new Date(subEntity.current_start * 1000)
+      : new Date();
+    update.current_period_start = periodStart.toISOString();
+
+    // Razorpay's own current_end stays authoritative; computePeriodEnd is only
+    // the fallback for events that omit it (which would otherwise leave the
+    // "next billing" date blank).
+    update.current_period_end = subEntity.current_end
+      ? new Date(subEntity.current_end * 1000).toISOString()
+      : computePeriodEnd(periodStart, cycle).toISOString();
+
+    update.billing_cycle = cycle;
+    // End the trial on first activation
+    update.trial_ends_at = new Date().toISOString();
+  }
+
+  // Capture Razorpay payment ID + how they paid, on a successful charge
+  if (event === "subscription.charged" && paymentEntity?.id) {
+    update.razorpay_plan_id = subEntity.plan_id;
+    if (paymentEntity.method) update.payment_method = paymentEntity.method;
+    const detail = paymentMethodDetail(paymentEntity);
+    if (detail) update.payment_method_detail = detail;
+  }
+
+  // ── Upsert hospital_subscriptions ────────────────────────────────────────
+  // Was: check `upsertErr` alone to decide whether to fall back to an upsert for a
+  // "row might not exist yet" race. A Postgres UPDATE that matches zero rows is NOT
+  // an error — supabase-js returns `error: null` regardless of how many rows matched
+  // unless the affected rows are actually selected back. So a hospital with no
+  // pre-existing hospital_subscriptions row got a 200 "processed" / newStatus:"active"
+  // response while the update silently affected nothing and the fallback branch never
+  // ran — the exact race the comment below describes, just never actually caught.
+  // Found via Phase 6 edge-function testing (HOSPITAL_A's Tier-0 seed has no
+  // subscription row, so the very first webhook event for it hit this directly).
+  const { data: updatedRows, error: upsertErr } = await db.from("hospital_subscriptions")
+    .update(update)
+    .eq("hospital_id", hospitalId)
+    .select("hospital_id");
+
+  if (upsertErr || !updatedRows || updatedRows.length === 0) {
+    // Fallback: row might not exist yet (race condition), try upsert
+    if (planId) {
+      const { error: fallbackErr } = await db.from("hospital_subscriptions").upsert({
+        hospital_id: hospitalId,
+        plan_id: planId,
+        razorpay_subscription_id: razorpaySubId,
+        ...update,
+      }, { onConflict: "hospital_id" });
+      if (fallbackErr) console.error("hospital_subscriptions upsert fallback failed:", fallbackErr.message);
+    } else if (upsertErr) {
+      console.error("hospital_subscriptions update failed:", upsertErr.message);
+    } else {
+      console.error(`hospital_subscriptions: no existing row for hospital ${hospitalId} and no plan_id in event notes to create one`);
+    }
+  }
+
+  // ── Increment coupon used_count on first activation ───────────────────────
+  // Was `db.rpc(...).catch(fallback)` — supabase-js's PostgrestBuilder (what .rpc()
+  // returns) is thenable but has no real .catch(), so that call threw synchronously
+  // and skipped both the RPC and its own fallback. Same root cause as the
+  // subscription_events insert below and KNOWN-BUG-172/175. Found via Phase 6.
+  if (event === "subscription.activated" && couponCode) {
+    try {
+      const { error: rpcErr } = await db.rpc("increment_discount_used_count" as any, { p_code: couponCode });
+      if (rpcErr) {
+        const { data } = await db.from("discount_codes").select("used_count").eq("code", couponCode).maybeSingle();
+        if (data) {
+          await db.from("discount_codes").update({ used_count: (data.used_count || 0) + 1 }).eq("code", couponCode);
+        }
+      }
+    } catch (e) {
+      console.error("razorpay-subscription-webhook: coupon used_count increment failed:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // ── Log subscription event ────────────────────────────────────────────────
+  // Was `.insert(...).catch(() => {})` directly on the query builder — the same
+  // thenable-without-.catch() bug, except here it crashed the ENTIRE webhook
+  // (500, DLQ'd) on every event that reached this line, not just a best-effort
+  // side path. Found via Phase 6 edge-function testing.
+  try {
+    const { error: eventLogErr } = await db.from("subscription_events").insert({
+      hospital_id: hospitalId,
+      event_type:  event.replace("subscription.", ""),
+      new_status:  newStatus,
+      new_plan_id: planId || null,
+      razorpay_event: event,
+      metadata: {
+        razorpay_subscription_id: razorpaySubId,
+        ...(paymentEntity?.id ? { razorpay_payment_id: paymentEntity.id } : {}),
+      },
+    });
+    if (eventLogErr) console.error("razorpay-subscription-webhook: logging subscription_events failed:", eventLogErr.message);
+  } catch (e) {
+    console.error("razorpay-subscription-webhook: logging subscription_events failed:", e instanceof Error ? e.message : String(e));
+  }
+
+  // ── Generate invoice on successful charge ─────────────────────────────────
+  if (event === "subscription.charged" && paymentEntity) {
+    const amountInr  = (paymentEntity.amount ?? 0) / 100; // paise → INR
+    const periodStart = subEntity.current_start
+      ? new Date(subEntity.current_start * 1000).toISOString()
+      : null;
+    const periodEnd   = subEntity.current_end
+      ? new Date(subEntity.current_end   * 1000).toISOString()
+      : null;
+
+    // Was `.functions.invoke(...).catch(...)` — .functions.invoke() results are
+    // thenable like PostgrestBuilder but likewise have no real .catch(), so this
+    // threw synchronously on every successful charge instead of the intended
+    // "log and move on" behaviour. Same root cause as the .insert().catch() bugs
+    // above. Found via Phase 6 edge-function testing.
+    try {
+      const { error: invokeErr } = await db.functions.invoke("generate-invoice", {
+        body: {
+          hospital_id:              hospitalId,
+          plan_name:                subEntity.notes?.plan_name || "Subscription",
+          amount_inr:               amountInr,
+          razorpay_payment_id:      paymentEntity.id || null,
+          razorpay_subscription_id: razorpaySubId,
+          billing_period_start:     periodStart,
+          billing_period_end:       periodEnd ?? computePeriodEnd(periodStart ?? new Date(), cycle).toISOString(),
+          billing_cycle:            cycle,
+          payment_method:           paymentEntity.method ?? null,
+          payment_method_detail:    paymentMethodDetail(paymentEntity),
+          payment_captured_at:      paymentEntity.created_at
+            ? new Date(paymentEntity.created_at * 1000).toISOString()
+            : new Date().toISOString(),
+        },
+      });
+      if (invokeErr) console.error("generate-invoice call failed:", invokeErr.message);
+    } catch (e) {
+      console.error("generate-invoice call failed:", e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // ── Renewal amount reconciliation (pricing v3) ────────────────────────────
+  // Reconciles BOTH involuntary/deferred amount changes: bed-band drift (the
+  // hospital opened or retired beds) and purchased add-ons (granted on purchase,
+  // billed from the next renewal — which is this event).
+  // On every successful charge, recompute what this hospital SHOULD pay against
+  // its live active-bed count. If the bound amount has drifted (beds added or
+  // retired since checkout), rebind the mandate at cycle end — never mid-cycle,
+  // so a renewal is the only moment the price can move (Aditya's rule).
+  //
+  // Hospitals with an ACTIVE hospital_pricing_overrides row are skipped
+  // entirely: an override means the price is admin-set — a negotiated deal or
+  // the migration-164 twelve-month grandfather freeze — and the automated
+  // repricer must not touch it. When valid_until lapses, the next renewal
+  // reprices naturally.
+  //
+  // Idempotent: acts only when the desired amount differs from
+  // effective_amount_inr, which is updated in the same pass — a webhook replay
+  // finds no drift and does nothing.
+  if (event === "subscription.charged") {
+    try {
+      const { data: subRow } = await db
+        .from("hospital_subscriptions")
+        .select("plan_id, effective_amount_inr, discount_pct")
+        .eq("hospital_id", hospitalId)
+        .maybeSingle();
+
+      const effectivePlanId = subRow?.plan_id ?? planId;
+      if (subRow && effectivePlanId) {
+        const [{ data: planRow }, { data: ovRow }, { data: activeBeds }, { data: addonRows }] = await Promise.all([
+          db.from("subscription_plans")
+            .select("id, name, price_monthly, price_yearly, is_custom_price, beds_included, bed_block_size, price_per_bed_block, price_per_bed_block_yearly")
+            .eq("id", effectivePlanId)
+            .maybeSingle(),
+          db.from("hospital_pricing_overrides")
+            .select("monthly_price, yearly_price, valid_until")
+            .eq("hospital_id", hospitalId)
+            .maybeSingle(),
+          db.rpc("current_active_beds", { p_hospital_id: hospitalId }),
+          // Purchased add-ons (pricing v3 Phase 2). Granted on purchase, billed
+          // from the next renewal — which is this event.
+          db.from("hospital_addons")
+            .select("addon_skus(price_monthly, price_yearly)")
+            .eq("hospital_id", hospitalId)
+            .eq("status", "active"),
+        ]);
+
+        const overrideActive = !!ovRow && (
+          !ovRow.valid_until || new Date(ovRow.valid_until).getTime() >= Date.now()
+        );
+
+        const addonsMonthlyInr = (addonRows ?? []).reduce(
+          (sum: number, r: { addon_skus?: { price_monthly?: number | string | null } | null }) =>
+            sum + Number(r.addon_skus?.price_monthly ?? 0), 0);
+        const addonsYearlyInr = (addonRows ?? []).reduce(
+          (sum: number, r: { addon_skus?: { price_yearly?: number | string | null } | null }) =>
+            sum + Number(r.addon_skus?.price_yearly ?? 0), 0);
+
+        // Reconcile when EITHER axis can drift: bed-banded plans, or any plan
+        // carrying purchased add-ons. Checking beds alone would strand a Clinic
+        // hospital (no bed billing) that has bought an add-on — it would keep
+        // paying the base price forever.
+        const hasBedBilling = planRow?.beds_included != null && planRow?.price_per_bed_block != null;
+        const hasAddons = addonsMonthlyInr > 0;
+        if (planRow && !overrideActive && (hasBedBilling || hasAddons)) {
+          const desired = resolveEffectivePrice({
+            plan: planRow,
+            override: null,
+            cycle,
+            // Preserve a checkout coupon's stored discount across reprices —
+            // a bed change must never silently strip a promotional rate.
+            couponPct: Number(subRow.discount_pct ?? 0),
+            activeBeds: activeBeds as number | null,
+            addonsMonthlyInr,
+            // 0 means "no explicit yearly price on any SKU" → let the resolver
+            // apply the 10× convention rather than charging zero.
+            addonsYearlyInr: addonsYearlyInr > 0 ? addonsYearlyInr : null,
+          });
+
+          const boundPaise = Math.round(Number(subRow.effective_amount_inr ?? 0) * 100);
+          if (desired.available && boundPaise > 0 && desired.amountPaise !== boundPaise) {
+            // Shared audit payload — identical in shadow and live, so a preview
+            // row can be compared like-for-like against what actually happened.
+            const repriceMeta = {
+              razorpay_subscription_id: razorpaySubId,
+              previous_amount_inr: Number(subRow.effective_amount_inr),
+              new_amount_inr: desired.amountInr,
+              active_beds: activeBeds,
+              bed_blocks: desired.bedBlocks,
+              bed_fee_inr: desired.bedFeeInr,
+              addons_inr: desired.addonsInr,
+            };
+
+            // ── Shadow gate ───────────────────────────────────────────────
+            // This path mutates live payment mandates fleet-wide and cannot be
+            // exercised outside production. It therefore ships OFF: with the
+            // flag disabled we record what WOULD have been charged and touch
+            // nothing. resolve_feature_flag returns false for an unknown key,
+            // so a missing/deleted flag degrades to shadow, never to live
+            // billing. Flip it in /platform → Feature Flags (per-hospital
+            // override first, then a rollout percentage).
+            const { data: repriceLive } = await db.rpc("resolve_feature_flag", {
+              p_key: "bed_reprice_live",
+              p_hospital_id: hospitalId,
+            });
+
+            if (!repriceLive) {
+              // Record what WOULD have been charged; change nothing.
+              const { error: shadowLogErr } = await db.from("subscription_events").insert({
+                hospital_id: hospitalId,
+                event_type:  "bed_reprice_preview",
+                new_status:  newStatus,
+                new_plan_id: planRow.id,
+                razorpay_event: event,
+                metadata: { ...repriceMeta, mode: "shadow", applied: false },
+              });
+              if (shadowLogErr) console.error("razorpay-subscription-webhook: logging bed_reprice_preview event failed:", shadowLogErr.message);
+
+              console.log(
+                `[shadow] Amount reconciliation NOT applied for ${hospitalId}: ` +
+                `₹${subRow.effective_amount_inr} → ₹${desired.amountInr} ` +
+                `(${activeBeds} beds, ${desired.bedBlocks} blocks). ` +
+                `Enable the 'bed_reprice_live' flag to charge this.`,
+              );
+            } else {
+
+            if (rzpKeyId && rzpSecret) {
+              const auth = btoa(`${rzpKeyId}:${rzpSecret}`);
+
+              // Same claim/create-on-miss protocol as checkout: one Razorpay
+              // plan per (plan, cycle, amount), race-safe via the RPC.
+              const { data: cachedPlanId } = await db.rpc("claim_razorpay_plan_slot", {
+                p_plan_id: planRow.id,
+                p_billing_cycle: cycle,
+                p_amount_paise: desired.amountPaise,
+                p_razorpay_plan_id: null,
+              });
+              let newRzpPlanId: string | null = cachedPlanId ?? null;
+
+              if (!newRzpPlanId) {
+                const cycleWord = cycle === "yearly" ? "annual" : "monthly";
+                const createPlanRes = await fetch("https://api.razorpay.com/v1/plans", {
+                  method: "POST",
+                  headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    period:   razorpayPeriodForCycle(cycle),
+                    interval: 1,
+                    item: {
+                      name:        `Aumrti HMS ${planRow.name} (${cycleWord})`,
+                      amount:      desired.amountPaise,
+                      currency:    "INR",
+                      description: `Aumrti HMS ${planRow.name} ${cycleWord} subscription`,
+                    },
+                  }),
+                });
+                if (createPlanRes.ok) {
+                  const rzpPlan = await createPlanRes.json();
+                  const { data: claimed } = await db.rpc("claim_razorpay_plan_slot", {
+                    p_plan_id: planRow.id,
+                    p_billing_cycle: cycle,
+                    p_amount_paise: desired.amountPaise,
+                    p_razorpay_plan_id: rzpPlan.id,
+                  });
+                  newRzpPlanId = claimed ?? rzpPlan.id;
+                } else {
+                  const rzpErr = await createPlanRes.json().catch(() => ({}));
+                  console.error("Bed-reprice: Razorpay plan create failed:", rzpErr);
+                }
+              }
+
+              if (newRzpPlanId) {
+                // schedule_change_at "cycle_end": the NEXT invoice moves to the
+                // new amount; the cycle that just charged is untouched.
+                const patchRes = await fetch(
+                  `https://api.razorpay.com/v1/subscriptions/${razorpaySubId}`,
+                  {
+                    method: "PATCH",
+                    headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      plan_id: newRzpPlanId,
+                      schedule_change_at: "cycle_end",
+                    }),
+                  },
+                );
+
+                if (patchRes.ok) {
+                  await db.from("hospital_subscriptions")
+                    .update({
+                      effective_amount_inr: desired.amountInr,
+                      razorpay_plan_id: newRzpPlanId,
+                      updated_at: new Date().toISOString(),
+                    })
+                    .eq("hospital_id", hospitalId);
+
+                  // Never a silent transition (Aditya's rule).
+                  const { error: liveLogErr } = await db.from("subscription_events").insert({
+                    hospital_id: hospitalId,
+                    event_type:  "bed_reprice_scheduled",
+                    new_status:  newStatus,
+                    new_plan_id: planRow.id,
+                    razorpay_event: event,
+                    metadata: { ...repriceMeta, mode: "live", applied: true, applies: "next_cycle" },
+                  });
+                  if (liveLogErr) console.error("razorpay-subscription-webhook: logging bed_reprice_scheduled event failed:", liveLogErr.message);
+
+                  console.log(`✓ Amount reconciliation scheduled for ${hospitalId}: ₹${subRow.effective_amount_inr} → ₹${desired.amountInr} (${activeBeds} beds, ₹${desired.addonsInr} add-ons) at cycle end`);
+                } else {
+                  const patchErr = await patchRes.json().catch(() => ({}));
+                  console.error("Bed-reprice: subscription PATCH failed:", patchErr);
+                }
+              }
+            }
+
+            } // end live branch (bed_reprice_live flag)
+          }
+        }
+      }
+    } catch (repriceErr) {
+      // Never let a reprice failure break charge processing — the invoice and
+      // status update above must stand regardless.
+      console.error("Bed-reprice check failed (non-fatal):", repriceErr);
+    }
+  }
+
+  // ── Retire a superseded mandate after the new one is confirmed ────────────
+  // change-subscription-plan deliberately leaves the OLD subscription running
+  // through an upgrade, so an abandoned checkout never leaves the hospital with
+  // no mandate at all. Once the new one actually activates, the old one is safe
+  // to cancel — and this is the only place that knows it succeeded.
+  if (event === "subscription.activated" && notes.supersedes_subscription_id) {
+    if (rzpKeyId && rzpSecret) {
+      const auth = btoa(`${rzpKeyId}:${rzpSecret}`);
+      await fetch(
+        `https://api.razorpay.com/v1/subscriptions/${notes.supersedes_subscription_id}/cancel`,
+        {
+          method: "POST",
+          headers: { "Authorization": `Basic ${auth}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ cancel_at_cycle_end: 0 }),
+        },
+      ).catch((e) => console.error("Superseded-mandate cancel failed:", e.message));
+      console.log(`Cancelled superseded mandate ${notes.supersedes_subscription_id}`);
+    }
+  }
+
+  // ── Send notifications for payment failure / suspension ───────────────────
+  if (event === "subscription.halted" || event === "subscription.paused") {
+    // Fetch admin email
+    const { data: adminUser } = await db
+      .from("users")
+      .select("email, full_name")
+      .eq("hospital_id", hospitalId)
+      .in("role", ["super_admin", "hospital_admin"])
+      .limit(1)
+      .maybeSingle();
+
+    if (adminUser?.email) {
+      const notifEvent = event === "subscription.halted" ? "payment_failed" : "subscription_suspended";
+      try {
+        const { error: notifyErr } = await db.functions.invoke("send-subscription-notification", {
+          body: {
+            event:        notifEvent,
+            hospital_id:  hospitalId,
+            email:        adminUser.email,
+            full_name:    adminUser.full_name,
+          },
+        });
+        if (notifyErr) console.error("razorpay-subscription-webhook: send-subscription-notification failed:", notifyErr.message);
+      } catch (e) {
+        console.error("razorpay-subscription-webhook: send-subscription-notification failed:", e instanceof Error ? e.message : String(e));
+      }
+    }
+  }
+
+  console.log(`✓ ${event} → hospital ${hospitalId} → status: ${newStatus}`);
+
+  return new Response(JSON.stringify({ status: "processed", event, hospitalId, newStatus }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+
+  } catch (err) {
+    console.error("razorpay-subscription-webhook error:", err);
+    // Persist failure to DLQ for retry by webhook-dlq-processor
+    try {
+      const dlqClient = createClient(
+        Deno.env.get("SUPABASE_URL")!,
+        Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+      );
+      let parsedPayload: Record<string, unknown> = {};
+      try { parsedPayload = rawBody ? JSON.parse(rawBody) : {}; } catch { /* ignore */ }
+      await dlqClient.from("webhook_dlq").insert({
+        source: "razorpay_subscription",
+        event_type: (parsedPayload as any)?.event ?? "unknown",
+        payload: parsedPayload,
+        error_message: err instanceof Error ? err.message : String(err),
+      });
+    } catch (dlqErr) {
+      console.error("Failed to write to webhook_dlq:", dlqErr);
+    }
+    return new Response(JSON.stringify({ error: String(err) }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+});

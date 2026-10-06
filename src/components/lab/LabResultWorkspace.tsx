@@ -1,0 +1,2131 @@
+import React, { useState, useEffect, useCallback } from "react";
+import { supabase } from "@/integrations/supabase/client";
+import { useToast } from "@/hooks/use-toast";
+import { useHospitalContext } from "@/hooks/useHospitalContext";
+import { cn } from "@/lib/utils";
+import { hasTabAccess } from "@/lib/tabPermissions";
+import { Clock, Save, CheckCircle2, FileText, Printer, MessageSquare, AlertTriangle, Pencil } from "lucide-react";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { useWhatsAppNotification } from "@/hooks/useWhatsAppNotification";
+import { sendLabResultReady } from "@/lib/whatsapp-notifications";
+import { notifyOrderingDoctorLabResult, notifyOrderingDoctorMicrobiology } from "@/lib/resultNotifications";
+import { printDocument, printHeader } from "@/lib/printUtils";
+import { logRecordAccess } from "@/lib/ims";
+import { getLatestQcWarnings } from "@/lib/labQc";
+import { useCredentialGate } from "@/components/hr/useCredentialGate";
+import { evaluateAutoVerify } from "@/lib/labAutoVerify";
+import { checkDeterministicMixupIndicators } from "@/lib/labSampleIntegrity";
+import SampleMixupPanel from "./SampleMixupPanel";
+import { logNABHEvidence } from "@/lib/nabh-evidence";
+import { collectOrderSamples, receiveOrderSamples, startOrderProcessing } from "@/lib/labSamples";
+import PatientIdentityConfirmDialog from "./PatientIdentityConfirmDialog";
+import LabTrendPanel from "./LabTrendPanel";
+import LabAnomalyDetector from "./LabAnomalyDetector";
+import LabInterpretationPanel from "./LabInterpretationPanel";
+import ReflexTestPanel from "./ReflexTestPanel";
+import { checkIntrinsicResistanceConflicts, detectResistancePhenotype, type ResistancePhenotype } from "@/lib/labAST";
+import { draftLabInterpretiveComment } from "@/lib/labReportNarrative";
+import { flagResult, formatReferenceRange } from "@/lib/labReferenceRange";
+import { Dna, Sparkles } from "lucide-react";
+
+interface LabOrder {
+  id: string;
+  priority: string;
+  status: string;
+  order_date: string;
+  order_time: string;
+  clinical_notes: string | null;
+  patient_id: string;
+  ordered_by: string;
+  patients: { full_name: string; uhid: string; gender: string | null; dob: string | null; phone?: string | null; blood_group?: string | null } | null;
+  ordered_by_user: { full_name: string } | null;
+  lab_order_items: any[];
+}
+
+interface TestItem {
+  id: string;
+  test_id: string;
+  status: string;
+  result_value: string | null;
+  result_numeric: number | null;
+  result_unit: string | null;
+  result_flag: string | null;
+  reference_range: string | null;
+  sample_barcode: string | null;
+  sample_collected_at: string | null;
+  validated_at: string | null;
+  critical_acknowledged: boolean;
+  notes: string | null;
+  previous_value: string | null;
+  delta_flag: boolean | null;
+  verification_method: string;
+  autoverify_reason: string | null;
+  autoverified_at: string | null;
+  test_name: string;
+  test_code: string | null;
+  category: string;
+  unit: string | null;
+  normal_min: number | null;
+  normal_max: number | null;
+  critical_low: number | null;
+  critical_high: number | null;
+  // Sex-specific intervals. These columns have existed since 20260910000001 and the
+  // settings page has always offered them, but nothing read them until
+  // src/lib/labReferenceRange.ts — so a hospital that carefully entered male and
+  // female haemoglobin ranges got exactly the same flags as one that left them blank.
+  male_normal_min: number | null;
+  male_normal_max: number | null;
+  female_normal_min: number | null;
+  female_normal_max: number | null;
+  tat_minutes: number | null;
+  sample_type: string;
+  autoverify_eligible: boolean;
+}
+
+interface Props {
+  order: LabOrder;
+  onRefresh: () => void;
+}
+
+// Delta-check threshold: a numeric result swinging this many % from the patient's
+// previous validated value for the same test is flagged for the reviewer (Phase 8).
+const DELTA_CHECK_THRESHOLD_PCT = 50;
+
+// Antibiogram drug panel (Phase 15 adds Vancomycin + Cefoxitin — required to detect
+// VRE/MRSA phenotypes; without them phenotype detection would be hollow).
+const ANTIBIOGRAM_DRUGS = [
+  "Amoxicillin", "Ampicillin", "Ciprofloxacin", "Levofloxacin", "Cotrimoxazole",
+  "Nitrofurantoin", "Gentamicin", "Amikacin", "Ceftriaxone", "Cefuroxime",
+  "Piperacillin-Taz", "Meropenem", "Imipenem", "Azithromycin", "Doxycycline",
+  "Clindamycin", "Vancomycin", "Cefoxitin",
+];
+
+function getInitials(name: string) {
+  return name.split(" ").map(w => w[0]).join("").slice(0, 2).toUpperCase();
+}
+
+function getAge(dob: string | null): string {
+  if (!dob) return "";
+  return `${Math.floor((Date.now() - new Date(dob).getTime()) / (365.25 * 24 * 60 * 60 * 1000))}y`;
+}
+
+/**
+ * Flag a result against the patient's own reference interval.
+ *
+ * Delegates to the shared resolver so result entry, the printed report and
+ * investigationSync all judge a result the same way. Passing the patient's sex is
+ * the whole point: against a merged 12.0-17.5 g/dL haemoglobin band a male at
+ * 12.5 g/dL is anaemic and used to read Normal.
+ */
+function calcFlag(value: number, item: TestItem, gender: string | null): string | null {
+  // A qualitative test has no interval to judge against, so it gets no flag at all
+  // rather than a misleading "N".
+  if (item.normal_min == null && item.normal_max == null
+      && item.male_normal_min == null && item.female_normal_min == null) return null;
+  return flagResult(item, value, gender);
+}
+
+const FLAG_STYLES: Record<string, { bg: string; text: string; label: string; border?: string }> = {
+  N: { bg: "", text: "", label: "" },
+  H: { bg: "bg-amber-50", text: "text-amber-700", label: "↑ H" },
+  L: { bg: "bg-blue-50", text: "text-blue-700", label: "↓ L" },
+  CH: { bg: "bg-red-50", text: "text-red-700", label: "↑↑ CH", border: "border-l-[3px] border-l-destructive" },
+  CL: { bg: "bg-indigo-50", text: "text-indigo-700", label: "↓↓ CL", border: "border-l-[3px] border-l-indigo-500" },
+  A: { bg: "bg-purple-50", text: "text-purple-700", label: "A" },
+};
+
+const STATUS_PILLS: Record<string, { bg: string; text: string; label: string }> = {
+  ordered: { bg: "bg-muted", text: "text-muted-foreground", label: "Ordered" },
+  sample_collected: { bg: "bg-amber-100", text: "text-amber-700", label: "Collected" },
+  in_process: { bg: "bg-blue-100", text: "text-blue-700", label: "Processing" },
+  result_entered: { bg: "bg-blue-100", text: "text-blue-700", label: "Entered" },
+  pending_validation: { bg: "bg-teal-100", text: "text-teal-700", label: "⏳ Pending Sign-off" },
+  validated: { bg: "bg-emerald-100", text: "text-emerald-700", label: "✓ Validated" },
+  reported: { bg: "bg-emerald-200", text: "text-emerald-800", label: "✓ Reported" },
+};
+
+const LabResultWorkspace: React.FC<Props> = ({ order, onRefresh }) => {
+  const { toast } = useToast();
+  const { role, permissions } = useHospitalContext();
+  const { show: showWaNotif, card: waCard } = useWhatsAppNotification();
+  const [items, setItems] = useState<TestItem[]>([]);
+  const [localValues, setLocalValues] = useState<Record<string, string>>({});
+  const [labNotes, setLabNotes] = useState(order.clinical_notes || "");
+  // Antibiogram state (microbiology / culture tests)
+  const [antibiogramOrganism, setAntibiogramOrganism] = useState("");
+  const [antibiogramColonyCount, setAntibiogramColonyCount] = useState("");
+  const [antibiogramSpecimen, setAntibiogramSpecimen] = useState("urine");
+  const [antibiogramSensitivity, setAntibiogramSensitivity] = useState<Record<string, "S" | "I" | "R">>({});
+  const [antibiogramSaving, setAntibiogramSaving] = useState(false);
+  // Preliminary vs final culture report (Phase 6)
+  const [antibiogramReportStatus, setAntibiogramReportStatus] = useState<"preliminary" | "final">("preliminary");
+  // AI resistance phenotype detection (Phase 15) — advisory only, feeds stewardship alerts
+  const [phenotypes, setPhenotypes] = useState<ResistancePhenotype[] | null>(null);
+  const [phenotypeLoading, setPhenotypeLoading] = useState(false);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [samples, setSamples] = useState<any[]>([]);
+  const [history, setHistory] = useState<any[]>([]);
+  const [labHospitalId, setLabHospitalId] = useState<string>("");
+  const { guard, gateElement } = useCredentialGate(labHospitalId);
+  const [validating, setValidating] = useState(false);
+  const [autoRunAnomaly, setAutoRunAnomaly] = useState(false);
+  const [hospitalName, setHospitalName] = useState<string>("");
+  const [nablNumber, setNablNumber] = useState<string>("");
+  // Barcode state
+  const [orderBarcode, setOrderBarcode] = useState<string | null>((order as any).barcode || null);
+  // Dual-validation state
+  const [requiresDualValidation, setRequiresDualValidation] = useState(false);
+  const [validationNotes, setValidationNotes] = useState("");
+  // Critical notify gate: item id → confirmed
+  const [doctorNotifyConfirmed, setDoctorNotifyConfirmed] = useState<Record<string, boolean>>({});
+  // QC advisory: test names already warned about this session (avoid repeat toasts)
+  const qcWarnedTests = React.useRef<Set<string>>(new Set());
+  // QC release gate (Phase 11): tests whose latest QC run is in Westgard REJECT state.
+  const [qcRejectByTest, setQcRejectByTest] = useState<Record<string, string[]>>({});
+  const [qcOverride, setQcOverride] = useState<{ by: string | null; reason: string | null; at: string | null }>({ by: null, reason: null, at: null });
+  const [showQcOverride, setShowQcOverride] = useState(false);
+  const [qcOverrideReason, setQcOverrideReason] = useState("");
+  const [qcOverrideSaving, setQcOverrideSaving] = useState(false);
+  // Bedside two-identifier confirm before collection (Phase 11)
+  const [showCollectConfirm, setShowCollectConfirm] = useState(false);
+  // Sample mix-up acknowledgement (Phase 13)
+  const [mixupAck, setMixupAck] = useState<{ by: string | null; reason: string | null; at: string | null }>({ by: null, reason: null, at: null });
+  // Order's encounter/admission linkage (Phase 14) — needed so a reflex-test order gets billed correctly
+  const [orderLinkage, setOrderLinkage] = useState<{ encounter_id: string | null; admission_id: string | null }>({ encounter_id: null, admission_id: null });
+  // AI interpretive comment draft (Phase 16) — always editable, never auto-saved unedited
+  const [interpretiveComment, setInterpretiveComment] = useState("");
+  const [commentDrafting, setCommentDrafting] = useState(false);
+  const [commentSaving, setCommentSaving] = useState(false);
+
+  // Get current user id and hospital id
+  useEffect(() => {
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (!user) return;
+      supabase.from("users").select("id, hospital_id").eq("auth_user_id", user.id).limit(1).maybeSingle()
+        .then(async ({ data }) => {
+          if (!data) return;
+          setCurrentUserId(data.id);
+          setLabHospitalId(data.hospital_id);
+          const { data: hosp } = await (supabase as any).from("hospitals")
+            .select("name, nabl_accreditation_number")
+            .eq("id", data.hospital_id).maybeSingle();
+          if (hosp) { setHospitalName(hosp.name || ""); setNablNumber(hosp.nabl_accreditation_number || ""); }
+        });
+    });
+  }, []);
+
+  // Fetch items with test master details
+  const fetchItems = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("lab_order_items")
+      .select(`
+        id, test_id, status, result_value, result_numeric, result_unit,
+        result_flag, reference_range, sample_barcode, sample_collected_at,
+        validated_at, critical_acknowledged, notes, previous_value, delta_flag,
+        verification_method, autoverify_reason, autoverified_at,
+        lab_test_master!lab_order_items_test_id_fkey (
+          test_name, test_code, category, unit, normal_min, normal_max,
+          critical_low, critical_high, male_normal_min, male_normal_max,
+          female_normal_min, female_normal_max, tat_minutes, sample_type,
+          autoverify_eligible
+        )
+      `)
+      .eq("lab_order_id", order.id)
+      .order("created_at", { ascending: true });
+
+    if (error) { console.error("Fetch items error:", error); return; }
+
+    const mapped = (data || []).map((d: any) => ({
+      ...d,
+      test_name: d.lab_test_master?.test_name || "",
+      test_code: d.lab_test_master?.test_code || null,
+      category: d.lab_test_master?.category || "other",
+      unit: d.lab_test_master?.unit || d.result_unit,
+      normal_min: d.lab_test_master?.normal_min,
+      normal_max: d.lab_test_master?.normal_max,
+      critical_low: d.lab_test_master?.critical_low,
+      critical_high: d.lab_test_master?.critical_high,
+      male_normal_min: d.lab_test_master?.male_normal_min ?? null,
+      male_normal_max: d.lab_test_master?.male_normal_max ?? null,
+      female_normal_min: d.lab_test_master?.female_normal_min ?? null,
+      female_normal_max: d.lab_test_master?.female_normal_max ?? null,
+      tat_minutes: d.lab_test_master?.tat_minutes,
+      sample_type: d.lab_test_master?.sample_type || "blood",
+      autoverify_eligible: d.lab_test_master?.autoverify_eligible ?? false,
+    }));
+
+    // Sort by category then test_name
+    mapped.sort((a: TestItem, b: TestItem) => a.category.localeCompare(b.category) || a.test_name.localeCompare(b.test_name));
+    setItems(mapped);
+
+    // Init local values
+    const vals: Record<string, string> = {};
+    mapped.forEach((m: TestItem) => { if (m.result_value) vals[m.id] = m.result_value; });
+    setLocalValues(vals);
+  }, [order.id]);
+
+  // Fetch samples
+  const fetchSamples = useCallback(async () => {
+    const { data } = await supabase
+      .from("lab_samples")
+      .select("*")
+      .eq("lab_order_id", order.id);
+    setSamples(data || []);
+  }, [order.id]);
+
+  // Fetch history — lazy, only when History tab is first opened.
+  // Uses two targeted indexed queries instead of the old hospital-wide scan + nested await waterfall.
+  const fetchHistory = useCallback(async () => {
+    if (!order.patient_id) return;
+
+    // Step 1: get this patient's previous completed order IDs (fast indexed lookup)
+    const { data: patientOrders } = await supabase
+      .from("lab_orders")
+      .select("id, order_date")
+      .eq("patient_id", order.patient_id)
+      .neq("id", order.id)
+      .in("status", ["completed"])
+      .order("order_date", { ascending: false })
+      .limit(20);
+
+    if (!patientOrders || patientOrders.length === 0) { setHistory([]); return; }
+
+    // Step 2: fetch items only for those order IDs (targeted, no hospital-wide scan)
+    const orderIds = patientOrders.map((o: any) => o.id);
+    const { data } = await supabase
+      .from("lab_order_items")
+      .select(`
+        result_numeric, result_flag, result_value, result_unit,
+        lab_order_id,
+        lab_test_master!lab_order_items_test_id_fkey (test_name, test_code),
+        lab_orders!lab_order_items_lab_order_id_fkey (order_date)
+      `)
+      .in("lab_order_id", orderIds)
+      .in("status", ["validated", "reported"])
+      .not("result_value", "is", null)
+      .order("created_at", { ascending: false })
+      .limit(100);
+
+    setHistory(data || []);
+  }, [order.id, order.patient_id]);
+
+  // Only load items + samples on mount; history is lazy-loaded on tab open
+  useEffect(() => {
+    fetchItems();
+    fetchSamples();
+  }, [fetchItems, fetchSamples]);
+
+  // Check dual-validation config once items + hospitalId are loaded
+  useEffect(() => {
+    if (!labHospitalId || items.length === 0) return;
+    const categories = [...new Set(items.map(i => i.category).filter(Boolean))];
+    (async () => {
+      const { data } = await (supabase as any)
+        .from("lab_dual_validation_config")
+        .select("requires_dual_validation")
+        .eq("hospital_id", labHospitalId)
+        .in("test_category", categories);
+      setRequiresDualValidation(data?.some((c: any) => c.requires_dual_validation) ?? false);
+    })();
+  }, [labHospitalId, items]);
+
+  // QC release gate (Phase 11): evaluate each test's latest QC run; if any is in a
+  // Westgard REJECT state, release is blocked until a supervisor override is recorded.
+  // Also load any existing override off the order so a re-opened order stays unblocked.
+  useEffect(() => {
+    if (!labHospitalId || items.length === 0) return;
+    (async () => {
+      const testNames = [...new Set(items.map(i => i.test_name).filter(Boolean))];
+      const results = await Promise.all(testNames.map(async (name) => {
+        const warnings = await getLatestQcWarnings(labHospitalId, name);
+        const rejects = warnings.filter(w => w.severity === "reject").map(w => `${w.rule}: ${w.message}`);
+        return [name, rejects] as const;
+      }));
+      const map: Record<string, string[]> = {};
+      for (const [name, rejects] of results) if (rejects.length) map[name] = rejects;
+      setQcRejectByTest(map);
+
+      const { data: ord } = await (supabase as any)
+        .from("lab_orders")
+        .select("qc_override_by, qc_override_reason, qc_override_at, mixup_acknowledged_by, mixup_ack_reason, mixup_acknowledged_at")
+        .eq("id", order.id).maybeSingle();
+      if (ord) {
+        setQcOverride({ by: ord.qc_override_by, reason: ord.qc_override_reason, at: ord.qc_override_at });
+        setMixupAck({ by: ord.mixup_acknowledged_by, reason: ord.mixup_ack_reason, at: ord.mixup_acknowledged_at });
+      }
+    })();
+  }, [labHospitalId, items, order.id]);
+
+  // Sample mix-up gate (Phase 13): deterministic indicators only (see labSampleIntegrity.ts).
+  const mixupIndicators = React.useMemo(
+    () => checkDeterministicMixupIndicators({
+      patientGender: order.patients?.gender ?? null,
+      patientRecordedBloodGroup: order.patients?.blood_group ?? null,
+      items,
+    }),
+    [order.patients, items]
+  );
+  const hasHighMixupRisk = mixupIndicators.some(i => i.severity === "high");
+  const mixupBlocksRelease = hasHighMixupRisk && !mixupAck.at;
+
+  // Fetch encounter/admission linkage + interpretive comment once (Phase 14 / 16)
+  useEffect(() => {
+    (supabase as any).from("lab_orders").select("encounter_id, admission_id, interpretive_comment").eq("id", order.id).maybeSingle()
+      .then(({ data }: any) => {
+        if (data) {
+          setOrderLinkage({ encounter_id: data.encounter_id, admission_id: data.admission_id });
+          setInterpretiveComment(data.interpretive_comment || "");
+        }
+      });
+  }, [order.id]);
+
+  const draftInterpretiveComment = async () => {
+    if (!labHospitalId) return;
+    setCommentDrafting(true);
+    const draft = await draftLabInterpretiveComment({
+      hospitalId: labHospitalId,
+      patientId: order.patient_id,
+      results: items.map(i => ({ test_name: i.test_name, result_value: i.result_value, result_flag: i.result_flag, unit: i.unit || i.result_unit, reference_range: i.reference_range })),
+    });
+    setCommentDrafting(false);
+    if (draft) setInterpretiveComment(draft);
+    else toast({ title: "Could not draft a comment", description: "AI unavailable — enter the comment manually.", variant: "destructive" });
+  };
+
+  const saveInterpretiveComment = async () => {
+    setCommentSaving(true);
+    await (supabase as any).from("lab_orders").update({ interpretive_comment: interpretiveComment || null }).eq("id", order.id);
+    setCommentSaving(false);
+    toast({ title: "Interpretive comment saved" });
+  };
+
+  const hasQcReject = Object.keys(qcRejectByTest).length > 0;
+  const qcOverridden = !!qcOverride.at;
+  // Release is blocked while QC is rejected and not overridden.
+  const qcBlocksRelease = hasQcReject && !qcOverridden;
+  // Override is a supervisor decision (pathologist / doctor / admin), not a bench tech's.
+  const canOverrideQc = ["doctor", "pathologist", "super_admin", "hospital_admin"].includes(role || "");
+
+  const submitQcOverride = async () => {
+    if (!currentUserId || !qcOverrideReason.trim()) return;
+    setQcOverrideSaving(true);
+    const at = new Date().toISOString();
+    await (supabase as any).from("lab_orders").update({
+      qc_override_by: currentUserId,
+      qc_override_reason: qcOverrideReason.trim(),
+      qc_override_at: at,
+    }).eq("id", order.id);
+    setQcOverride({ by: currentUserId, reason: qcOverrideReason.trim(), at });
+    await logNABHEvidence(
+      labHospitalId,
+      "QPS.2",
+      `QC reject overridden for order ${orderBarcode || order.id}: ${qcOverrideReason.trim()} (tests: ${Object.keys(qcRejectByTest).join(", ")})`,
+      "compliant"
+    );
+    setQcOverrideSaving(false);
+    setShowQcOverride(false);
+    setQcOverrideReason("");
+    toast({ title: "QC override recorded", description: "Release is now permitted for this order." });
+  };
+
+  // TAT calculation — freeze at validated_at when the order is completed
+  const isCompleted = order.status === "completed";
+  const completedAt = isCompleted
+    ? items.reduce<string | null>((latest, i) => {
+        if (!i.validated_at) return latest;
+        return !latest || i.validated_at > latest ? i.validated_at : latest;
+      }, null)
+    : null;
+  const tatEndMs = completedAt ? new Date(completedAt).getTime() : Date.now();
+  const elapsed = (tatEndMs - new Date(order.order_time).getTime()) / 60000;
+  const avgTat = items.length > 0
+    ? items.reduce((s, i) => s + (i.tat_minutes || 60), 0) / items.length
+    : 60;
+  const tatRatio = elapsed / avgTat;
+  const tatLabel = elapsed >= 60 ? `${Math.floor(elapsed / 60)}h ${Math.floor(elapsed % 60)}m` : `${Math.floor(elapsed)}m`;
+  const tatBg = isCompleted
+    ? "bg-emerald-50 text-emerald-800"
+    : tatRatio > 1 ? "bg-red-50 text-red-800"
+    : tatRatio > 0.75 ? "bg-amber-50 text-amber-800"
+    : "bg-emerald-50 text-emerald-800";
+
+  const patient = order.patients;
+
+  // Save a single result
+  const saveResult = async (item: TestItem, rawValue: string) => {
+    if (!currentUserId) return;
+    // A test configured with ONLY sex-specific bounds is still numeric — reading just
+    // normal_min/max here would have shown it the qualitative dropdown instead.
+    const isNumeric = item.normal_min != null || item.normal_max != null
+      || item.male_normal_min != null || item.male_normal_max != null
+      || item.female_normal_min != null || item.female_normal_max != null;
+    const patientGender = order.patients?.gender ?? null;
+    const numVal = isNumeric ? parseFloat(rawValue) : null;
+    const flag = isNumeric && numVal != null && !isNaN(numVal) ? calcFlag(numVal, item, patientGender) : (rawValue && !isNumeric ? "A" : null);
+    // For text results: Negative/Not detected = normal
+    if (!isNumeric && rawValue) {
+      const lower = rawValue.toLowerCase();
+      if (lower === "negative" || lower === "not detected") {
+        // Keep flag null (normal text)
+      }
+    }
+    const finalFlag = isNumeric && numVal != null && !isNaN(numVal) ? calcFlag(numVal, item, patientGender)
+      : (!isNumeric && rawValue && ["positive", "detected"].includes(rawValue.toLowerCase())) ? "A"
+      : null;
+
+    // Delta check (Phase 8): compare against this patient's most recent prior validated
+    // numeric result for the same test. A >50% swing is flagged for the reviewer.
+    let previousValue: string | null = null;
+    // `lab_order_items.delta_flag` is boolean (20260322152823) — was written as the string
+    // "delta" here, which Postgres rejects outright (22P02), aborting the entire `.update()`
+    // below and silently discarding the result being entered along with it. Found live: any
+    // result >=50% off the patient's own prior value for the same test never saved at all.
+    let deltaFlag = false;
+    if (numVal != null && !isNaN(numVal)) {
+      const { data: prev } = await (supabase as any)
+        .from("lab_order_items")
+        .select("result_numeric, lab_orders!inner(patient_id, order_date)")
+        .eq("test_id", item.test_id)
+        .eq("lab_orders.patient_id", order.patient_id)
+        .neq("lab_order_id", order.id)
+        .in("status", ["reported", "validated"])
+        .not("result_numeric", "is", null)
+        .order("result_entered_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (prev?.result_numeric != null) {
+        const prevNum = Number(prev.result_numeric);
+        previousValue = String(prevNum);
+        if (prevNum !== 0) {
+          const pctChange = Math.abs((numVal - prevNum) / prevNum) * 100;
+          if (pctChange >= DELTA_CHECK_THRESHOLD_PCT) deltaFlag = true;
+        }
+      }
+    }
+
+    // Auto-verification (Phase 12): a deterministic rule engine, evaluated with the
+    // flag/delta we just computed — not the possibly-stale values on `item`. Only
+    // fully-normal, non-delta, QC-clean results on an opt-in test qualify; everything
+    // else is left as 'result_entered' for a human to review, exactly as before.
+    const autoDecision = evaluateAutoVerify(
+      // A pending, unacknowledged sample mix-up indicator (Phase 13) blocks auto-verify
+      // the same way it blocks manual release — treat the test as not-eligible for this save.
+      { test_name: item.test_name, autoverify_eligible: item.autoverify_eligible && !mixupBlocksRelease, result_value: rawValue || null, result_flag: finalFlag, delta_flag: deltaFlag },
+      { requiresDualValidation, qcRejectTestNames: new Set(Object.keys(qcRejectByTest)) }
+    );
+    const now = new Date().toISOString();
+
+    const { error } = await supabase
+      .from("lab_order_items")
+      .update({
+        result_value: rawValue || null,
+        result_numeric: numVal != null && !isNaN(numVal) ? numVal : null,
+        result_flag: finalFlag,
+        result_unit: item.unit,
+        // Stored, not derived at print time — this is the interval that was in force
+        // when the result was released, and NABL expects the report to carry it. It
+        // must be the patient's own interval: printing the female range beside a male
+        // patient's haemoglobin is a report-content finding.
+        reference_range: (() => {
+          const r = formatReferenceRange(item, patientGender);
+          return r ? `${r} ${item.unit || ""}`.trim() : null;
+        })(),
+        result_entered_at: now,
+        result_entered_by: currentUserId,
+        status: autoDecision.eligible ? "reported" : "result_entered",
+        previous_value: previousValue,
+        delta_flag: deltaFlag,
+        ...(autoDecision.eligible
+          ? { verification_method: "auto", autoverify_reason: autoDecision.reason, autoverified_at: now, validated_at: now }
+          : {}),
+      } as any)
+      .eq("id", item.id);
+
+    if (error) { console.error("Save result error:", error); return; }
+
+    if (autoDecision.eligible) {
+      toast({ title: `🤖 ${item.test_name} auto-verified`, description: autoDecision.reason });
+      if (labHospitalId) {
+        logNABHEvidence(labHospitalId, "COP.6", `Auto-verified ${item.test_name} for order ${orderBarcode || order.id}: ${autoDecision.reason}`, "compliant");
+      }
+    }
+
+    // Large delta → advisory alert + toast (Phase 8)
+    if (deltaFlag && previousValue) {
+      toast({
+        title: `Δ Delta check: ${item.test_name}`,
+        description: `Changed from ${previousValue} to ${rawValue} ${item.unit || ""} (>${DELTA_CHECK_THRESHOLD_PCT}%). Verify before releasing.`,
+      });
+      if (labHospitalId) {
+        // Deduped on the item itself — re-saving/editing the same result must not raise a
+        // second delta alert for it (KNOWN-BUG-002).
+        (supabase as any).from("clinical_alerts").upsert({
+          hospital_id: labHospitalId,
+          patient_id: order.patient_id,
+          alert_type: "lab_trend",
+          severity: "medium",
+          alert_message: `Lab delta on ${item.test_name}: ${previousValue} → ${rawValue} ${item.unit || ""} for ${patient?.full_name} (${patient?.uhid})`,
+          lab_order_item_id: item.id,
+          dedupe_key: item.id,
+        }, { onConflict: "hospital_id,alert_type,dedupe_key", ignoreDuplicates: true }).then(() => {}, () => {});
+      }
+    }
+
+    // QC advisory (Phase 2): if the latest QC run for this test violates a Westgard
+    // rule, surface a non-blocking warning. Never blocks or delays saving — the result
+    // is already persisted above; this is fire-and-forget.
+    if (labHospitalId && item.test_name && !qcWarnedTests.current.has(item.test_name)) {
+      qcWarnedTests.current.add(item.test_name);
+      getLatestQcWarnings(labHospitalId, item.test_name).then((warnings) => {
+        const worst = warnings.find(w => w.severity === "reject") || warnings[0];
+        if (worst) {
+          toast({
+            title: `⚠️ QC ${worst.severity === "reject" ? "failure" : "warning"} on ${item.test_name} (${worst.rule})`,
+            description: `${worst.message}. Verify the run before releasing this result.`,
+          });
+        }
+      }).then(() => {}, () => {});
+    }
+
+    // Critical alert
+    if (finalFlag === "CH" || finalFlag === "CL") {
+      const { data: orderData } = await supabase.from("lab_orders").select("hospital_id").eq("id", order.id).maybeSingle();
+      if (orderData) {
+        // Deduped on the item itself — same rationale as the delta-check alert above.
+        // `dedupe_key` isn't in the generated types yet (added by this session's migration,
+        // types.ts regenerates from a live push) — cast like every other clinical_alerts
+        // write in this file already does for the same reason.
+        await (supabase as any).from("clinical_alerts").upsert({
+          hospital_id: orderData.hospital_id,
+          alert_type: "critical_lab_value",
+          severity: "critical",
+          alert_message: `Critical ${item.test_name}: ${rawValue} ${item.unit || ""} — Patient: ${patient?.full_name} (${patient?.uhid})`,
+          patient_id: order.patient_id,
+          lab_order_item_id: item.id,
+          dedupe_key: item.id,
+        }, { onConflict: "hospital_id,alert_type,dedupe_key", ignoreDuplicates: true });
+        toast({
+          title: `🚨 Critical: ${item.test_name} = ${rawValue}`,
+          description: `Patient: ${patient?.full_name}`,
+          variant: "destructive",
+        });
+      }
+    }
+
+    fetchItems();
+    onRefresh();
+  };
+
+  const handleAcknowledgeCritical = async (itemId: string) => {
+    if (!currentUserId) return;
+    await supabase.from("lab_order_items").update({
+      critical_acknowledged: true,
+      critical_acknowledged_by: currentUserId,
+      critical_acknowledged_at: new Date().toISOString(),
+    }).eq("id", itemId);
+
+    // Also update clinical_alerts
+    await supabase.from("clinical_alerts").update({
+      is_acknowledged: true,
+      acknowledged_by: currentUserId,
+      acknowledged_at: new Date().toISOString(),
+    }).eq("lab_order_item_id", itemId);
+
+    fetchItems();
+    toast({ title: "✓ Critical value acknowledged" });
+  };
+
+  // Sample lifecycle transitions live in src/lib/labSamples.ts (Phase 5) — shared with
+  // the Collection workstation so both drive identical status updates.
+  const handleMarkCollected = async () => {
+    if (!currentUserId) return;
+    const newBarcode = await collectOrderSamples({
+      orderId: order.id,
+      userId: currentUserId,
+      uhid: order.patients?.uhid,
+    });
+    setOrderBarcode(newBarcode);
+    fetchItems(); fetchSamples(); onRefresh();
+    toast({ title: "📦 Sample collected" });
+  };
+
+  const handleMarkReceived = async () => {
+    if (!currentUserId) return;
+    await receiveOrderSamples({ orderId: order.id, userId: currentUserId });
+    fetchSamples(); onRefresh();
+    toast({ title: "📥 Sample received at lab" });
+  };
+
+  const handleMarkProcessing = async () => {
+    if (!currentUserId) return;
+    await startOrderProcessing({ orderId: order.id, userId: currentUserId });
+    fetchItems(); fetchSamples(); onRefresh();
+    toast({ title: "🔬 Sample processing started" });
+  };
+
+  const handleSubmitForValidation = async () => {
+    if (!currentUserId || validating) return;
+    setValidating(true);
+    const unacknowledged = items.filter(i => (i.result_flag === "CH" || i.result_flag === "CL") && !i.critical_acknowledged);
+    if (unacknowledged.length > 0) {
+      toast({ title: "Acknowledge all critical values before submitting", variant: "destructive" });
+      setValidating(false);
+      return;
+    }
+    await supabase.from("lab_orders").update({ status: "pending_validation" } as any).eq("id", order.id);
+    setValidating(false);
+    onRefresh();
+    toast({ title: "⏳ Submitted for pathologist sign-off" });
+  };
+
+  // Shared post-release tail: notify the ordering doctor + OPD auto-billing + WhatsApp
+  // "result ready" to the patient.
+  // Used by both release paths (single-step handleValidateAll and the dual-validation
+  // handlePathologistValidate) so pathologist sign-off no longer skips billing/notification.
+  const finalizeReleasedOrder = async () => {
+    // Tell the doctor who ordered this. Until now the release notified the PATIENT over
+    // WhatsApp and nobody else — the clinician had to come to the Lab module and look. This
+    // is fire-and-forget: a failed notification must never undo a completed release.
+    notifyOrderingDoctorLabResult(order.id, currentUserId).then(() => {}, () => {});
+
+    // Auto-bill OPD lab charges (skip IPD — handled by discharge auto-pull)
+    const { data: fullOrder } = await supabase.from("lab_orders")
+      .select("hospital_id, admission_id, encounter_id, patient_id, ordered_by")
+      .eq("id", order.id).maybeSingle();
+
+    if (fullOrder && !fullOrder.admission_id) {
+      try {
+        const { autoBillOpdInvestigation, getInvestigationRate } = await import("@/lib/investigationBilling");
+        const lineItems: { description: string; itemType: "lab_test"; unitRate: number; gstPercent: number; gstAmount: number }[] = [];
+
+        let usedDefaultRate = false;
+        for (const item of items) {
+          if (!item.test_name) continue;
+          const { rate, gstPercent, isDefaultRate } = await getInvestigationRate(fullOrder.hospital_id, item.test_name, "lab");
+          const gstAmount = rate * gstPercent / 100;
+          if (isDefaultRate) usedDefaultRate = true;
+          lineItems.push({
+            // Visible marker (Phase 4): no configured fee found anywhere — billed at the
+            // hard default so the biller knows to verify instead of silently trusting it.
+            description: isDefaultRate ? `${item.test_name} (default rate — verify)` : item.test_name,
+            itemType: "lab_test",
+            unitRate: rate,
+            gstPercent,
+            gstAmount,
+          });
+        }
+        if (usedDefaultRate) {
+          toast({
+            title: "⚠️ Some tests billed at the default rate",
+            description: "No fee is configured for one or more tests — the bill line is marked '(default rate — verify)'. Set fees in Settings → Lab Tests.",
+          });
+        }
+
+        const result = await autoBillOpdInvestigation({
+          hospitalId: fullOrder.hospital_id,
+          patientId: fullOrder.patient_id,
+          encounterId: fullOrder.encounter_id,
+          admissionId: null,
+          orderedBy: fullOrder.ordered_by,
+          lineItems,
+          billPrefix: "LAB",
+          sourceModule: "lab",
+          sourceId: order.id,
+        });
+
+        if (result) {
+          toast({ title: `Lab charges billed: ₹${result.total.toLocaleString("en-IN")}` });
+        }
+      } catch (e) {
+        console.error("Lab auto-billing error (non-blocking):", e);
+      }
+    }
+
+    // Trigger WhatsApp notification
+    if (patient?.phone && fullOrder) {
+      try {
+        const { data: hospital } = await supabase.from("hospitals").select("name").eq("id", fullOrder.hospital_id).maybeSingle();
+        const abnormalCount = items.filter(i => i.result_flag && !["N", null].includes(i.result_flag)).length;
+        const result = await sendLabResultReady({
+          hospitalId: fullOrder.hospital_id,
+          hospitalName: hospital?.name || "Hospital",
+          patientId: order.patient_id,
+          patientName: patient.full_name,
+          phone: patient.phone,
+          testCount: items.length,
+          abnormalCount,
+          orderDate: order.order_date,
+        });
+        showWaNotif(patient.full_name, "lab_result_ready", result.waUrl);
+      } catch (e) {
+        console.error("Lab WhatsApp notification error (non-blocking):", e);
+      }
+    }
+  };
+
+  // Auto-complete the order once every item has reached 'reported' via auto-verification
+  // (Phase 12). This mirrors handleValidateAll's completion tail but fires without a
+  // click. It can only be reached through the new auto-verify path: the pre-existing
+  // manual release paths (handleValidateAll / handlePathologistValidate) set every
+  // item's status AND the order's status to 'completed' in the same call, so an order
+  // never sits with all-'reported' items while still not 'completed' unless auto-verify
+  // put it there. Guarded by a ref so it fires at most once per order.
+  const autoCompletedRef = React.useRef(false);
+
+  // The body is held in a ref that is refreshed every render, so the effect below
+  // can trigger it while depending only on what should actually re-trigger the
+  // check. This effect writes to the DB and releases a report — re-running it
+  // because `onRefresh` or `finalizeReleasedOrder` got a new identity would mean
+  // a duplicate release.
+  const autoCompleteRunRef = React.useRef<() => Promise<void>>();
+  autoCompleteRunRef.current = async () => {
+    await supabase.from("lab_orders").update({ status: "completed" }).eq("id", order.id);
+    await finalizeReleasedOrder();
+    if (labHospitalId) {
+      logNABHEvidence(labHospitalId, "COP.6", `Order ${orderBarcode || order.id} auto-completed — all items auto-verified`, "compliant");
+    }
+    setAutoRunAnomaly(true);
+    onRefresh();
+    toast({ title: "🤖 Order auto-verified & released", description: "All results were within range and passed auto-verification rules." });
+  };
+
+  useEffect(() => {
+    if (autoCompletedRef.current) return;
+    if (order.status === "completed" || items.length === 0) return;
+    if (!items.every(i => i.status === "reported" && i.verification_method === "auto")) return;
+    autoCompletedRef.current = true;
+    void autoCompleteRunRef.current?.();
+  }, [items, order.status]);
+
+  const handlePathologistValidate = async () => {
+    if (!currentUserId || validating) return;
+    if (qcBlocksRelease) {
+      toast({ title: "QC is in reject state — supervisor override required before release", variant: "destructive" });
+      return;
+    }
+    if (mixupBlocksRelease) {
+      toast({ title: "Sample mix-up indicator unacknowledged — review before release", variant: "destructive" });
+      return;
+    }
+    setValidating(true);
+    const now = new Date().toISOString();
+    await supabase.from("lab_order_items").update({
+      status: "reported",
+      validated_at: now,
+      validated_by: currentUserId,
+    }).eq("lab_order_id", order.id).neq("status", "cancelled");
+
+    await supabase.from("lab_orders").update({
+      status: "completed",
+      validated_by: currentUserId,
+      validated_at: now,
+      validation_notes: validationNotes || null,
+    } as any).eq("id", order.id);
+
+    // Fire-and-forget ABHA care context linking (non-blocking)
+    if (labHospitalId && order.patient_id) {
+      supabase.functions.invoke("abdm-auto-link-care-context", {
+        body: {
+          hospital_id: labHospitalId,
+          patient_id: order.patient_id,
+          event_type: "lab_reported",
+          source_id: order.id,
+        },
+      }).then(() => {}, () => {});
+    }
+
+    await finalizeReleasedOrder();
+
+    // KNOWN-BUG-213: this dual-validation (pathologist sign-off) path never logged NABH
+    // evidence at all — only the auto-verify path (below) did. Same criterion code the
+    // auto-verify path already uses, so a report on this admission's evidence trail does not
+    // depend on which release path happened to run.
+    if (labHospitalId) {
+      logNABHEvidence(labHospitalId, "COP.6", `Order ${orderBarcode || order.id} validated and signed by pathologist ${currentUserId}`, "compliant");
+    }
+
+    setValidating(false);
+    setAutoRunAnomaly(true);
+    fetchItems();
+    onRefresh();
+    toast({ title: "✓ Report validated & signed by pathologist" });
+  };
+
+  const printBarcodeLabel = async () => {
+    if (!orderBarcode) return;
+    const p = order.patients;
+    const testNames = items.map(i => i.test_name).join(", ");
+    const dateStr = new Date().toLocaleString("en-IN", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+    const html = `<!DOCTYPE html>
+<html><head><title>Barcode Label</title>
+<script src="https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js"></script>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:Arial,sans-serif;width:50mm}
+  .label{width:50mm;min-height:25mm;padding:2mm;display:flex;flex-direction:column;align-items:center;border:.5px solid #000}
+  svg{width:46mm;height:14mm}
+  p{font-size:7px;text-align:center;line-height:1.3}
+  .name{font-size:9px;font-weight:bold}
+  @media print{@page{size:50mm 25mm;margin:0}body{width:50mm}}
+</style></head>
+<body>
+<div class="label">
+  <svg id="bc"></svg>
+  <p class="name">${p?.full_name || "Patient"}</p>
+  <p>${p?.uhid || ""} | ${dateStr}</p>
+  <p style="max-width:46mm;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">${testNames}</p>
+</div>
+<script>
+  JsBarcode("#bc","${orderBarcode}",{format:"CODE128",width:1.5,height:40,displayValue:true,fontSize:8,margin:2});
+  setTimeout(()=>{window.print();window.close();},400);
+</script>
+</body></html>`;
+    const win = window.open("", "_blank", "width=320,height=270,toolbar=0,menubar=0");
+    if (win) {
+      win.document.write(html);
+      win.document.close();
+      if (currentUserId) {
+        await supabase.from("lab_orders").update({
+          barcode_printed_at: new Date().toISOString(),
+          barcode_printed_by: currentUserId,
+        } as any).eq("id", order.id);
+      }
+    }
+  };
+
+  const releaseNow = async () => {
+    setValidating(true);
+    await supabase.from("lab_order_items").update({
+      status: "reported",
+      validated_at: new Date().toISOString(),
+      validated_by: currentUserId,
+    }).eq("lab_order_id", order.id).neq("status", "cancelled");
+
+    await supabase.from("lab_orders").update({ status: "completed" }).eq("id", order.id);
+
+    await finalizeReleasedOrder();
+
+    // KNOWN-BUG-213: the single-step release path never logged NABH evidence either — see the
+    // matching comment on handlePathologistValidate.
+    if (labHospitalId) {
+      logNABHEvidence(labHospitalId, "COP.6", `Order ${orderBarcode || order.id} validated and released${currentUserId ? ` by ${currentUserId}` : ""}`, "compliant");
+    }
+
+    setValidating(false);
+    setAutoRunAnomaly(true); // auto-trigger AI anomaly analysis after validation
+    fetchItems(); onRefresh();
+    toast({ title: "✓ Report released" });
+  };
+
+  const handleValidateAll = async () => {
+    if (!currentUserId || validating) return;
+    if (qcBlocksRelease) {
+      toast({ title: "QC is in reject state — supervisor override required before release", variant: "destructive" });
+      return;
+    }
+    if (mixupBlocksRelease) {
+      toast({ title: "Sample mix-up indicator unacknowledged — review before release", variant: "destructive" });
+      return;
+    }
+    const unacknowledgedCritical = items.filter(i => (i.result_flag === "CH" || i.result_flag === "CL") && !i.critical_acknowledged);
+    if (unacknowledgedCritical.length > 0) {
+      toast({ title: "Acknowledge critical values before releasing", variant: "destructive" });
+      return;
+    }
+    // License-validity gate on the validating clinician before release
+    guard({ clinicianId: currentUserId, module: "lab", action: "validate_result", recordId: order.id }, releaseNow);
+  };
+
+  const allResultsEntered = items.length > 0 && items.every(i => i.result_value || localValues[i.id]);
+  const hasUnacknowledgedCritical = items.some(i => (i.result_flag === "CH" || i.result_flag === "CL") && !i.critical_acknowledged);
+
+  // Microbiology / culture detection
+  const hasMicrobiology = items.some(i =>
+    i.category?.toLowerCase().includes("micro") ||
+    i.test_name?.toLowerCase().includes("culture") ||
+    i.test_name?.toLowerCase().includes("sensitivity")
+  );
+  const microItem = items.find(i =>
+    i.category?.toLowerCase().includes("micro") ||
+    i.test_name?.toLowerCase().includes("culture")
+  );
+
+  // Read through a ref so this stays keyed on the item's id: it seeds the editable
+  // antibiogram fields when a different micro item is opened, and must not
+  // overwrite the technician's in-progress entry every time `items` is refetched
+  // and `find` returns a new object.
+  const microItemRef = React.useRef(microItem);
+  React.useEffect(() => { microItemRef.current = microItem; });
+
+  // Load an existing antibiogram (Phase 6): prefer the structured lab_results row,
+  // fall back to the legacy lab_order_items.notes JSON for historical entries.
+  useEffect(() => {
+    const microItem = microItemRef.current;
+    if (!microItem) return;
+    (async () => {
+      const { data: lr } = await (supabase as any)
+        .from("lab_results")
+        .select("organism_identified, colony_count, specimen_type, sensitivity_json, report_status")
+        .eq("order_item_id", microItem.id)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (lr) {
+        setAntibiogramOrganism(lr.organism_identified || "");
+        setAntibiogramColonyCount(lr.colony_count || "");
+        if (lr.specimen_type) setAntibiogramSpecimen(lr.specimen_type);
+        setAntibiogramSensitivity((lr.sensitivity_json as any) || {});
+        setAntibiogramReportStatus(lr.report_status === "final" ? "final" : "preliminary");
+        return;
+      }
+      // Fallback: parse legacy notes JSON
+      if (microItem.notes) {
+        try {
+          const parsed = JSON.parse(microItem.notes);
+          setAntibiogramOrganism(parsed.organism || "");
+          setAntibiogramColonyCount(parsed.colony_count || "");
+          if (parsed.specimen_type) setAntibiogramSpecimen(parsed.specimen_type);
+          setAntibiogramSensitivity(parsed.sensitivity || {});
+        } catch { /* not JSON — ignore */ }
+      }
+    })();
+  }, [microItem?.id]);
+
+  // Deterministic intrinsic-resistance conflicts (Phase 15) — recomputed on every
+  // organism/sensitivity edit; these are the only AST findings shown as a hard warning.
+  const intrinsicConflicts = React.useMemo(
+    () => checkIntrinsicResistanceConflicts(antibiogramOrganism, antibiogramSensitivity),
+    [antibiogramOrganism, antibiogramSensitivity]
+  );
+
+  const runPhenotypeDetection = async () => {
+    if (!microItem || !labHospitalId) return;
+    setPhenotypeLoading(true);
+    const result = await detectResistancePhenotype({
+      hospitalId: labHospitalId,
+      patientId: order.patient_id,
+      organism: antibiogramOrganism,
+      specimenType: antibiogramSpecimen,
+      sensitivity: antibiogramSensitivity,
+    });
+    setPhenotypes(result);
+    setPhenotypeLoading(false);
+
+    for (const p of result) {
+      if (!p.stewardship_alert) continue;
+      // Deduped per (item, phenotype) — the re-clickable "Detect phenotype" button must not
+      // re-raise the same phenotype alert twice, but one item can legitimately carry more than
+      // one distinct resistant-phenotype finding, so the phenotype name is part of the key.
+      await (supabase as any).from("clinical_alerts").upsert({
+        hospital_id: labHospitalId,
+        patient_id: order.patient_id,
+        alert_type: "antibiotic_stewardship",
+        severity: p.confidence === "high" ? "critical" : "high",
+        alert_message: `Possible ${p.phenotype} (${p.confidence} confidence) — ${antibiogramOrganism} in ${patient?.full_name} (${patient?.uhid}): ${p.explanation}`,
+        lab_order_item_id: microItem.id,
+        dedupe_key: `${microItem.id}:${p.phenotype}`,
+      }, { onConflict: "hospital_id,alert_type,dedupe_key", ignoreDuplicates: true });
+    }
+    if (result.some(p => p.stewardship_alert)) {
+      toast({ title: "⚠️ Possible resistant phenotype detected", description: "Antibiotic stewardship team notified." });
+    }
+  };
+
+  const saveAntibiogram = async () => {
+    if (!microItem) return;
+    setAntibiogramSaving(true);
+    const now = new Date().toISOString();
+    // Dual-write (Phase 6): the structured lab_results row is now canonical; the legacy
+    // notes JSON is kept in sync for one release so anything still reading it stays correct.
+    const payload = {
+      hospital_id: labHospitalId,
+      order_id: order.id,
+      order_item_id: microItem.id,
+      patient_id: order.patient_id,
+      organism_identified: antibiogramOrganism,
+      colony_count: antibiogramColonyCount,
+      specimen_type: antibiogramSpecimen,
+      sensitivity_json: antibiogramSensitivity,
+      report_status: antibiogramReportStatus,
+      is_abnormal: !!antibiogramOrganism,
+      ...(antibiogramReportStatus === "final"
+        ? { finalized_at: now, finalized_by: currentUserId, verified_by: currentUserId, verified_at: now }
+        : {}),
+    };
+    // Upsert-by-hand: one lab_results row per item
+    const { data: existing } = await (supabase as any)
+      .from("lab_results").select("id").eq("order_item_id", microItem.id).limit(1).maybeSingle();
+    let microResultId: string | null = existing?.id ?? null;
+    if (existing) {
+      await (supabase as any).from("lab_results").update(payload).eq("id", existing.id);
+    } else {
+      const { data: inserted } = await (supabase as any)
+        .from("lab_results").insert(payload).select("id").maybeSingle();
+      microResultId = inserted?.id ?? null;
+    }
+
+    // A culture finalises days after the rest of its order was released, so it needs its own
+    // notification — the doctor has usually long since read the scalar results. The helper
+    // also re-opens the parent order for review, otherwise the organism would never surface
+    // to a clinician who had already acknowledged that order.
+    if (antibiogramReportStatus === "final" && microResultId) {
+      notifyOrderingDoctorMicrobiology(microResultId, currentUserId).then(() => {}, () => {});
+    }
+
+    await (supabase as any).from("lab_order_items").update({
+      notes: JSON.stringify({
+        organism: antibiogramOrganism,
+        colony_count: antibiogramColonyCount,
+        specimen_type: antibiogramSpecimen,
+        sensitivity: antibiogramSensitivity,
+        report_status: antibiogramReportStatus,
+      }),
+    }).eq("id", microItem.id);
+    toast({ title: `Antibiogram saved (${antibiogramReportStatus})` });
+    setAntibiogramSaving(false);
+    fetchItems();
+  };
+
+  // Print a microbiology / culture report. Preliminary reports carry a watermark so a
+  // provisional organism/sensitivity can be issued before the final read (Phase 6).
+  const printAntibiogram = () => {
+    const p = order.patients;
+    const rows = Object.entries(antibiogramSensitivity)
+      .filter(([, v]) => v)
+      .map(([drug, v]) => {
+        const label = v === "S" ? "Sensitive" : v === "I" ? "Intermediate" : "Resistant";
+        const color = v === "S" ? "#166534" : v === "I" ? "#b45309" : "#b91c1c";
+        return `<tr><td style="padding:3px 8px">${drug}</td><td style="padding:3px 8px;font-weight:bold;color:${color}">${v} — ${label}</td></tr>`;
+      }).join("");
+    const isPrelim = antibiogramReportStatus === "preliminary";
+    const body = `
+      ${printHeader(hospitalName || "Lab Report", "Microbiology / Culture & Sensitivity", nablNumber ? `NABL: ${nablNumber}` : undefined)}
+      <div style="position:relative">
+        ${isPrelim ? `<div style="position:absolute;top:40%;left:50%;transform:translate(-50%,-50%) rotate(-30deg);font-size:64px;color:rgba(200,120,0,0.14);font-weight:900;letter-spacing:4px;pointer-events:none">PRELIMINARY</div>` : ""}
+        <h2 style="margin:0 0 4px">Microbiology / Culture & Sensitivity Report</h2>
+        <p style="margin:0 0 2px"><b>${p?.full_name || "Patient"}</b> · ${p?.uhid || ""} · ${getAge(p?.dob || null)} ${p?.gender || ""}</p>
+        <p style="margin:0 0 2px">Accession: ${orderBarcode || `LAB-${order.id.slice(0,8).toUpperCase()}`}</p>
+        <p style="margin:0 0 10px;font-weight:bold;color:${isPrelim ? "#b45309" : "#166534"}">Status: ${antibiogramReportStatus.toUpperCase()}</p>
+        <table style="border-collapse:collapse;margin-bottom:10px">
+          <tr><td style="padding:3px 8px;color:#555">Specimen</td><td style="padding:3px 8px;font-weight:bold">${antibiogramSpecimen.replace(/_/g," ")}</td></tr>
+          <tr><td style="padding:3px 8px;color:#555">Organism</td><td style="padding:3px 8px;font-weight:bold">${antibiogramOrganism || "—"}</td></tr>
+          <tr><td style="padding:3px 8px;color:#555">Colony Count</td><td style="padding:3px 8px;font-weight:bold">${antibiogramColonyCount || "—"}</td></tr>
+        </table>
+        <h3 style="margin:0 0 4px">Antibiotic Sensitivity</h3>
+        <table style="border-collapse:collapse;border:1px solid #ccc">${rows || `<tr><td style="padding:3px 8px">No sensitivity recorded</td></tr>`}</table>
+      </div>`;
+    logRecordAccess({ hospitalId: labHospitalId, recordType: "Lab_Report", recordId: order.id, patientId: order.patient_id, action: "print" });
+    printDocument(`Culture Report – ${p?.full_name || "Patient"}`, body);
+  };
+
+  // Cumulative report (Phase 8): all of this patient's validated numeric results for
+  // the tests in the current order, as a date-columns × test-rows grid — the classic
+  // trend view clinicians expect for serial labs (creatinine, Hb, electrolytes…).
+  const printCumulativeReport = async () => {
+    const p = order.patients;
+    const testIds = [...new Set(items.map(i => i.test_id).filter(Boolean))];
+    if (testIds.length === 0) { toast({ title: "No tests to trend", variant: "destructive" }); return; }
+
+    const { data } = await (supabase as any)
+      .from("lab_order_items")
+      .select(`
+        result_value, result_flag, result_unit, test_id,
+        lab_test_master:lab_test_master!lab_order_items_test_id_fkey(test_name, unit),
+        lab_orders!inner(patient_id, order_date)
+      `)
+      .eq("lab_orders.patient_id", order.patient_id)
+      .in("test_id", testIds as string[])
+      .in("status", ["reported", "validated"])
+      .not("result_value", "is", null)
+      .order("created_at", { ascending: true })
+      .limit(500);
+
+    if (!data?.length) { toast({ title: "No prior validated results to trend" }); return; }
+
+    // Build date set and test→date→value map
+    const dates: string[] = [...new Set(data.map((r: any) => r.lab_orders.order_date))].sort() as string[];
+    const byTest: Record<string, { unit: string; byDate: Record<string, { value: string; flag: string | null }> }> = {};
+    for (const r of data) {
+      const name = r.lab_test_master?.test_name || "—";
+      if (!byTest[name]) byTest[name] = { unit: r.result_unit || r.lab_test_master?.unit || "", byDate: {} };
+      byTest[name].byDate[r.lab_orders.order_date] = { value: r.result_value, flag: r.result_flag };
+    }
+
+    const dateHeaders = dates.map(d => `<th>${new Date(d).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}</th>`).join("");
+    const rows = Object.entries(byTest).map(([name, t]) => {
+      const cells = dates.map(d => {
+        const cell = t.byDate[d];
+        if (!cell) return `<td style="color:#cbd5e1">—</td>`;
+        const style = cell.flag === "CH" || cell.flag === "H" ? "color:#b45309;font-weight:700"
+          : cell.flag === "CL" || cell.flag === "L" ? "color:#1d4ed8;font-weight:700" : "";
+        return `<td style="${style}">${cell.value}</td>`;
+      }).join("");
+      return `<tr><td style="font-weight:600">${name}</td><td style="color:#6b7280">${t.unit}</td>${cells}</tr>`;
+    }).join("");
+
+    const body = `
+      ${printHeader(hospitalName || "Lab Report", "Cumulative Laboratory Report", nablNumber ? `NABL: ${nablNumber}` : undefined)}
+      <div style="font-size:12px;margin-bottom:10px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
+        <strong>${p?.full_name || "—"}</strong> · ${p?.uhid || ""} · ${getAge(p?.dob || null)} ${p?.gender || ""}
+      </div>
+      <table style="border-collapse:collapse;width:100%;font-size:12px">
+        <thead><tr style="background:#f1f5f9"><th style="text-align:left">Test</th><th style="text-align:left">Unit</th>${dateHeaders}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    logRecordAccess({ hospitalId: labHospitalId, recordType: "Lab_Report", recordId: order.id, patientId: order.patient_id, action: "print" });
+    printDocument(`Cumulative Report – ${p?.full_name || "Patient"}`, body);
+  };
+
+  // Group items by category
+  const grouped = items.reduce<Record<string, TestItem[]>>((acc, item) => {
+    const cat = item.category.toUpperCase();
+    if (!acc[cat]) acc[cat] = [];
+    acc[cat].push(item);
+    return acc;
+  }, {});
+
+  // History grouped by test
+  const historyByTest = history.reduce<Record<string, any[]>>((acc, h) => {
+    const name = h.lab_test_master?.test_name || "Unknown";
+    if (!acc[name]) acc[name] = [];
+    acc[name].push(h);
+    return acc;
+  }, {});
+
+  return (
+    <>
+    {waCard}
+    {gateElement}
+    <div className="flex-1 flex flex-col overflow-hidden bg-muted/30">
+      {/* Order Header */}
+      <div className="h-[68px] shrink-0 bg-card border-b border-border px-5 flex items-center gap-4">
+        {/* Patient info */}
+        <div className="flex items-center gap-3 min-w-0">
+          {patient && (
+            <>
+              <div className="w-9 h-9 rounded-full bg-[hsl(var(--sidebar-background))] text-white flex items-center justify-center text-xs font-bold shrink-0">
+                {getInitials(patient.full_name)}
+              </div>
+              <div className="min-w-0">
+                <p className="text-[15px] font-bold text-foreground truncate">{patient.full_name}</p>
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] bg-muted px-1.5 py-0.5 rounded text-muted-foreground">{patient.uhid}</span>
+                  <span className="text-[11px] text-muted-foreground">{getAge(patient.dob)} {patient.gender === "male" ? "M" : patient.gender === "female" ? "F" : ""}</span>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Order info */}
+        <div className="text-center min-w-0">
+          <p className="text-xs text-muted-foreground font-mono">LAB-{order.id.slice(0, 8).toUpperCase()}</p>
+          <div className="flex items-center gap-2 justify-center">
+            {order.priority !== "routine" && (
+              <span className={cn("text-[9px] font-bold px-1.5 py-0.5 rounded-full",
+                order.priority === "stat" ? "bg-destructive/10 text-destructive" : "bg-amber-100 text-amber-700"
+              )}>
+                {order.priority === "stat" ? "🔴 STAT" : "🟡 URGENT"}
+              </span>
+            )}
+            <span className="text-[11px] text-muted-foreground">
+              Dr. {(order.ordered_by_user as any)?.full_name || "Unknown"}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex-1" />
+
+        {/* TAT display — frozen after release */}
+        <div className={cn("rounded-lg px-3.5 py-2 shrink-0", tatBg, !isCompleted && tatRatio > 1 && "ring-1 ring-red-300 animate-pulse")}>
+          {isCompleted ? (
+            <>
+              <p className="text-sm font-bold flex items-center gap-1"><CheckCircle2 size={13} /> Released</p>
+              <p className="text-[10px] opacity-70">TAT: {tatLabel}</p>
+            </>
+          ) : (
+            <>
+              <p className="text-sm font-bold flex items-center gap-1"><Clock size={13} /> {tatLabel}</p>
+              <p className="text-[10px] opacity-70">Target: {Math.round(avgTat)}m</p>
+            </>
+          )}
+        </div>
+
+        {/* Status action */}
+        {order.status === "ordered" && (
+          <button onClick={() => setShowCollectConfirm(true)}
+            className="shrink-0 px-3.5 py-1.5 rounded-lg bg-amber-500 text-white text-[11px] font-semibold hover:bg-amber-600 active:scale-[0.97] transition-all">
+            📦 Mark Collected
+          </button>
+        )}
+        {/* Dual-validation: technician submits for sign-off */}
+        {allResultsEntered && requiresDualValidation && role !== "doctor" && role !== "pathologist" && role !== "radiologist" && order.status !== "completed" && order.status !== "pending_validation" && (
+          <button onClick={handleSubmitForValidation}
+            disabled={hasUnacknowledgedCritical || validating}
+            className="shrink-0 px-3.5 py-1.5 rounded-lg bg-teal-600 text-white text-[11px] font-semibold hover:bg-teal-700 active:scale-[0.97] transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+            {validating ? "⏳ Submitting..." : "⏳ Submit for Validation"}
+          </button>
+        )}
+        {/* Dual-validation: pathologist/doctor sees Validate & Sign.
+            super_admin/hospital_admin included — same admin-always-can-act convention as
+            DISCOUNT_OVERRIDE_ROLES / tabPermissions.ts's BYPASS_ROLES. Without them here, a
+            hospital whose only working account is an admin (common at go-live, before
+            individual pathologist logins are set up) could submit an order for sign-off and
+            then have no role able to complete it — every dual-validation order for a
+            microbiology/culture test would sit at "pending_validation" forever, with no
+            button on screen to move it. The technician submit step above is untouched, so
+            the two-step audit trail (submitted_at vs validated_at) is preserved even when an
+            admin performs both steps. */}
+        {requiresDualValidation && (role === "doctor" || role === "pathologist" || role === "radiologist" || role === "super_admin" || role === "hospital_admin") && order.status === "pending_validation" && (
+          <button onClick={handlePathologistValidate}
+            disabled={validating || qcBlocksRelease || mixupBlocksRelease}
+            title={qcBlocksRelease ? "QC in reject state — override required" : mixupBlocksRelease ? "Sample mix-up indicator unacknowledged" : ""}
+            className="shrink-0 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[11px] font-semibold hover:bg-emerald-700 active:scale-[0.97] transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+            {validating ? "⏳ Signing..." : "✓ Validate & Sign"}
+          </button>
+        )}
+        {/* Standard single-step validation */}
+        {allResultsEntered && !requiresDualValidation && order.status !== "completed" && order.status !== "pending_validation" && (
+          <button onClick={handleValidateAll}
+            disabled={hasUnacknowledgedCritical || validating || qcBlocksRelease || mixupBlocksRelease}
+            className="shrink-0 px-3.5 py-1.5 rounded-lg bg-emerald-600 text-white text-[11px] font-semibold hover:bg-emerald-700 active:scale-[0.97] transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+            title={qcBlocksRelease ? "QC in reject state — override required" : mixupBlocksRelease ? "Sample mix-up indicator unacknowledged" : hasUnacknowledgedCritical ? "Acknowledge critical values first" : ""}>
+            {validating ? "⏳ Validating..." : "✓ Validate & Release"}
+          </button>
+        )}
+      </div>
+
+      {/* QC release gate banner (Phase 11) */}
+      {hasQcReject && (
+        <div className={cn("px-4 py-2.5 border-b flex-shrink-0", qcOverridden ? "bg-amber-50 border-amber-200" : "bg-red-50 border-red-300")}>
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={16} className={cn("mt-0.5 shrink-0", qcOverridden ? "text-amber-600" : "text-red-600")} />
+            <div className="flex-1 min-w-0">
+              {qcOverridden ? (
+                <p className="text-[12px] text-amber-800">
+                  <span className="font-bold">QC override in effect.</span> Release permitted despite a QC reject.
+                  {qcOverride.reason ? ` Reason: ${qcOverride.reason}` : ""}
+                </p>
+              ) : (
+                <>
+                  <p className="text-[12px] font-bold text-red-800">Result release blocked — QC is in a reject state</p>
+                  <ul className="mt-0.5 space-y-0.5">
+                    {Object.entries(qcRejectByTest).map(([test, rules]) => (
+                      <li key={test} className="text-[11px] text-red-700">
+                        <span className="font-semibold">{test}</span>: {rules.join("; ")}
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="text-[11px] text-red-600 mt-0.5">
+                    Repeat QC and re-run the analyte, or record a supervisor override to release.
+                  </p>
+                  {canOverrideQc ? (
+                    <button
+                      onClick={() => setShowQcOverride(true)}
+                      className="mt-1.5 text-[11px] px-3 py-1.5 rounded-md bg-red-600 text-white font-semibold hover:bg-red-700 active:scale-95 transition-all"
+                    >
+                      Supervisor Override…
+                    </button>
+                  ) : (
+                    <p className="text-[11px] text-red-500 mt-1">A pathologist/supervisor must record the override.</p>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sample mix-up detection (Phase 13) */}
+      {labHospitalId && items.length > 0 && (
+        <SampleMixupPanel
+          orderId={order.id}
+          hospitalId={labHospitalId}
+          patientId={order.patient_id}
+          patientGender={order.patients?.gender ?? null}
+          patientBloodGroup={order.patients?.blood_group ?? null}
+          items={items}
+          currentUserId={currentUserId}
+          acknowledged={mixupAck}
+          onAcknowledged={() => {
+            fetchItems();
+            (async () => {
+              const { data: ord } = await (supabase as any)
+                .from("lab_orders")
+                .select("mixup_acknowledged_by, mixup_ack_reason, mixup_acknowledged_at")
+                .eq("id", order.id).maybeSingle();
+              if (ord) setMixupAck({ by: ord.mixup_acknowledged_by, reason: ord.mixup_ack_reason, at: ord.mixup_acknowledged_at });
+            })();
+          }}
+        />
+      )}
+
+      {/* Bedside two-identifier confirm before collection (Phase 11) */}
+      {showCollectConfirm && (
+        <PatientIdentityConfirmDialog
+          patientName={patient?.full_name || "Patient"}
+          uhid={patient?.uhid}
+          dob={patient?.dob}
+          gender={patient?.gender}
+          onConfirm={handleMarkCollected}
+          onClose={() => setShowCollectConfirm(false)}
+        />
+      )}
+
+      {/* QC override dialog */}
+      {showQcOverride && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowQcOverride(false)}>
+          <div className="bg-card rounded-lg shadow-xl w-[440px] max-w-[90vw] p-5" onClick={e => e.stopPropagation()}>
+            <p className="text-sm font-bold text-foreground">Supervisor QC Override</p>
+            <p className="text-[12px] text-muted-foreground mt-1">
+              You are permitting result release for an order whose QC is in a Westgard reject state.
+              This is recorded against the order and logged as NABH evidence.
+            </p>
+            <div className="mt-3 text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2.5 py-1.5">
+              {Object.entries(qcRejectByTest).map(([test, rules]) => (
+                <div key={test}><span className="font-semibold">{test}</span>: {rules.join("; ")}</div>
+              ))}
+            </div>
+            <Textarea
+              value={qcOverrideReason}
+              onChange={e => setQcOverrideReason(e.target.value)}
+              placeholder="Reason for override (required) — e.g. QC repeated & acceptable, corrective action logged separately"
+              className="mt-3 text-sm min-h-[70px]"
+            />
+            <div className="flex justify-end gap-2 mt-3">
+              <button onClick={() => setShowQcOverride(false)} className="text-[12px] px-3 py-1.5 rounded-md border border-border text-muted-foreground hover:bg-muted">Cancel</button>
+              <button
+                onClick={submitQcOverride}
+                disabled={!qcOverrideReason.trim() || qcOverrideSaving}
+                className="text-[12px] px-3 py-1.5 rounded-md bg-red-600 text-white font-semibold hover:bg-red-700 disabled:opacity-50"
+              >
+                {qcOverrideSaving ? "Recording…" : "Record Override & Permit Release"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tabs — History is lazy-loaded on first open */}
+      <Tabs defaultValue="results" className="flex-1 flex flex-col overflow-hidden"
+        onValueChange={(v) => { if (v === "history") fetchHistory(); }}
+      >
+        <TabsList className="shrink-0 bg-card border-b border-border rounded-none h-11 w-full justify-start px-5 gap-0">
+          {[
+            { v: "results", l: "Results" },
+            { v: "sample", l: "Sample" },
+            { v: "history", l: "History" },
+            { v: "notes", l: "Notes" },
+          ]
+            .filter((t) => hasTabAccess("lab", t.v, permissions, role))
+            .map((t) => (
+              <TabsTrigger key={t.v} value={t.v} className="rounded-none border-b-2 border-transparent data-[state=active]:border-b-[hsl(var(--sidebar-background))] data-[state=active]:text-[hsl(var(--sidebar-background))] data-[state=active]:shadow-none text-[13px] px-6">
+                {t.l}
+              </TabsTrigger>
+            ))}
+        </TabsList>
+
+        {/* TAB 1: Results */}
+        <TabsContent value="results" className="flex-1 overflow-auto m-0 mt-0">
+          <div className="min-w-[600px]">
+            {/* Header row */}
+            <div className="sticky top-0 z-10 bg-muted/80 backdrop-blur border-b border-border grid grid-cols-[160px_150px_70px_130px_70px_90px_50px] gap-0 px-4 py-2 text-[11px] font-bold uppercase text-muted-foreground tracking-wide">
+              <span>Test Name</span>
+              <span>Result</span>
+              <span>Unit</span>
+              <span>Ref. Range</span>
+              <span className="text-center">Flag</span>
+              <span>Status</span>
+              <span></span>
+            </div>
+
+            {Object.entries(grouped).map(([category, catItems]) => (
+              <React.Fragment key={category}>
+                <div className="bg-muted/60 px-4 py-1.5 text-[11px] font-bold text-muted-foreground uppercase tracking-wide border-b border-border">
+                  {category.replace(/_/g, " ")}
+                </div>
+                {catItems.map(item => {
+                  const fs = item.result_flag ? FLAG_STYLES[item.result_flag] : null;
+                  const sp = STATUS_PILLS[item.status] || STATUS_PILLS.ordered;
+                  const isNumeric = item.normal_min != null || item.normal_max != null;
+                  const isCritical = item.result_flag === "CH" || item.result_flag === "CL";
+                  const isValidated = item.status === "validated" || item.status === "reported";
+
+                  return (
+                    <React.Fragment key={item.id}>
+                      <div className={cn(
+                        "grid grid-cols-[160px_150px_70px_130px_70px_90px_50px] gap-0 px-4 items-center h-12 border-b border-border/50 transition-colors",
+                        fs?.bg || "bg-card",
+                        fs?.border
+                      )}>
+                        {/* Test Name */}
+                        <div className="min-w-0">
+                          <p className="text-[13px] font-semibold text-foreground truncate">{item.test_name}</p>
+                          {item.test_code && <p className="text-[10px] text-muted-foreground">{item.test_code}</p>}
+                        </div>
+
+                        {/* Result Input */}
+                        <div>
+                          {isValidated ? (
+                            <span className="text-sm font-semibold text-foreground">{item.result_value || "—"}</span>
+                          ) : isNumeric ? (
+                            <input
+                              type="number"
+                              step="any"
+                              value={localValues[item.id] || ""}
+                              onChange={e => setLocalValues(p => ({ ...p, [item.id]: e.target.value }))}
+                              onBlur={e => { if (e.target.value) saveResult(item, e.target.value); }}
+                              className="w-[100px] h-9 border border-border rounded-md px-2.5 text-sm font-semibold text-center bg-card focus:ring-2 focus:ring-ring focus:border-transparent outline-none tabular-nums"
+                              placeholder="—"
+                            />
+                          ) : (
+                            <select
+                              value={localValues[item.id] || ""}
+                              onChange={e => {
+                                setLocalValues(p => ({ ...p, [item.id]: e.target.value }));
+                                if (e.target.value) saveResult(item, e.target.value);
+                              }}
+                              className="w-[120px] h-9 border border-border rounded-md px-2 text-sm bg-card focus:ring-2 focus:ring-ring outline-none"
+                            >
+                              <option value="">Select...</option>
+                              <option value="Positive">Positive</option>
+                              <option value="Negative">Negative</option>
+                              <option value="Detected">Detected</option>
+                              <option value="Not detected">Not detected</option>
+                              <option value="Equivocal">Equivocal</option>
+                            </select>
+                          )}
+                        </div>
+
+                        {/* Unit */}
+                        <span className="text-xs text-muted-foreground">{item.unit || "—"}</span>
+
+                        {/* Ref Range + delta (Phase 8) */}
+                        <span className="text-xs text-muted-foreground flex items-center gap-1">
+                          {item.normal_min != null && item.normal_max != null
+                            ? `${item.normal_min} – ${item.normal_max}`
+                            : item.normal_max != null ? `< ${item.normal_max}` : "—"}
+                          {item.delta_flag && item.previous_value && (
+                            <span className="text-[9px] font-bold px-1 py-0.5 rounded bg-purple-100 text-purple-700"
+                              title={`Delta >${DELTA_CHECK_THRESHOLD_PCT}% vs previous ${item.previous_value}`}>
+                              Δ {item.previous_value}
+                            </span>
+                          )}
+                        </span>
+
+                        {/* Flag */}
+                        <div className="flex justify-center">
+                          {fs && fs.label && (
+                            <span className={cn("text-[10px] font-bold px-2 py-0.5 rounded", fs.bg, fs.text,
+                              isCritical && "animate-pulse"
+                            )}>
+                              {fs.label}
+                            </span>
+                          )}
+                        </div>
+
+                        {/* Status */}
+                        <span className={cn("text-[10px] font-medium px-2 py-0.5 rounded-full text-center flex items-center justify-center gap-1", sp.bg, sp.text)}>
+                          {sp.label}
+                          {item.verification_method === "auto" && (
+                            <span title={item.autoverify_reason || "Auto-verified"}>🤖</span>
+                          )}
+                        </span>
+
+                        {/* Actions */}
+                        <div className="flex justify-center">
+                          {isValidated ? (
+                            <span className="text-muted-foreground/50"><CheckCircle2 size={14} /></span>
+                          ) : item.result_value ? (
+                            <button className="text-muted-foreground hover:text-foreground"><Pencil size={13} /></button>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      {/* Critical banner */}
+                      {isCritical && !item.critical_acknowledged && (
+                        <div className="mx-4 my-1 bg-red-50 border-2 border-red-300 rounded-lg px-4 py-3">
+                          <div className="flex items-start gap-3">
+                            <AlertTriangle className="text-destructive shrink-0 mt-0.5" size={18} />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-[13px] font-bold text-destructive uppercase tracking-wide">
+                                🚨 Critical Value — Notify Treating Doctor Immediately
+                              </p>
+                              <p className="text-sm font-semibold text-foreground mt-0.5">
+                                {item.test_name}: <span className="text-destructive">{item.result_value} {item.unit || ""}</span>
+                              </p>
+                              <p className="text-[11px] text-muted-foreground">
+                                Normal range: {formatReferenceRange(item, patient?.gender ?? null) ?? "—"}
+                                {item.critical_low != null ? ` | Critical low: ${item.critical_low}` : ""}
+                                {item.critical_high != null ? ` | Critical high: ${item.critical_high}` : ""}
+                              </p>
+                              <label className="flex items-center gap-2 mt-2.5 cursor-pointer select-none">
+                                <input
+                                  type="checkbox"
+                                  className="h-4 w-4 rounded border-gray-400 accent-red-600"
+                                  checked={doctorNotifyConfirmed[item.id] || false}
+                                  onChange={e => setDoctorNotifyConfirmed(prev => ({ ...prev, [item.id]: e.target.checked }))}
+                                />
+                                <span className="text-xs font-semibold text-foreground">
+                                  I have notified the treating doctor about this critical value
+                                </span>
+                              </label>
+                            </div>
+                          </div>
+                          <div className="flex justify-end mt-2">
+                            <button
+                              onClick={() => handleAcknowledgeCritical(item.id)}
+                              disabled={!doctorNotifyConfirmed[item.id]}
+                              className="px-3 py-1.5 rounded-md bg-destructive text-white text-xs font-semibold hover:bg-destructive/90 active:scale-[0.97] transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              ✓ Acknowledge & Continue
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {isCritical && item.critical_acknowledged && (
+                        <div className="mx-4 my-1 bg-emerald-50 border border-emerald-200 rounded-lg px-4 py-2 text-xs text-emerald-700 font-medium">
+                          ✓ Critical acknowledged
+                        </div>
+                      )}
+                      {/* Trend analysis for validated numeric results */}
+                      {isValidated && isNumeric && item.result_numeric != null && labHospitalId && (
+                        <div className="mx-4 my-1">
+                          <LabTrendPanel
+                            testName={item.test_name}
+                            currentResult={item.result_numeric}
+                            unit={item.unit}
+                            normalMin={item.normal_min}
+                            normalMax={item.normal_max}
+                            patientId={order.patient_id}
+                            hospitalId={labHospitalId}
+                          />
+                        </div>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </React.Fragment>
+            ))}
+          </div>
+          {/* Antibiogram section — shown for microbiology / culture orders */}
+          {hasMicrobiology && (
+            <div className="mx-4 mb-3 border border-blue-200 rounded-lg p-4 bg-blue-50/30 space-y-3">
+              <p className="text-xs font-bold text-blue-800 uppercase tracking-wide">🔬 Microbiology / Antibiogram</p>
+              <div className="grid grid-cols-3 gap-2">
+                <div>
+                  <label className="text-[11px] text-muted-foreground font-medium block mb-1">Specimen Type</label>
+                  <select value={antibiogramSpecimen} onChange={e => setAntibiogramSpecimen(e.target.value)}
+                    className="w-full h-8 text-xs border border-border rounded-md px-2 bg-background">
+                    {["urine","blood","sputum","wound","csf","pus","stool","throat_swab","other"].map(s => (
+                      <option key={s} value={s}>{s.replace(/_/g," ")}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="text-[11px] text-muted-foreground font-medium block mb-1">Organism Identified</label>
+                  <input value={antibiogramOrganism} onChange={e => setAntibiogramOrganism(e.target.value)}
+                    placeholder="e.g. E. coli, MRSA" className="w-full h-8 text-xs border border-border rounded-md px-2 bg-background" />
+                </div>
+                <div>
+                  <label className="text-[11px] text-muted-foreground font-medium block mb-1">Colony Count</label>
+                  <input value={antibiogramColonyCount} onChange={e => setAntibiogramColonyCount(e.target.value)}
+                    placeholder="e.g. >10⁵ CFU/mL" className="w-full h-8 text-xs border border-border rounded-md px-2 bg-background" />
+                </div>
+              </div>
+              <div>
+                <label className="text-[11px] text-muted-foreground font-medium block mb-2">Sensitivity (S=Sensitive · I=Intermediate · R=Resistant)</label>
+                <div className="grid grid-cols-4 gap-1">
+                  {ANTIBIOGRAM_DRUGS.map(drug => {
+                    const conflict = intrinsicConflicts.find(c => c.drug === drug);
+                    return (
+                      <div key={drug} className={cn("flex items-center gap-1 bg-background border rounded px-2 py-1", conflict ? "border-red-400" : "border-border")}>
+                        <span className="text-[10px] text-muted-foreground flex-1 truncate flex items-center gap-1" title={conflict ? conflict.note : drug}>
+                          {drug}
+                          {conflict && <AlertTriangle size={10} className="text-red-500 shrink-0" />}
+                        </span>
+                        <select value={antibiogramSensitivity[drug] || ""}
+                          onChange={e => setAntibiogramSensitivity(p => ({ ...p, [drug]: e.target.value as "S"|"I"|"R" }))}
+                          className={cn("h-6 w-10 text-[11px] font-bold border-0 rounded text-center appearance-none cursor-pointer",
+                            antibiogramSensitivity[drug] === "S" ? "bg-green-100 text-green-800" :
+                            antibiogramSensitivity[drug] === "I" ? "bg-amber-100 text-amber-800" :
+                            antibiogramSensitivity[drug] === "R" ? "bg-red-100 text-red-800" : "bg-muted text-muted-foreground")}>
+                          <option value="">—</option>
+                          <option value="S">S</option>
+                          <option value="I">I</option>
+                          <option value="R">R</option>
+                        </select>
+                      </div>
+                    );
+                  })}
+                </div>
+                {intrinsicConflicts.length > 0 && (
+                  <div className="mt-2 rounded-md border border-red-300 bg-red-50 px-2.5 py-1.5 space-y-0.5">
+                    <p className="text-[10px] font-bold text-red-700 flex items-center gap-1"><AlertTriangle size={11} /> Intrinsic resistance conflict — likely data-entry error</p>
+                    {intrinsicConflicts.map((c, i) => (
+                      <p key={i} className="text-[10px] text-red-700">{c.drug}: {c.note}</p>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-3 flex-wrap">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-muted-foreground font-medium">Report:</span>
+                  {(["preliminary", "final"] as const).map(rs => (
+                    <button
+                      key={rs}
+                      onClick={() => setAntibiogramReportStatus(rs)}
+                      className={cn(
+                        "text-[11px] font-semibold px-2.5 py-1 rounded-md capitalize transition-colors",
+                        antibiogramReportStatus === rs
+                          ? rs === "final" ? "bg-emerald-600 text-white" : "bg-amber-500 text-white"
+                          : "bg-background border border-border text-muted-foreground hover:bg-muted"
+                      )}
+                    >
+                      {rs}
+                    </button>
+                  ))}
+                </div>
+                <button onClick={saveAntibiogram} disabled={antibiogramSaving || !antibiogramOrganism}
+                  className="h-8 px-4 rounded-md text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 transition-colors">
+                  {antibiogramSaving ? "Saving…" : "Save Antibiogram"}
+                </button>
+                <button onClick={() => printAntibiogram()} disabled={!antibiogramOrganism}
+                  className="h-8 px-4 rounded-md text-xs font-semibold border border-blue-300 text-blue-700 hover:bg-blue-100 disabled:opacity-40 transition-colors flex items-center gap-1.5">
+                  <Printer size={13} /> Print Report
+                </button>
+                <button onClick={runPhenotypeDetection} disabled={phenotypeLoading || !antibiogramOrganism}
+                  className="h-8 px-4 rounded-md text-xs font-semibold border border-purple-300 text-purple-700 hover:bg-purple-100 disabled:opacity-40 transition-colors flex items-center gap-1.5">
+                  <Dna size={13} /> {phenotypeLoading ? "Analysing…" : "Detect Resistance Phenotype (AI)"}
+                </button>
+              </div>
+
+              {/* AI resistance phenotype results (Phase 15) — advisory only */}
+              {phenotypes !== null && (
+                <div className="space-y-1.5">
+                  {phenotypes.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground">No specific resistance phenotype inferred from this pattern.</p>
+                  ) : (
+                    phenotypes.map((p, i) => (
+                      <div key={i} className={cn(
+                        "rounded-md border px-3 py-2 text-[11px]",
+                        p.stewardship_alert ? "bg-red-50 border-red-300" : "bg-purple-50 border-purple-200"
+                      )}>
+                        <p className="font-bold flex items-center gap-1.5">
+                          <Dna size={12} /> {p.phenotype}
+                          <span className="text-[9px] font-semibold uppercase opacity-70">{p.confidence} confidence</span>
+                          {p.stewardship_alert && <span className="text-[9px] font-bold text-red-700 uppercase">Stewardship Alert Raised</span>}
+                        </p>
+                        <p className="mt-0.5 opacity-80">{p.explanation}</p>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* AI-drafted interpretive comment (Phase 16) — printed on the report if saved.
+              Always human-reviewed: the draft only fills the textarea, never auto-saves. */}
+          {items.some(i => i.result_value) && (
+            <div className="mx-4 mb-3 border border-border rounded-lg p-3 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-foreground">Interpretive Comment</span>
+                <button onClick={draftInterpretiveComment} disabled={commentDrafting}
+                  className="text-[11px] px-2.5 py-1 rounded bg-primary/10 text-primary font-semibold hover:bg-primary/20 disabled:opacity-50 flex items-center gap-1">
+                  <Sparkles size={11} /> {commentDrafting ? "Drafting…" : "AI Draft"}
+                </button>
+              </div>
+              <Textarea
+                value={interpretiveComment}
+                onChange={e => setInterpretiveComment(e.target.value)}
+                placeholder="Optional — appears on the printed report. Use 'AI Draft' for a starting point, then review and edit."
+                className="text-sm min-h-[70px]"
+              />
+              <button onClick={saveInterpretiveComment} disabled={commentSaving}
+                className="text-[11px] px-2.5 py-1 rounded border border-border text-muted-foreground hover:bg-muted disabled:opacity-50">
+                {commentSaving ? "Saving…" : "Save Comment"}
+              </button>
+            </div>
+          )}
+
+          {/* AI Anomaly Detection — shown when results are entered */}
+          {items.some(i => i.result_value) && labHospitalId && (
+            <div className="px-4 pb-3">
+              <LabAnomalyDetector
+                patientId={order.patient_id}
+                hospitalId={labHospitalId}
+                orderId={order.id}
+                autoRun={autoRunAnomaly}
+                currentResults={items.map(i => ({
+                  test_name: i.test_name,
+                  result_value: i.result_value,
+                  result_numeric: i.result_numeric,
+                  result_flag: i.result_flag,
+                  unit: i.unit || i.result_unit,
+                  normal_min: i.normal_min,
+                  normal_max: i.normal_max,
+                  reference_range: i.reference_range,
+                }))}
+              />
+            </div>
+          )}
+
+          {/* Lab Auto-Interpretation — shown after anomaly detector when results are entered */}
+          {items.some(i => i.result_value) && labHospitalId && (
+            <div className="px-4 pb-4">
+              <LabInterpretationPanel
+                results={items.map(i => ({
+                  test_name: i.test_name,
+                  result_value: i.result_value,
+                  result_numeric: i.result_numeric,
+                  result_flag: i.result_flag,
+                  unit: i.unit || i.result_unit,
+                  normal_min: i.normal_min,
+                  normal_max: i.normal_max,
+                  reference_range: i.reference_range,
+                }))}
+                hospitalId={labHospitalId}
+                patientId={order.patient_id}
+              />
+            </div>
+          )}
+
+          {/* AI Reflex Test Suggestions — shown when there's at least one abnormal result */}
+          {labHospitalId && patient && items.some(i => i.result_value && i.result_flag && i.result_flag !== "N") && (
+            <div className="px-4 pb-4">
+              <ReflexTestPanel
+                hospitalId={labHospitalId}
+                patientId={order.patient_id}
+                patientName={patient.full_name}
+                patientUhid={patient.uhid}
+                patientGender={patient.gender}
+                patientDob={patient.dob}
+                encounterId={orderLinkage.encounter_id}
+                admissionId={orderLinkage.admission_id}
+                clinicalNotes={order.clinical_notes}
+                abnormalResults={items
+                  .filter(i => i.result_value && i.result_flag && i.result_flag !== "N")
+                  .map(i => ({ test_name: i.test_name, result_value: i.result_value, result_flag: i.result_flag, unit: i.unit || i.result_unit }))}
+              />
+            </div>
+          )}
+        </TabsContent>
+
+        {/* TAB 2: Sample */}
+        <TabsContent value="sample" className="flex-1 overflow-auto m-0 p-4 space-y-3">
+          {samples.length === 0 && <p className="text-sm text-muted-foreground text-center py-8">No samples recorded</p>}
+          {samples.map(sample => {
+            const fullSteps = ["pending", "collected", "received", "processing"];
+            const sampleIdx = fullSteps.indexOf(sample.status);
+            // Derive higher-level workflow status
+            const allEntered = items.length > 0 && items.every(i => i.result_value);
+            const allReported = items.length > 0 && items.every(i => i.status === "reported" || i.status === "validated");
+            const workflowSteps = [
+              { key: "pending", label: "Ordered" },
+              { key: "collected", label: "Collected" },
+              { key: "received", label: "Received" },
+              { key: "processing", label: "Processing" },
+              { key: "results", label: "Results Entered" },
+              { key: "reported", label: "Reported" },
+            ];
+            const workflowIdx = allReported ? 5 : allEntered ? 4 : sampleIdx >= 0 ? sampleIdx : 0;
+
+            return (
+              <div key={sample.id} className="bg-card border border-border rounded-lg p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-xs font-semibold bg-muted px-2 py-1 rounded capitalize">{sample.sample_type}</span>
+                    {orderBarcode && (
+                      <span className="text-xs font-mono bg-muted/50 px-2 py-1 rounded text-muted-foreground">{orderBarcode}</span>
+                    )}
+                    {orderBarcode && (
+                      <button
+                        onClick={printBarcodeLabel}
+                        className="text-[11px] font-medium px-2.5 py-1 rounded border border-border text-foreground hover:bg-muted transition-colors flex items-center gap-1"
+                      >
+                        🏷️ Print Barcode Label
+                      </button>
+                    )}
+                  </div>
+                  <span className={cn("text-[10px] font-medium px-2 py-0.5 rounded-full capitalize",
+                    allReported ? "bg-emerald-100 text-emerald-700" :
+                    allEntered ? "bg-blue-100 text-blue-700" :
+                    sample.status === "processing" ? "bg-violet-100 text-violet-700" :
+                    sample.status === "received" ? "bg-blue-100 text-blue-700" :
+                    sample.status === "collected" ? "bg-amber-100 text-amber-700" :
+                    "bg-muted text-muted-foreground"
+                  )}>
+                    {allReported ? "reported" : allEntered ? "results entered" : sample.status}
+                  </span>
+                </div>
+
+                {/* Full Workflow Stepper */}
+                <div className="flex items-center gap-0.5 mb-2">
+                  {workflowSteps.map((step, i) => {
+                    const isComplete = i <= workflowIdx;
+                    const isCurrent = i === workflowIdx;
+                    return (
+                      <React.Fragment key={step.key}>
+                        {i > 0 && <div className={cn("flex-1 h-0.5 rounded", isComplete ? "bg-emerald-500" : "bg-border")} />}
+                        <div className={cn("w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0",
+                          isComplete ? "bg-emerald-500 text-white" : "bg-muted text-muted-foreground border border-border",
+                          isCurrent && !isComplete && "ring-2 ring-blue-300"
+                        )}>
+                          {isComplete ? "✓" : i + 1}
+                        </div>
+                      </React.Fragment>
+                    );
+                  })}
+                </div>
+                <div className="flex justify-between text-[9px] text-muted-foreground px-0">
+                  {workflowSteps.map(s => <span key={s.key} className="text-center w-12">{s.label.split(" ")[0]}</span>)}
+                </div>
+
+                {sample.collected_at && (
+                  <p className="text-[11px] text-muted-foreground mt-2">
+                    Collected: {new Date(sample.collected_at).toLocaleString()}
+                  </p>
+                )}
+                {sample.received_at && (
+                  <p className="text-[11px] text-muted-foreground">
+                    Received: {new Date(sample.received_at).toLocaleString()}
+                  </p>
+                )}
+
+                {/* Workflow action buttons */}
+                {sample.status === "pending" && (
+                  <button onClick={handleMarkCollected}
+                    className="w-full mt-3 h-9 rounded-lg bg-amber-500 text-white text-xs font-semibold hover:bg-amber-600 active:scale-[0.97] transition-all">
+                    📦 Mark Sample Collected
+                  </button>
+                )}
+                {sample.status === "collected" && (
+                  <button onClick={handleMarkReceived}
+                    className="w-full mt-3 h-9 rounded-lg bg-blue-500 text-white text-xs font-semibold hover:bg-blue-600 active:scale-[0.97] transition-all">
+                    📥 Mark Sample Received
+                  </button>
+                )}
+                {sample.status === "received" && (
+                  <button onClick={handleMarkProcessing}
+                    className="w-full mt-3 h-9 rounded-lg bg-violet-500 text-white text-xs font-semibold hover:bg-violet-600 active:scale-[0.97] transition-all">
+                    🔬 Start Processing
+                  </button>
+                )}
+                {sample.status === "processing" && !allEntered && (
+                  <div className="mt-3 bg-blue-50 border border-blue-200 rounded-lg p-3 text-center">
+                    <p className="text-xs font-semibold text-blue-700">🧪 Sample is being processed</p>
+                    <p className="text-[11px] text-blue-600 mt-1">Switch to the <strong>Results</strong> tab to enter test results</p>
+                  </div>
+                )}
+                {sample.status === "processing" && allEntered && !allReported && (
+                  <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
+                    <p className="text-xs font-semibold text-emerald-700">✓ All results entered</p>
+                    <p className="text-[11px] text-emerald-600 mt-1">Click <strong>Validate & Release</strong> to finalize the report</p>
+                  </div>
+                )}
+                {allReported && (
+                  <div className="mt-3 bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-center">
+                    <p className="text-xs font-semibold text-emerald-700">✓ Report released</p>
+                    <p className="text-[11px] text-emerald-600 mt-1">Use <strong>Print Report</strong> or <strong>WhatsApp</strong> to deliver results</p>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </TabsContent>
+
+        {/* TAB 3: History */}
+        <TabsContent value="history" className="flex-1 overflow-auto m-0 p-4 space-y-4">
+          {Object.keys(historyByTest).length === 0 && (
+            <p className="text-sm text-muted-foreground text-center py-8">No previous results found for this patient</p>
+          )}
+          {Object.entries(historyByTest).map(([testName, results]) => (
+            <div key={testName} className="bg-card border border-border rounded-lg p-3">
+              <p className="text-xs font-bold text-foreground mb-2">{testName}</p>
+              <div className="flex flex-wrap gap-2">
+                {results.slice(0, 5).map((r: any, i: number) => {
+                  const flagS = r.result_flag ? FLAG_STYLES[r.result_flag] : null;
+                  return (
+                    <div key={i} className={cn("text-xs px-2.5 py-1 rounded-md border", flagS?.bg || "bg-muted", "border-border")}>
+                      <span className={cn("font-semibold", flagS?.text || "text-foreground")}>{r.result_value || r.result_numeric}</span>
+                      <span className="text-muted-foreground ml-1">{r.result_unit}</span>
+                      <span className="text-muted-foreground ml-1.5 text-[10px]">
+                        {(r.lab_orders as any)?.order_date ? new Date((r.lab_orders as any).order_date).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : ""}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </TabsContent>
+
+        {/* TAB 4: Notes */}
+        <TabsContent value="notes" className="flex-1 m-0 p-4">
+          <Textarea
+            value={labNotes}
+            onChange={e => setLabNotes(e.target.value)}
+            onBlur={() => {
+              supabase.from("lab_orders").update({ clinical_notes: labNotes }).eq("id", order.id);
+            }}
+            placeholder="Lab notes, QC comments, instrument used..."
+            className="h-full min-h-[200px] resize-none"
+          />
+        </TabsContent>
+      </Tabs>
+
+      {/* Action Bar */}
+      <div className="shrink-0 bg-card border-t border-border px-5 py-2 flex items-center gap-2 flex-wrap min-h-[56px]">
+        <button onClick={() => {
+          const unsaved = items.filter(i => localValues[i.id] && localValues[i.id] !== i.result_value);
+          if (unsaved.length === 0) { toast({ title: "All results already saved" }); return; }
+          Promise.all(unsaved.map(i => saveResult(i, localValues[i.id]))).then(() => {
+            toast({ title: `💾 ${unsaved.length} result(s) saved` });
+          });
+        }}
+          className="px-4 py-2 rounded-lg border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors flex items-center gap-1.5">
+          <Save size={14} /> Save All
+        </button>
+        {/* Single-step validation */}
+        {!requiresDualValidation && (
+          <button onClick={handleValidateAll}
+            disabled={!allResultsEntered || hasUnacknowledgedCritical || validating}
+            className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 active:scale-[0.97] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5">
+            <CheckCircle2 size={14} /> {validating ? "Validating..." : "Validate & Release"}
+          </button>
+        )}
+        {/* Technician: submit for pathologist */}
+        {requiresDualValidation && role !== "doctor" && role !== "pathologist" && role !== "radiologist" && order.status !== "pending_validation" && order.status !== "completed" && (
+          <button onClick={handleSubmitForValidation}
+            disabled={!allResultsEntered || hasUnacknowledgedCritical || validating}
+            className="px-4 py-2 rounded-lg bg-teal-600 text-white text-xs font-semibold hover:bg-teal-700 active:scale-[0.97] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5">
+            <CheckCircle2 size={14} /> {validating ? "Submitting..." : "Submit for Validation"}
+          </button>
+        )}
+        {/* Pathologist: add notes + sign. super_admin/hospital_admin included — see the
+            matching comment on the compact header action above; same dead-end otherwise. */}
+        {requiresDualValidation && (role === "doctor" || role === "pathologist" || role === "radiologist" || role === "super_admin" || role === "hospital_admin") && order.status === "pending_validation" && (
+          <>
+            <input
+              type="text"
+              value={validationNotes}
+              onChange={e => setValidationNotes(e.target.value)}
+              placeholder="Pathologist notes (optional)..."
+              className="flex-1 h-9 border border-border rounded-lg px-3 text-xs bg-background focus:ring-2 focus:ring-ring focus:border-transparent outline-none min-w-[180px]"
+            />
+            <button onClick={handlePathologistValidate}
+              disabled={validating}
+              className="px-4 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 active:scale-[0.97] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5">
+              <CheckCircle2 size={14} /> {validating ? "Signing..." : "Validate & Sign"}
+            </button>
+          </>
+        )}
+        <div className="flex-1" />
+        <button onClick={() => {
+          const p = order.patients;
+          const doctorName = (order.ordered_by_user as any)?.full_name || "";
+
+          // Group items by category for a structured report
+          const grouped: Record<string, TestItem[]> = {};
+          items.forEach(i => {
+            const cat = (i.category || "Other").toUpperCase();
+            if (!grouped[cat]) grouped[cat] = [];
+            grouped[cat].push(i);
+          });
+
+          const categoryRows = Object.entries(grouped).map(([cat, catItems]) => `
+            <tr style="background:#f8fafc">
+              <td colspan="4" style="font-weight:700;font-size:11px;text-transform:uppercase;color:#475569;padding:5px 10px;letter-spacing:.05em">${cat}</td>
+            </tr>
+            ${catItems.map(i => {
+              const flagStyle = i.result_flag === "H" || i.result_flag === "CH"
+                ? "color:#b45309;font-weight:700"
+                : i.result_flag === "L" || i.result_flag === "CL"
+                  ? "color:#1d4ed8;font-weight:700"
+                  : "";
+              const flagLabel = FLAG_STYLES[i.result_flag || ""]?.label || "";
+              // Prefer the interval stored on the result: it is what was in force at
+              // release. Fall back to the master only for rows released before
+              // reference_range was captured.
+              const ref = i.reference_range || formatReferenceRange(i, p?.gender ?? null) || "—";
+              const rowBg = i.result_flag === "CH" || i.result_flag === "CL"
+                ? "background:#fff5f5"
+                : i.result_flag === "H" || i.result_flag === "L"
+                  ? "background:#fffbeb" : "";
+              return `<tr style="${rowBg}">
+                <td>${i.test_name}${i.test_code ? `<br/><span style="font-size:10px;color:#94a3b8">${i.test_code}</span>` : ""}</td>
+                <td style="${flagStyle}">${i.result_value || "—"}${flagLabel ? ` <span style="font-size:11px">${flagLabel}</span>` : ""}</td>
+                <td>${i.unit || "—"}</td>
+                <td style="color:#6b7280">${ref}</td>
+              </tr>`;
+            }).join("")}
+          `).join("");
+
+          const headerExtras = `
+            <div style="font-size:11px;color:#64748b;margin-top:4px">
+              Laboratory Investigation Report
+              ${nablNumber ? ` &nbsp;|&nbsp; NABL Accreditation No: <strong>${nablNumber}</strong>` : ""}
+            </div>`;
+
+          const body = `
+            ${printHeader(hospitalName || "Lab Report", undefined, headerExtras)}
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px 24px;margin-bottom:16px;font-size:12px;padding:12px;background:#f8fafc;border-radius:6px;border:1px solid #e2e8f0">
+              <div><span style="color:#64748b">Patient:</span> <strong>${p?.full_name || "—"}</strong></div>
+              <div><span style="color:#64748b">Order No:</span> LAB-${order.id.slice(0, 8).toUpperCase()}</div>
+              <div><span style="color:#64748b">UHID:</span> ${p?.uhid || "—"}</div>
+              <div><span style="color:#64748b">Date:</span> ${new Date(order.order_date).toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" })}</div>
+              <div><span style="color:#64748b">Age / Gender:</span> ${getAge(p?.dob || null)}${p?.gender ? ` / ${p.gender}` : ""}</div>
+              ${doctorName ? `<div><span style="color:#64748b">Ref. Doctor:</span> Dr. ${doctorName}</div>` : ""}
+            </div>
+            <table>
+              <thead><tr><th>Test</th><th>Result</th><th>Unit</th><th>Ref. Range</th></tr></thead>
+              <tbody>${categoryRows}</tbody>
+            </table>
+            ${interpretiveComment.trim() ? `
+            <div style="margin-top:16px;padding:10px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px">
+              <div style="font-size:11px;font-weight:700;color:#475569;text-transform:uppercase;margin-bottom:3px">Interpretive Comment</div>
+              <div style="font-size:12px;color:#1e293b;white-space:pre-wrap">${interpretiveComment.trim()}</div>
+            </div>` : ""}
+            <div style="margin-top:32px;display:flex;justify-content:flex-end">
+              <div style="text-align:center;min-width:140px">
+                <div style="border-top:1px solid #334155;padding-top:4px;font-size:11px;color:#475569">Lab Technician / Pathologist</div>
+              </div>
+            </div>
+          `;
+
+          logRecordAccess({ hospitalId: labHospitalId, recordType: "Lab_Report", recordId: order.id, patientId: order.patient_id, action: "print" });
+          printDocument(`Lab Report – ${p?.full_name || "Patient"}`, body);
+        }}
+          className="px-3 py-2 rounded-lg border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors flex items-center gap-1.5">
+          <Printer size={13} /> Print Report
+        </button>
+        <button
+          onClick={printCumulativeReport}
+          className="px-3 py-2 rounded-lg border border-border text-xs font-medium text-foreground hover:bg-muted transition-colors flex items-center gap-1.5">
+          <FileText size={13} /> Cumulative
+        </button>
+        <button
+          onClick={() => {
+            const p = order.patients;
+            if (!p?.phone) { toast({ title: "Patient phone not available", variant: "destructive" }); return; }
+            if (order.status !== "completed") { toast({ title: "Validate & release report first", variant: "destructive" }); return; }
+            const testLines = items.map(i => {
+              const emoji = i.result_flag === "CH" || i.result_flag === "CL" ? "🔴" : i.result_flag === "H" || i.result_flag === "L" ? "🟡" : "✅";
+              return `• ${i.test_name}: *${i.result_value} ${i.unit || ""}* ${emoji}`;
+            }).join("\n");
+            const msg = `🏥 *Lab Report*\n*Patient:* ${p.full_name}\n\n📋 *Results:*\n${testLines}`;
+            const phone = p.phone?.replace(/\D/g, "");
+            window.open(`https://wa.me/91${phone}?text=${encodeURIComponent(msg)}`, "_blank", "noopener,noreferrer");
+          }}
+          className="px-3 py-2 rounded-lg border border-emerald-300 text-xs font-medium text-emerald-700 hover:bg-emerald-50 transition-colors flex items-center gap-1.5">
+          <MessageSquare size={13} /> WhatsApp
+        </button>
+      </div>
+    </div>
+    </>
+  );
+};
+
+export default LabResultWorkspace;

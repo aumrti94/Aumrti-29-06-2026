@@ -1,0 +1,28 @@
+-- Drop bills_bill_type_check entirely — found while escalating KNOWN-BUG-222 to Kavitha/
+-- revenue-pod for a go-live revenue-exposure assessment (2026-09-18).
+--
+-- WHY. This exact CHECK constraint has needed patching four times now for the identical reason
+-- (20260520000002, 20260821000002, 20261106000004, 20261106000030) — a module ships, its
+-- transformed bill_type isn't in the allow-list, and every charge attempt silently fails inside
+-- autoChargeService's standalone branch (every real call site wraps the call in
+-- `.catch(() => {})`, so the rejection was never once visible to anyone). Track record: 0-for-4
+-- catching an actually-wrong value, 4-for-4 blocking a legitimate one nobody remembered to
+-- allow-list. A control with that record is negative-value, not a safety net.
+--
+-- Exact precedent already in this codebase: 20261008000051 dropped the sibling
+-- bill_line_items.item_type CHECK for the identical reason ("Same class of bug as
+-- auto_posting_rules.trigger_event... dropped entirely rather than chasing an ever-growing
+-- allow-list that nobody kept in sync") and replaced it with nothing — item_type has been a
+-- plain free-text column since, with no issues. Same fix here.
+--
+-- Enforcement moves to CI instead: scripts/check-bill-type-coverage.mjs, run in
+-- .github/workflows/ci.yml, diffs every MODULE_* constant's transformed value in
+-- src/lib/serviceBilling.ts against that file's own BILLABLE_MODULES array — catching a missing
+-- value on the PR that introduces it, not silently in production. autoChargeService's standalone
+-- branch (same file, same migration set) also now degrades any bill-insert failure into a visible
+-- service_charges "unbilled" record instead of throwing into a swallowed .catch(), so even a gap
+-- this CI check somehow misses becomes a findable record, not nothing.
+--
+-- Purely permissive-in-reverse: removes a guardrail, changes no existing row.
+
+ALTER TABLE public.bills DROP CONSTRAINT IF EXISTS bills_bill_type_check;
