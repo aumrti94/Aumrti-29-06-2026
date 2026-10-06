@@ -53,6 +53,42 @@ export interface HospitalTypeDefinition {
    *  pattern rather than sourced from the founder-reviewed matrix (see registration taxonomy
    *  build report). Kept so a later pass can re-review these specifically. */
   inferred?: boolean;
+  /** Best-guess `subscription_plans.slug` to highlight/pre-select on the registration wizard's
+   *  Choose Plan step (Step4ChoosePlan.tsx) once this type has been picked in Step 1. This is a
+   *  SUGGESTION, never a filter — every plan stays pickable regardless of this value; the founder
+   *  was explicit that over-filtering risks losing an edge-case hospital that doesn't fit the mould.
+   *
+   *  Slugs and their actual plan_features (checked against supabase/migrations — not guessed):
+   *    "clinic"       — Clinic & Day Care (₹2,499/mo, ≤15 beds). plan_features enables only opd,
+   *                     day_care, billing, payments, day_closure, pharmacy_retail, lab,
+   *                     patient_portal, inbox, settings, ai_suite. No IPD/OT, no named specialty
+   *                     EMR, no Insurance/TPA, no Radiology.
+   *    "starter"      — Starter (₹8,999/mo + ₹750/10 extra beds). Adds ipd, emergency, nursing,
+   *                     radiology, pharmacy (IP), hr, inventory. Still no insurance, quality/NABH,
+   *                     blood_bank, or any named specialty EMR (oncology, dialysis, ivf, ayush,
+   *                     dental, mental_health, physio, dietetics, home_care, vaccination,
+   *                     health_packages, neonatal, obstetric_anc, ophthalmology...).
+   *    "professional" — Professional (₹17,999/mo + ₹950/10 extra beds). Every module ON,
+   *                     including every named specialty EMR above, Insurance/TPA, Quality & NABH,
+   *                     OT, Govt Schemes/PMJAY, Govt HMIS, ABDM, AI.
+   *    "enterprise"   — Enterprise (custom pricing). Identical plan_features to Professional;
+   *                     sold on multi-branch/white-label/SLA for chains and 250+-bed hospitals —
+   *                     used here only for the explicitly large-scale / government-&-PSU-network
+   *                     / tertiary-referral types, where Aumrti's negotiated-contract motion fits
+   *                     the real procurement process better than self-serve (flagged per entry).
+   *
+   *  Rule applied: the cheapest plan whose plan_features cover every module in this type's `core`
+   *  list, so the suggestion never leaves a hospital unable to chart its own specialty — with the
+   *  enterprise override above layered on top for scale/procurement reasons, not module fit.
+   *
+   *  Net effect, surfaced here rather than papered over: because Clinic and Starter carry almost
+   *  no named specialty modules, any type whose core includes one (Oncology, Dialysis, IVF,
+   *  AYUSH, Dental, Physiotherapy, Mental Health, Chronic Disease, Home Care, Dietetics, Health
+   *  Packages, Vaccination, Neonatal EMR, Obstetric ANC, Ophthalmology EMR...) lands on
+   *  "professional" regardless of how small the facility physically is — see the "PLAN FIT GAP"
+   *  comments on the entries below where that produces a genuine price/size mismatch worth the
+   *  founder's attention, not something this mapping should force a fit for. */
+  defaultPlanSlug: "clinic" | "starter" | "professional" | "enterprise";
 }
 
 /** Implied Core for every single hospital type — not repeated per entry. */
@@ -70,6 +106,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Health Packages", "Quick Scribe", "CRM & Marketing", "Communication Inbox", "ABDM / ABHA", "Notifications", "HR & Payroll", "Inventory & Stores"],
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Mortuary & Medico-Legal", "Biomedical Engineering", "FMS / Safety", "Accounts / ERP", "Financial Statements", "Budget Management", "Fixed Assets Register", "Research Platform", "JCI Accreditation", "MCI / Disaster Response", "Govt HMIS Reporting"],
     inferred: true,
+    defaultPlanSlug: "clinic",
   },
   {
     key: "nursing_home_small_hospital",
@@ -81,6 +118,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Ambulance Service", "Quality & NABH", "CRM & Marketing", "Communication Inbox", "ABDM / ABHA", "Notifications"],
     usuallyNotRequired: ["Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Mortuary & Medico-Legal", "Research Platform", "JCI Accreditation", "Govt HMIS Reporting", "Population Health", "Revenue Intelligence", "AI Clinical Intelligence"],
     inferred: true,
+    // No OT/Insurance/Blood Bank/Quality in core — Starter's opd+ipd+day_care+radiology+lab+
+    // pharmacy(+retail)+hr+inventory+patient_portal set already covers this type's full core list.
+    defaultPlanSlug: "starter",
   },
   {
     key: "phc_chc",
@@ -92,6 +132,11 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Dietetics & Nutrition", "HR & Payroll", "Notifications"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Day Care Unit", "Research Platform", "JCI Accreditation", "Accounts / ERP", "Financial Statements", "Budget Management", "Fixed Assets Register", "Revenue Intelligence", "CRM & Marketing"],
     inferred: true,
+    // PLAN FIT GAP: Vaccination + Obstetric ANC are core here but both are Professional-only
+    // modules (off on Clinic/Starter) — a govt primary-care centre is pushed to ₹17,999/mo just
+    // to unlock two charting modules it cannot do without. Flag for founder: either of those two
+    // modules on a cheaper tier, or a dedicated low-cost govt/PHC tier, would close this gap.
+    defaultPlanSlug: "professional",
   },
   {
     key: "general_hospital",
@@ -104,6 +149,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     usuallyNotRequired: ["Dialysis Unit", "Oncology", "IVF & ART", "Mortuary & Medico-Legal", "JCI Accreditation"],
     teachingOverlayEligible: true,
     inferred: true,
+    defaultPlanSlug: "professional", // Operation Theatre in core — needs the OT module (Professional+).
   },
   {
     key: "multispecialty_hospital",
@@ -116,6 +162,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     usuallyNotRequired: ["IVF & ART", "MCI / Disaster Response"],
     teachingOverlayEligible: true,
     inferred: true,
+    defaultPlanSlug: "professional", // OT + Insurance/TPA + Quality & NABH all core — needs the full module set.
   },
   {
     key: "super_specialty_hospital",
@@ -128,6 +175,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     usuallyNotRequired: ["Vaccination", "Govt Schemes / PMJAY", "Obstetric ANC"],
     teachingOverlayEligible: true,
     inferred: true,
+    // Tertiary-referral scale (Blood Bank + CSSD + Insurance + Accounts/ERP + Quality&NABH all
+    // core) — Enterprise's SLA/dedicated-CSM motion fits better than self-serve Professional.
+    defaultPlanSlug: "enterprise",
   },
   {
     key: "district_hospital",
@@ -139,6 +189,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Quality & NABH", "Notifications", "Dietetics & Nutrition"],
     usuallyNotRequired: ["Insurance / TPA", "CRM & Marketing", "Research Platform", "AI Clinical Intelligence", "Revenue Intelligence", "JCI Accreditation"],
     inferred: true,
+    // Govt-network mega-facility (Blood Bank, PMJAY, HMIS all core) — negotiated/institutional
+    // procurement, not self-serve; Enterprise's custom-pricing motion matches that process.
+    defaultPlanSlug: "enterprise",
   },
   {
     key: "government_hospital",
@@ -150,6 +203,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Quality & NABH", "Notifications", "Telemedicine"],
     usuallyNotRequired: ["Insurance / TPA", "CRM & Marketing", "Research Platform", "AI Clinical Intelligence", "Revenue Intelligence", "JCI Accreditation", "Patient Portal"],
     inferred: true,
+    // Govt-network facility (PMJAY + HMIS core) — same institutional-procurement reasoning as
+    // district_hospital; Enterprise's negotiated pricing fits better than a self-serve tier.
+    defaultPlanSlug: "enterprise",
   },
   {
     key: "trust_charitable_hospital",
@@ -161,6 +217,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Communication Inbox", "ABDM / ABHA", "Notifications", "Accounts / ERP", "Staff Training / LMS"],
     usuallyNotRequired: ["Research Platform", "AI Clinical Intelligence", "Revenue Intelligence", "JCI Accreditation", "IVF & ART"],
     inferred: true,
+    defaultPlanSlug: "professional", // OT in core; mid-size single-site charitable hospital, no govt/chain override.
   },
   {
     key: "esi_hospital",
@@ -172,6 +229,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Insurance / TPA", "Telemedicine", "Notifications"],
     usuallyNotRequired: ["CRM & Marketing", "Research Platform", "AI Clinical Intelligence", "Revenue Intelligence", "JCI Accreditation", "Patient Portal"],
     inferred: true,
+    // PSU hospital network (Govt Schemes/PMJAY core) — institutional procurement; Enterprise fits
+    // the negotiated-contract model this sector actually buys on.
+    defaultPlanSlug: "enterprise",
   },
   {
     key: "railway_hospital",
@@ -183,6 +243,11 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Insurance / TPA", "Telemedicine", "Notifications"],
     usuallyNotRequired: ["CRM & Marketing", "Research Platform", "AI Clinical Intelligence", "Revenue Intelligence", "JCI Accreditation"],
     inferred: true,
+    // PLAN FIT GAP / judgment call: core alone (no OT, no Insurance/Quality) would rule-map to
+    // Starter, but a railway-zone hospital is one node in a PSU network bought on negotiated
+    // institutional contracts, not self-serve — overriding to Enterprise on that basis, not
+    // module fit. Founder may decide Starter/Professional is the better self-serve default.
+    defaultPlanSlug: "enterprise",
   },
   {
     key: "defence_military_hospital",
@@ -194,6 +259,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Research Platform", "Staff Training / LMS"],
     usuallyNotRequired: ["Insurance / TPA", "CRM & Marketing", "Patient Portal", "Govt Schemes / PMJAY", "Revenue Intelligence"],
     inferred: true,
+    // Defence/PSU network hospital, multi-department tertiary scale (OT + Blood Bank + CSSD
+    // core) — institutional procurement; Enterprise's negotiated motion fits best.
+    defaultPlanSlug: "enterprise",
   },
 
   // ───────────────────────── SPECIALTY HOSPITALS ─────────────────────────
@@ -207,6 +275,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Research Platform", "AI Clinical Intelligence", "Dietetics & Nutrition", "Staff Training / LMS"],
     usuallyNotRequired: ["Obstetric ANC", "Neonatal EMR", "Vaccination", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Oncology + OT + Insurance/TPA all core — needs the Oncology module (Professional+).
   },
   {
     key: "dialysis_renal_hospital",
@@ -218,6 +287,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Communication Inbox", "Notifications", "Dietetics & Nutrition", "Quality & NABH"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "CSSD", "Oncology", "Obstetric ANC", "Neonatal EMR", "Mortuary & Medico-Legal", "Research Platform"],
     inferred: true,
+    defaultPlanSlug: "professional", // Dialysis Unit module is Professional-only; Insurance/TPA also core here.
   },
   {
     key: "maternity_womens_hospital",
@@ -229,6 +299,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Health Packages", "CRM & Marketing", "Vaccination", "Dietetics & Nutrition"],
     usuallyNotRequired: ["Dialysis Unit", "Oncology", "Mortuary & Medico-Legal", "Chronic Disease Management"],
     inferred: true,
+    defaultPlanSlug: "professional", // OT + Obstetric ANC + Partograph all core — those modules are Professional-only.
   },
   {
     key: "neonatal_nicu_hospital",
@@ -240,6 +311,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Dietetics & Nutrition", "Quality & NABH"],
     usuallyNotRequired: ["Dialysis Unit", "Oncology", "Mortuary & Medico-Legal", "Vaccination", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Neonatal EMR module is Professional-only.
   },
   {
     key: "ivf_fertility_centre",
@@ -251,6 +323,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Communication Inbox"],
     usuallyNotRequired: ["IPD / Wards", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Govt Schemes / PMJAY", "Mortuary & Medico-Legal"],
     inferred: true,
+    // PLAN FIT GAP: physically a small day-care footprint (no IPD/OT in core) but IVF & ART is a
+    // Professional-only module, so the suggestion has to jump straight past Clinic/Starter.
+    defaultPlanSlug: "professional",
   },
   {
     key: "eye_hospital",
@@ -262,6 +337,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Inventory & Stores"],
     usuallyNotRequired: ["Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // OT + Ophthalmology EMR both core — Ophthalmology EMR is Professional-only.
   },
   {
     key: "dental_hospital",
@@ -273,6 +349,11 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Communication Inbox"],
     usuallyNotRequired: ["IPD / Wards", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: this is a small walk-in dental practice (no IPD/OT core) but the Dental
+    // module itself is Professional-only, so a Dental Hospital gets pushed past Clinic/Starter
+    // just to chart its own specialty. Flag for founder: Dental on Clinic would fit this segment
+    // far better than ₹17,999/mo Professional.
+    defaultPlanSlug: "professional",
   },
   {
     // Worked example from the registration-taxonomy build brief — Core list sourced verbatim;
@@ -286,6 +367,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "HR & Payroll"],
     usuallyNotRequired: ["Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: false,
+    defaultPlanSlug: "professional", // Operation Theatre in core — OT module is Professional-only.
   },
   {
     key: "orthopaedic_hospital",
@@ -297,6 +379,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Health Packages"],
     usuallyNotRequired: ["Emergency", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: false,
+    defaultPlanSlug: "professional", // OT + Physiotherapy both core — Physiotherapy module is Professional-only.
   },
   {
     key: "cardiac_cardiology_hospital",
@@ -308,6 +391,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Research Platform", "AI Clinical Intelligence"],
     usuallyNotRequired: ["Obstetric ANC", "Neonatal EMR", "Dental", "Vaccination", "Govt Schemes / PMJAY"],
     inferred: false,
+    defaultPlanSlug: "professional", // OT + Insurance/TPA both core.
   },
   {
     key: "urology_hospital",
@@ -319,6 +403,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing"],
     usuallyNotRequired: ["Emergency", "Blood Bank", "CSSD", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Operation Theatre in core — OT module is Professional-only.
   },
   {
     key: "gastroenterology_hospital",
@@ -330,6 +415,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing"],
     usuallyNotRequired: ["Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Operation Theatre in core — OT module is Professional-only.
   },
   {
     key: "dermatology_skin_clinic",
@@ -341,6 +427,10 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Communication Inbox"],
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Laboratory (LIS)", "Radiology (RIS)", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: a solo-practitioner skin clinic (no IPD/OT core) is pushed to ₹17,999/mo
+    // Professional purely because Health Packages — its core revenue line — is a Professional-
+    // only module. Flag for founder: Health Packages on Clinic would fit this segment better.
+    defaultPlanSlug: "professional",
   },
   {
     key: "psychiatric_mental_health_hospital",
@@ -352,6 +442,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Staff Training / LMS"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Mental Health / Psychiatry module is Professional-only.
   },
   {
     key: "rehabilitation_physiotherapy_hospital",
@@ -363,6 +454,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Home Care", "Patient Portal", "CRM & Marketing"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: small OPD+day-care rehab centre (no IPD/OT) pushed to Professional purely
+    // because Physiotherapy — its whole business — is a Professional-only module.
+    defaultPlanSlug: "professional",
   },
   {
     // Sibling of Homecare/Palliative Provider — same clinical family; this one owns beds (IPD
@@ -376,6 +470,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Notifications"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // Chronic Disease Management + Dietetics & Nutrition both core — both Professional-only.
   },
   {
     key: "homecare_palliative_provider",
@@ -387,6 +482,12 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Patient Portal", "Communication Inbox", "CRM & Marketing", "Notifications"],
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Laboratory (LIS)", "Radiology (RIS)", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: this provider has zero beds and no OT — the opposite of what the plan tiers'
+    // bed-based pricing assumes — yet Home Care + Chronic Disease Management + Dietetics &
+    // Nutrition are all Professional-only, so it still lands on the ₹17,999/mo tier priced for
+    // 40 included beds it will never use. Strongest signal in this taxonomy for a dedicated
+    // low-cost "community / home-care" plan.
+    defaultPlanSlug: "professional",
   },
   {
     // Worked example — Core list sourced verbatim from the taxonomy build brief.
@@ -399,6 +500,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing"],
     usuallyNotRequired: ["Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "IVF & ART"],
     inferred: false,
+    defaultPlanSlug: "professional", // Chronic Disease Management + Home Care + Dietetics + Physiotherapy all core — all Professional-only.
   },
   {
     // Worked example — Core list sourced verbatim; Neonatal EMR Conditional unless NICU attached
@@ -412,6 +514,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Health Packages", "CRM & Marketing"],
     usuallyNotRequired: ["Dialysis Unit", "Oncology", "Obstetric ANC", "Mortuary & Medico-Legal", "Govt Schemes / PMJAY"],
     inferred: false,
+    defaultPlanSlug: "professional", // Vaccination + Dietetics & Nutrition both core — both Professional-only.
   },
 
   // ───────────────────────── DIAGNOSTIC & PROCEDURE ─────────────────────────
@@ -425,6 +528,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing"],
     usuallyNotRequired: ["IPD / Wards", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "clinic", // OPD + Day Care + Pharmacy Retail — exactly the Clinic plan's module set, no gaps.
   },
   {
     key: "diagnostic_pathology_lab_chain",
@@ -436,6 +540,13 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Patient Portal", "Communication Inbox", "Notifications", "Analytics & BI"],
     usuallyNotRequired: ["OPD Queue", "IPD / Wards", "Operation Theatre", "Emergency", "Pharmacy (IP)", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    // Core is just Laboratory + Radiology — both true on Starter (Clinic's module set has no
+    // Radiology, so Clinic would leave this type unable to run its second core workflow).
+    // PLAN FIT GAP: "chain" in the name implies multi-branch operation, which none of today's
+    // plans are built around (Enterprise's multi-branch feature assumes a bedded hospital's
+    // pricing shape, not a bedless diagnostics network) — flagging for the founder rather than
+    // forcing a fit.
+    defaultPlanSlug: "starter",
   },
   {
     key: "trauma_emergency_centre",
@@ -447,6 +558,7 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "Notifications"],
     usuallyNotRequired: ["Obstetric ANC", "Neonatal EMR", "IVF & ART", "Oncology", "Dialysis Unit", "Govt Schemes / PMJAY"],
     inferred: true,
+    defaultPlanSlug: "professional", // OT + Blood Bank + Ambulance all core — all Professional-only.
   },
 
   // ───────────────────────── TRADITIONAL & PREVENTIVE ─────────────────────────
@@ -463,6 +575,11 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Laboratory (LIS)", "Radiology (RIS)", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Govt Schemes / PMJAY"],
     subSystems: ["Ayurveda", "Homeopathy", "Unani", "Siddha", "Yoga & Naturopathy"],
     inferred: true,
+    // PLAN FIT GAP: a small single-practitioner AYUSH clinic (coarseType "clinic", no IPD/OT)
+    // can only chart its own system via the AYUSH module, which is Professional-only — forcing
+    // ₹17,999/mo onto a segment that is almost always budget-constrained. Strongest single
+    // candidate in this taxonomy for either an AYUSH add-on on Clinic, or a dedicated AYUSH tier.
+    defaultPlanSlug: "professional",
   },
   {
     key: "wellness_preventive_health_centre",
@@ -474,6 +591,9 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Telemedicine", "Patient Portal", "CRM & Marketing", "Communication Inbox"],
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Obstetric ANC", "Neonatal EMR", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: same pattern as Dermatology — small OPD-only wellness practice forced to
+    // Professional purely because Health Packages (its core service) is gated there.
+    defaultPlanSlug: "professional",
   },
   {
     key: "vaccination_centre",
@@ -485,6 +605,11 @@ export const HOSPITAL_TYPES: HospitalTypeDefinition[] = [
     optional: ["Patient Portal", "Communication Inbox", "Notifications"],
     usuallyNotRequired: ["IPD / Wards", "Operation Theatre", "Emergency", "Laboratory (LIS)", "Radiology (RIS)", "Blood Bank", "CSSD", "Dialysis Unit", "Oncology", "Pharmacy (IP)", "Govt Schemes / PMJAY"],
     inferred: true,
+    // PLAN FIT GAP: a standalone vaccination drive/centre has close to zero other footprint
+    // (no beds, no OT, no pharmacy) yet the Vaccination module itself is Professional-only,
+    // so this tiny operation is suggested the most expensive self-serve tier. Strong candidate
+    // for a cheap Vaccination add-on on Clinic rather than a full tier jump.
+    defaultPlanSlug: "professional",
   },
 ];
 
@@ -495,6 +620,15 @@ export function getHospitalTypesByCategory(category: BroadHospitalCategory | str
 export function getHospitalTypeByKey(key: string | null | undefined): HospitalTypeDefinition | undefined {
   if (!key) return undefined;
   return HOSPITAL_TYPES.find((t) => t.key === key);
+}
+
+/** The `subscription_plans.slug` to suggest on the Choose Plan step for a given hospital-type
+ *  key, or `undefined` if no type (or an unrecognised one) was picked in Step 1. Callers must
+ *  treat this as a SUGGESTION only — never use it to filter/hide other plans, and never block
+ *  proceeding if the plan it names isn't in the live, active plan list (a plan can be renamed or
+ *  deactivated in Plans Manager independently of this taxonomy). */
+export function getDefaultPlanSlug(key: string | null | undefined): string | undefined {
+  return getHospitalTypeByKey(key)?.defaultPlanSlug;
 }
 
 /** Resolves a stored `hospitals.hospital_category` value (new granular key, or a legacy

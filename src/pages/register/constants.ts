@@ -97,7 +97,10 @@ export interface RegistrationData {
   nabhAccredited: boolean;
   nabhNumber: string;
   website: string;
-  plan: "starter" | "professional" | "enterprise" | "";
+  // Plan slugs are admin-configurable (Plans Manager) and fetched live from subscription_plans
+  // in Step4ChoosePlan — "clinic" included here since it's one of the four live plans today, but
+  // this union is a convenience, not a hard contract; the wizard already treats any slug.
+  plan: "clinic" | "starter" | "professional" | "enterprise" | "";
   termsAccepted: boolean;
   dpdpConsent: boolean;
   verificationMethod: "email" | "phone";

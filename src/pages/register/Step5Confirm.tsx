@@ -12,6 +12,7 @@ interface Props {
 }
 
 const planLabels: Record<string, string> = {
+  clinic: "Clinic & Day Care — ₹2,499/mo",
   starter: "Starter — ₹8,999/mo",
   professional: "Professional — ₹18,999/mo",
   enterprise: "Enterprise — Custom",
