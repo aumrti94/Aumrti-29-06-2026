@@ -16,6 +16,25 @@ const corsHeaders = {
 };
 
 const CONTEXT_PROMPTS: Record<string, string> = {
+  // PARITY FIX (frequency format, Ticket B): opd_consultation's prescription[].frequency now
+  // resolves to the same Morning-Afternoon-Evening numeral pattern (e.g. "1-0-1") that
+  // quick_scribe already produces, via the FREQUENCY RULE block ported from quick_scribe below
+  // — RxOrdersTab reads/displays frequency in that numeral form, not a bare OD/BD/TDS/QID
+  // abbreviation (quantity math itself was never broken: prescriptionQuantity.ts's legacy-
+  // abbreviation shim already covered the old format — this is a display/input-format
+  // consistency fix, not a calculation-correctness one). Nalini (CDO) ruling, 2026-10-06.
+  //
+  // This is inline prompt-debt: ai-clinical-voice is NOT yet wired to the prompt_registry
+  // table (unlike ai-resolve-orders/ai-clarifying-questions/ai-history-ingest/whatsapp-bot,
+  // which already read their prompts from it). When this file's prompts are eventually
+  // migrated into prompt_registry, this FREQUENCY RULE block must be carried forward for
+  // opd_consultation as its own entry — do not silently drop it as a duplicate of
+  // quick_scribe's copy.
+  //
+  // ipd_workspace's frequency field (below) deliberately stays OUT OF SCOPE of this fix and
+  // keeps bare-abbreviation form — see that entry's own comment and its "do not normalise BD"
+  // instruction; bedside nursing administration may be a permanently different format from
+  // outpatient dispensing, not merely an un-migrated one.
   opd_consultation: `You are a clinical documentation AI for an Indian hospital. The following is a transcript of a LIVE OPD CONSULTATION — a two-way CONVERSATION between a doctor and a patient (either or both may speak, and it may be in an Indian language). It is NOT a clean dictation of finished notes. Read the whole conversation and extract the clinical information into structured fields.
 
 Capture clinical facts stated by EITHER speaker:
@@ -43,10 +62,10 @@ Return ONLY a JSON object with this exact structure:
   "prescription": [
     {
       "drug_name": "drug name with strength",
-      "dose": "dose",
+      "dose": "strength/formulation ONLY if stated separately from drug name, else empty string — an administration amount like '1 tablet' or 'half tablet' is NOT a dose, it belongs in the frequency pattern, see FREQUENCY RULE below",
       "route": "oral/iv/im etc",
-      "frequency": "OD/BD/TDS/QID/SOS/STAT/HS",
-      "duration": "number of days",
+      "frequency": "Morning-Afternoon-Evening tablet pattern — see FREQUENCY RULE below",
+      "duration": "BARE number of days only, e.g. '15' — never '15 days' or any other unit word, the field is already labelled Days",
       "instructions": "special instructions if any"
     }
   ],
@@ -55,6 +74,24 @@ Return ONLY a JSON object with this exact structure:
   "confidence": 0.85,
   "reasoning": "One sentence explaining the confidence level and key structuring decisions made"
 }
+
+FREQUENCY RULE (prescription[].frequency) — the dosage chart (Morning-Afternoon-Evening) is used to calculate how many tablets to dispense, so it must be a hyphenated numeral pattern, never a bare abbreviation and never a plain English time phrase:
+- Resolve standard Indian shorthand into the pattern, using the tablet amount the doctor stated (default 1 if no amount was said):
+  - OD (once daily) → morning slot only, e.g. "1-0-0"
+  - BD/BID (twice daily) → morning and evening, e.g. "1-0-1"
+  - TDS (thrice daily) → all three, e.g. "1-1-1"
+  - QID (four times daily) → add a fourth slot, e.g. "1-1-1-1"
+  - HS (bedtime) → evening/night slot only, e.g. "0-0-1"
+- The doctor very often names the time(s) of day directly in plain words instead of an abbreviation ("one tablet early in the morning", "half tablet in the afternoon", "one at night") — resolve these exactly the same way, into the SAME numeral pattern, never left as the spoken words:
+  - "morning" / "early morning" / "early in the morning" → the FIRST (morning) slot
+  - "afternoon" / "noon" / "midday" → the SECOND (afternoon) slot
+  - "evening" / "night" / "bedtime" → the THIRD (evening/night) slot
+  - Use the tablet amount stated for that specific time in that slot, and 0 for every slot no time was mentioned for — a single named time is still a full hyphenated pattern with zeros elsewhere (e.g. "1 tablet early in the morning" → "1-0-0"), NEVER a bare "1" and NEVER the words themselves.
+  - Several named times for the same drug fill each of their own slots, e.g. "one in the morning and one at night" → "1-0-1".
+- "half tablet" / "1/2 tablet" → write the fraction as the slot amount, e.g. "1/2-0-0"
+- If the doctor dictates the pattern directly (e.g. "one-zero-one"), use it exactly as stated instead of inferring from an abbreviation or a named time.
+- SOS (as needed) and STAT (one-time) do not have a fixed daily pattern — leave frequency as an empty string and record "SOS" or "STAT" in instructions instead.
+- Never write "OD", "BD", "TDS", "QID", "HS", or a bare time-of-day word ("morning", "afternoon", "night", ...) literally into frequency — always resolve it to the numeral pattern. The tablet amount belongs in this pattern, never in "dose".
 
 FORMATTING (readability):
 - For history_of_present_illness, examination_findings, systemic_examination, plan and follow_up: return a BULLET LIST, NOT a paragraph. Put each distinct clinical point on its own line, beginning with "• " (a bullet character followed by one space). Separate lines with a newline (\n).
@@ -207,13 +244,31 @@ Return ONLY a JSON object with this exact structure:
 {
   "summary": "the presenting complaint and relevant findings, as a short BULLET LIST — one point per line, beginning with '• '",
   "medicines": [
-    { "drug_name": "drug name with strength", "dose": "dose", "frequency": "OD/BD/TDS/QID/SOS/STAT/HS", "duration": "number of days", "instructions": "special instructions if any" }
+    { "drug_name": "drug name with strength", "dose": "strength/formulation ONLY if stated separately from drug name, else empty string — an administration amount like '1 tablet' or 'half tablet' is NOT a dose, it belongs in the frequency pattern, see FREQUENCY RULE below", "frequency": "Morning-Afternoon-Evening tablet pattern — see FREQUENCY RULE below", "duration": "BARE number of days only, e.g. '15' — never '15 days' or any other unit word, the field is already labelled Days", "instructions": "special instructions if any" }
   ],
   "lab_tests": ["exact test name, e.g. CBC, LFT, KFT, HbA1c, Urine R/M"],
   "radiology_tests": ["exact study name, e.g. Chest X-ray, USG Abdomen, CT Brain"],
   "confidence": 0.85,
   "reasoning": "One sentence explaining the confidence level and key structuring decisions made"
 }
+
+FREQUENCY RULE (medicines[].frequency) — the printed note shows a dosage chart (Morning-Afternoon-Evening), and the number in each slot is used to calculate how many tablets to supply, so it must be a hyphenated numeral pattern, never a bare abbreviation and never a plain English time phrase:
+- Resolve standard Indian shorthand into the pattern, using the tablet amount the doctor stated (default 1 if no amount was said):
+  - OD (once daily) → morning slot only, e.g. "1-0-0"
+  - BD/BID (twice daily) → morning and evening, e.g. "1-0-1"
+  - TDS (thrice daily) → all three, e.g. "1-1-1"
+  - QID (four times daily) → add a fourth slot, e.g. "1-1-1-1"
+  - HS (bedtime) → evening/night slot only, e.g. "0-0-1"
+- The doctor very often names the time(s) of day directly in plain words instead of an abbreviation ("one tablet early in the morning", "half tablet in the afternoon", "one at night") — resolve these exactly the same way, into the SAME numeral pattern, never left as the spoken words:
+  - "morning" / "early morning" / "early in the morning" → the FIRST (morning) slot
+  - "afternoon" / "noon" / "midday" → the SECOND (afternoon) slot
+  - "evening" / "night" / "bedtime" → the THIRD (evening/night) slot
+  - Use the tablet amount stated for that specific time in that slot, and 0 for every slot no time was mentioned for — a single named time is still a full hyphenated pattern with zeros elsewhere (e.g. "1 tablet early in the morning" → "1-0-0"), NEVER a bare "1" and NEVER the words themselves.
+  - Several named times for the same drug fill each of their own slots, e.g. "one in the morning and one at night" → "1-0-1".
+- "half tablet" / "1/2 tablet" → write the fraction as the slot amount, e.g. "1/2-0-0"
+- If the doctor dictates the pattern directly (e.g. "one-zero-one"), use it exactly as stated instead of inferring from an abbreviation or a named time.
+- SOS (as needed) and STAT (one-time) do not have a fixed daily pattern — leave frequency as an empty string and record "SOS" or "STAT" in instructions instead.
+- Never write "OD", "BD", "TDS", "QID", "HS", or a bare time-of-day word ("morning", "afternoon", "night", ...) literally into frequency — always resolve it to the numeral pattern. The tablet amount belongs in this pattern, never in "dose".
 
 Rules:
 - Include a medicine, lab test, or radiology test ONLY if it was explicitly spoken — do not add anything routine or assumed.

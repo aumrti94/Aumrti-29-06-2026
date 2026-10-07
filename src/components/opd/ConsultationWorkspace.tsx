@@ -30,6 +30,7 @@ import OphthalmologySheet from "@/components/specialty/OphthalmologySheet";
 import { sendWhatsApp } from "@/lib/whatsapp-send";
 import { isRadiologyKeyword } from "@/lib/investigationSync";
 import { resolveDrugStock, calcDrugQuantity } from "@/lib/drugStock";
+import { formatDuration, normalizeDurationDays } from "@/lib/prescriptionQuantity";
 import { loadOrderCatalogue, resolveOrders } from "@/lib/orderCatalogue";
 import { printDocument, printHeader } from "@/lib/printUtils";
 import { buildInvestigationResultsHtml } from "@/lib/investigationPrint";
@@ -111,6 +112,31 @@ export interface DrugEntry {
   catalogue_id?: string;
   /** Units on hand across non-expired, active batches. */
   stock_qty?: number;
+  /** How this line entered the prescription. Absent/"manual" = typed or templated through
+   *  RxOrdersTab's Add Drug form, which already gates on checkDrugSafety before it ever
+   *  appends. "voice" means it was matched from a dictated transcript — see
+   *  `safety_status`/`ai_unreviewed` below for the gates that apply only to this source. */
+  source?: "manual" | "voice";
+  /**
+   * The drug-interaction/allergy/duplicate gate, for a voice-added line only:
+   *   - "pending": landed on the prescription, not yet run through checkDrugSafety.
+   *   - "cleared": checked, no issues.
+   *   - "ack" / "override": checked, had issues, doctor explicitly added anyway / overrode
+   *     with a reason (mirrors the manual-add modal's two resolutions).
+   *   - "issues_unresolved": checked, had issues, doctor dismissed the modal without
+   *     resolving them — stays visibly flagged rather than silently treated as reviewed.
+   * Undefined for a manually-added drug that hasn't been touched since: the gate already ran
+   * before it was appended, so there was nothing left to track — until RxOrdersTab's inline
+   * row lets the doctor edit an already-prescribed drug's name in place, which resets this to
+   * "pending" for ANY source, manual included, since the identity (and therefore the prior
+   * clearance) just changed.
+   */
+  safety_status?: "pending" | "cleared" | "ack" | "override" | "issues_unresolved";
+  /** Set on every voice-added drug; cleared only when the doctor explicitly confirms the
+   *  matched drug identity is correct (Dr. Nalini's condition on T3 — a fuzzy/phonetic
+   *  catalogue match can clear checkDrugSafety cleanly while having matched the WRONG drug,
+   *  which is a different kind of "verified" than a clean safety check). */
+  ai_unreviewed?: boolean;
 }
 
 /**
@@ -424,16 +450,28 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
       // Prescriptions and orders land immediately as "unresolved", then an async pass
       // matches them to this hospital's catalogue and stock (see enrichVoiceOrders).
       // Filling first keeps the UI instant; enrichment only adds badges and quantities.
+      // `source: "voice"` + `safety_status: "pending"` route this drug through RxOrdersTab's
+      // checkDrugSafety gate (the SAME interaction/allergy/duplicate check a manually-added
+      // drug gets) as soon as it renders there — see the pending-voice-safety effect in
+      // RxOrdersTab.tsx. Before this, a voice-matched drug went straight onto the
+      // prescription with no safety check at all. `ai_unreviewed: true` is the separate,
+      // longer-lived flag: it survives a clean safety check and is only cleared when the
+      // doctor explicitly confirms the matched drug identity is correct.
       const drugs: DrugEntry[] = ((data.prescription as DrugEntry[]) || []).map((d) => ({
         drug_name: d.drug_name || "",
         dose: d.dose || "",
         route: d.route || "Oral",
         frequency: d.frequency || "OD",
-        duration_days: (d as unknown as Record<string, string>).duration || "",
+        // normalizeDurationDays strips a unit word the model wrote despite being told not to
+        // ("15 days" → "15") — the Days field should only ever hold a bare number.
+        duration_days: normalizeDurationDays((d as unknown as Record<string, string>).duration || ""),
         instructions: d.instructions || "",
         quantity: "",
         is_stat: false,
         availability: "unresolved",
+        source: "voice",
+        safety_status: "pending",
+        ai_unreviewed: true,
       }));
 
       const isRadiology = (name: string) =>
@@ -1008,7 +1046,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
             <td><b>${d.drug_name}</b></td>
             <td>${d.dose}</td>
             <td>${d.frequency}</td>
-            <td>${d.duration_days} days</td>
+            <td>${formatDuration(d.duration_days, " days")}</td>
             <td style="font-size:11px">${d.instructions}</td>
           </tr>`).join("")}
         </table>`
@@ -1205,8 +1243,14 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
 
       const nextDrugs = prev.drugs.map((d) => {
         if (!addedDrugNames.has(d.drug_name) || d.availability !== "unresolved") return d;
+        // Quantity is purely frequency x duration — it has nothing to do with whether this
+        // hospital's catalogue has the drug. It used to be computed only inside the "matched"
+        // branch below, so a drug that failed catalogue matching (shown as "Unmatched") kept
+        // a blank Qty forever even though the prescription still needs a correct quantity for
+        // the patient to buy the right amount outside.
+        const quantity = d.quantity || calcDrugQuantity(d.dose, d.frequency, d.duration_days);
         const hit = stock.get(d.drug_name);
-        if (!hit) return { ...d, availability: "unresolved" as const };
+        if (!hit) return { ...d, availability: "unresolved" as const, quantity };
         return {
           ...d,
           // Canonical catalogue spelling, so the pharmacy screen and the bill agree.
@@ -1217,7 +1261,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
           is_ndps: hit.is_ndps,
           stock_qty: hit.total_stock,
           availability: hit.total_stock > 0 ? ("in_stock" as const) : ("not_stocked" as const),
-          quantity: d.quantity || calcDrugQuantity(d.dose, d.frequency, d.duration_days),
+          quantity,
         };
       });
 
@@ -1677,7 +1721,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
       return;
     }
     const phone = token.patient.phone.replace(/\D/g, "");
-    const drugList = prescription.drugs.map((d) => `• ${d.drug_name} - ${d.dose} - ${d.frequency} - ${d.duration_days} days`).join("\n");
+    const drugList = prescription.drugs.map((d) => `• ${d.drug_name} - ${d.dose} - ${d.frequency} - ${formatDuration(d.duration_days, " days")}`).join("\n");
     const labList = prescription.lab_orders.map((l) => l.test_name).join(", ");
     const msg = `🏥 *Prescription*\n*Patient:* ${token.patient.full_name}\n📅 ${new Date().toLocaleDateString("en-IN")}\n\n💊 *Medicines:*\n${drugList || "None"}\n\n🔬 *Lab Tests:* ${labList || "None"}\n\n📋 *Advice:* ${prescription.advice_notes || "—"}\n📅 *Review:* ${prescription.review_date || "As needed"}`;
     await sendWhatsApp({ hospitalId: hospitalId ?? "", phone: `91${phone}`, message: msg });

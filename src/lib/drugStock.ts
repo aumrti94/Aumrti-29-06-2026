@@ -18,6 +18,7 @@
 
 import { supabase } from "@/integrations/supabase/client";
 import { normalizeTerm, phoneticNormalize, similarityRatio } from "@/lib/medicalLexicon";
+import { calcQuantity } from "@/lib/prescriptionQuantity";
 
 export interface DrugStockInfo {
   /** drug_master.id */
@@ -184,19 +185,17 @@ export function stripStrength(name: string): string {
 }
 
 /**
- * Units to dispense for a course. Mirrors calcQty in RxOrdersTab so a voice-added drug is
- * quantified the same way a hand-picked one is — without a quantity there is nothing to
- * check against stock and nothing to bill.
+ * Units to dispense for a course, delegating to the shared M-A-E pattern math in
+ * prescriptionQuantity.ts so a voice-added drug is quantified the same (correct) way a
+ * hand-picked one is — without a quantity there is nothing to check against stock and
+ * nothing to bill.
+ *
+ * This used to multiply the DOSE STRENGTH by a frequency lookup by days — e.g.
+ * Paracetamol 650mg x TDS x 5 days computed 9750 instead of 15 — the same bug RxOrdersTab's
+ * old calcQty had, explicitly mirrored from it. `dose` is kept as a parameter only for
+ * call-site compatibility (ConsultationWorkspace.enrichVoiceOrders); the quantity formula
+ * does not use dose strength at all.
  */
-export const FREQ_PER_DAY: Record<string, number> = {
-  OD: 1, HS: 1, BD: 2, TDS: 3, QID: 4, Q6H: 4, Q8H: 3, Q12H: 2, SOS: 1, STAT: 1,
-};
-
-export function calcDrugQuantity(dose: string, frequency: string, durationDays: string): string {
-  const perDose = parseFloat((dose ?? "").match(/\d+(\.\d+)?/)?.[0] ?? "1") || 1;
-  const perDay = FREQ_PER_DAY[(frequency ?? "").toUpperCase()] ?? 1;
-  const days = parseInt(durationDays ?? "", 10);
-  if (!Number.isFinite(days) || days <= 0) return "";
-  const qty = Math.ceil(perDose * perDay * days);
-  return qty > 0 ? String(qty) : "";
+export function calcDrugQuantity(_dose: string, frequency: string, durationDays: string): string {
+  return calcQuantity(frequency, durationDays);
 }

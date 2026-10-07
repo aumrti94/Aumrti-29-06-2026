@@ -18,6 +18,14 @@ interface Props {
   onChange: (text: string) => void;
   /** A drug picked from the Drug Master dropdown. */
   onSelect: (drug: DrugSearchRow) => void;
+  /** Fired alongside the field's own focus handling — lets a caller that edits an
+   *  already-committed drug (e.g. a row already on a prescription) note the value an edit
+   *  started from, without this component needing to know anything about that use case. */
+  onFocus?: () => void;
+  /** Fired alongside the field's own blur handling (after the dropdown-close timeout is
+   *  scheduled, not after it fires — so a caller can compare start-of-edit vs. end-of-edit
+   *  value immediately on blur). */
+  onBlur?: () => void;
   placeholder?: string;
   className?: string;
   inputClassName?: string;
@@ -30,7 +38,7 @@ interface Props {
  * it can be dropped anywhere a drug name is entered (Add Drug, Rx templates, …).
  */
 const DrugMasterSearchInput: React.FC<Props> = ({
-  value, hospitalId, onChange, onSelect,
+  value, hospitalId, onChange, onSelect, onFocus, onBlur,
   placeholder = "Search drug name…", className = "", inputClassName = "", autoFocus,
 }) => {
   const [results, setResults] = useState<DrugSearchRow[]>([]);
@@ -71,8 +79,8 @@ const DrugMasterSearchInput: React.FC<Props> = ({
         autoFocus={autoFocus}
         value={value}
         onChange={(e) => { justPickedRef.current = null; onChange(e.target.value); setOpen(true); }}
-        onFocus={() => setOpen(true)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        onFocus={() => { setOpen(true); onFocus?.(); }}
+        onBlur={() => { setTimeout(() => setOpen(false), 150); onBlur?.(); }}
         onKeyDown={(e) => { if (e.key === "Escape") setOpen(false); }}
         placeholder={placeholder}
         className={inputClassName}

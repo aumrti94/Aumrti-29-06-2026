@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
 import { X, Plus, AlertTriangle, ShieldX, CheckCircle2, Pencil, RotateCcw, Clock, FileText } from "lucide-react";
@@ -16,6 +16,7 @@ import type { RxQuickPickTemplate, TestGroupOrderEntry } from "@/lib/quickPickDe
 import QuickPickManagerPanel from "@/components/opd/QuickPickManagerPanel";
 import DrugMasterSearchInput from "@/components/opd/DrugMasterSearchInput";
 import TestGroupPickerModal from "@/components/opd/TestGroupPickerModal";
+import SectionChip from "@/components/quick-scribe/SectionChip";
 import {
   loadOrderCatalogue,
   matchOrderNameDetailed,
@@ -23,6 +24,8 @@ import {
 } from "@/lib/orderCatalogue";
 import { resolveOrdersWithAI } from "@/lib/orderCatalogueAI";
 import { useAIFeature } from "@/hooks/useAIFeature";
+import { calcQuantity, perDayDose, formatDuration } from "@/lib/prescriptionQuantity";
+import { logNABHEvidence } from "@/lib/nabh-evidence";
 
 interface Props {
   prescription: PrescriptionData;
@@ -42,21 +45,6 @@ interface Props {
   /** The prescriber. An override with no author is not an audit trail (P4-S11). */
   userId?: string | null;
 }
-
-
-const FREQ_PER_DAY: Record<string, number> = {
-  OD: 1, QD: 1, HS: 1, SOS: 1, STAT: 1, AC: 1, PC: 1,
-  BD: 2,
-  TDS: 3,
-  QID: 4,
-};
-
-const calcQty = (dose: string, frequency: string, days: string): number => {
-  const doseNum = parseFloat(dose) || 1;
-  const freqPerDay = FREQ_PER_DAY[frequency?.toUpperCase()] ?? 1;
-  const d = parseInt(days || "0", 10) || 0;
-  return d > 0 ? Math.ceil(doseNum * freqPerDay * d) : 0;
-};
 
 
 const templateToDrugEntry = (t: RxQuickPickTemplate): DrugEntry => ({
@@ -121,10 +109,11 @@ export const OrderStateChip: React.FC<{ state: OrderState | null; className?: st
 const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, patientAllergies = [], encounterId, admissionId, patientId, userId }) => {
   const { toast } = useToast();
   const routeOptions     = useConfigValues("drug_routes");
-  const frequencyOptions = useConfigValues("drug_frequencies");
+  // `drug_frequencies` (OD/BD/TDS/QID) is still read by IPD's medication tabs — this tab now
+  // takes the M-A-E pattern as free text instead, so it no longer reads the config key.
   const [showAddDrug, setShowAddDrug] = useState(false);
   const [showRxManager, setShowRxManager] = useState(false);
-  const [newTemplate, setNewTemplate] = useState<RxQuickPickTemplate>({ drug_name: "", dose: "", route: "Oral", frequency: "OD", duration_days: "", instructions: "", quantity: "" });
+  const [newTemplate, setNewTemplate] = useState<RxQuickPickTemplate>({ drug_name: "", dose: "", route: "Oral", frequency: "", duration_days: "", instructions: "", quantity: "" });
   const [addingTemplate, setAddingTemplate] = useState(false);
   const [showLabManager, setShowLabManager] = useState(false);
   const [showRadManager, setShowRadManager] = useState(false);
@@ -137,7 +126,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
   const { items: testOrderPrefs, save: saveTestOrder } =
     useDoctorQuickPicks<TestGroupOrderEntry>("test_group_order");
   const [searchQuery, setSearchQuery] = useState("");
-  const [newDrug, setNewDrug] = useState<DrugEntry>({ drug_name: "", dose: "", route: "Oral", frequency: "OD", duration_days: "", instructions: "", quantity: "", is_stat: false });
+  const [newDrug, setNewDrug] = useState<DrugEntry>({ drug_name: "", dose: "", route: "Oral", frequency: "", duration_days: "", instructions: "", quantity: "", is_stat: false });
   const [labInput, setLabInput] = useState("");
   const [radInput, setRadInput] = useState("");
   const [labMaster, setLabMaster] = useState<{ name: string; category: string }[]>([]);
@@ -167,6 +156,14 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
   const [drugSafetyMeta, setDrugSafetyMeta] = useState<Map<number, DrugSafetyMeta>>(new Map());
   const [showAntibioticModal, setShowAntibioticModal] = useState(false);
   const [antibioticJustified, setAntibioticJustified] = useState(false);
+  /** Set while the safety modal is open FOR an already-on-the-prescription drug being
+   *  RE-checked in place — originally only a voice-added drug landing with
+   *  `safety_status: "pending"`, now also any drug whose name is edited directly in the
+   *  compact Rx row (identity changed, so the prior clearance no longer applies). Named for
+   *  its original voice-only case; `pendingDrug` is the separate not-yet-appended
+   *  manual/template drug. Lets the same modal and the same two resolutions (Add Anyway /
+   *  Override) update the existing row in place instead of appending a second one. */
+  const [pendingVoiceIndex, setPendingVoiceIndex] = useState<number | null>(null);
 
   // Fetch lab tests, groups, and radiology modalities from DB
   useEffect(() => {
@@ -510,17 +507,108 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
     }
   };
 
+  /**
+   * MOM.3 ("Medication orders are legible, dated, timed, and authenticated") — the criterion
+   * code already used for medication-administration/reconciliation evidence elsewhere
+   * (MedReconciliationPanel.tsx uses MOM.4 for reconciliation; this is the ordering-side
+   * equivalent). Fired once a drug is actually committed to the prescription and, for a
+   * voice-added one, once it has cleared (or been explicitly overridden past) the safety
+   * gate — not on every keystroke, and never for a drug still sitting in "pending" review.
+   */
+  const logPrescribingEvidence = (drug: DrugEntry, channel: "manual" | "voice") => {
+    if (!hospitalId) return;
+    const parts = [drug.dose, drug.frequency, formatDuration(drug.duration_days, "d")].filter(Boolean);
+    void logNABHEvidence(
+      hospitalId,
+      "MOM.3",
+      `Medication order placed${channel === "voice" ? " via voice dictation" : ""}: ${drug.drug_name}` +
+        (parts.length ? ` (${parts.join(", ")})` : ""),
+      "compliant",
+    );
+  };
+
   const addDrugDirect = (drug: DrugEntry) => {
     onChange({ drugs: [...prescription.drugs, drug] });
+    logPrescribingEvidence(drug, "manual");
     resetAddForm();
   };
 
   const resetAddForm = () => {
-    setNewDrug({ drug_name: "", dose: "", route: "Oral", frequency: "OD", duration_days: "", instructions: "", quantity: "", is_stat: false });
+    setNewDrug({ drug_name: "", dose: "", route: "Oral", frequency: "", duration_days: "", instructions: "", quantity: "", is_stat: false });
     setSearchQuery("");
     setShowAddDrug(false);
     setPendingDrug(null);
   };
+
+  /** Update one existing drug row in place, by index — used for the voice-safety gate, which
+   *  resolves a drug that is already on the prescription rather than appending a new one. */
+  const updateDrugAt = (index: number, patch: Partial<DrugEntry>) => {
+    onChange({ drugs: prescription.drugs.map((d, i) => (i === index ? { ...d, ...patch } : d)) });
+  };
+
+  /**
+   * The SAME interaction/allergy/duplicate gate a manually-added drug gets
+   * (`performSafetyCheck` above), run against a drug that is already sitting on the
+   * prescription with `safety_status: "pending"`. Two cases land here: a drug that arrived
+   * via voice dictation (`fillFn` in ConsultationWorkspace.tsx marks every voice drug
+   * "pending" the instant it lands), and ANY drug — voice- or manually-sourced — whose name
+   * was just edited in place in the compact Rx row (`editDrugField` below resets
+   * `safety_status` to "pending" on a name change, since a changed identity invalidates
+   * whatever safety result applied to the old name). The effect below picks either case up
+   * as soon as it renders here.
+   *
+   * Runs one drug at a time (never while the modal is already open for another), so editing
+   * or dictating several drugs in a row surfaces separate, undismissable-by-inaction alerts
+   * rather than one batched summary — "clinical alerts... never silenced or batched."
+   */
+  const runVoiceSafetyCheck = useCallback(async (index: number) => {
+    const drug = prescription.drugs[index];
+    if (!drug || drug.safety_status !== "pending") return;
+    setChecking(true);
+    const currentDrugNames = prescription.drugs.filter((_, i) => i !== index).map((d) => d.drug_name);
+    try {
+      const result = await checkDrugSafety(drug.drug_name, currentDrugNames, patientAllergies, hospitalId ?? "");
+      if (result.hasIssues) {
+        setSafetyResult(result);
+        setPendingVoiceIndex(index);
+        setShowSafetyModal(true);
+      } else {
+        updateDrugAt(index, { safety_status: "cleared" });
+        logPrescribingEvidence(drug, drug.source === "voice" ? "voice" : "manual");
+        setSafeFlash(true);
+        setTimeout(() => setSafeFlash(false), 1500);
+      }
+    } catch (e) {
+      // Same fail-loud shape as performSafetyCheck's catch — an incomplete check must block
+      // on the modal, never silently clear.
+      setSafetyResult({
+        hasIssues: true,
+        interactions: [],
+        allergyConflicts: [],
+        duplicates: [],
+        worstSeverity: "major",
+        checkUnavailable: true,
+        unavailableReasons: [`Drug safety check failed: ${e instanceof Error ? e.message : String(e)}`],
+      });
+      setPendingVoiceIndex(index);
+      setShowSafetyModal(true);
+    } finally {
+      setChecking(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prescription.drugs, patientAllergies, hospitalId]);
+
+  // Picks up the next drug still awaiting its safety check — voice-added on arrival, or any
+  // drug whose name was just edited in place. Gated on `!showSafetyModal` so it never starts
+  // a second check (and a second modal) while one is already open — each pending drug gets
+  // its own turn instead of overlapping.
+  useEffect(() => {
+    if (showSafetyModal || checking) return;
+    const idx = prescription.drugs.findIndex((d) => d.safety_status === "pending");
+    if (idx === -1) return;
+    void runVoiceSafetyCheck(idx);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prescription.drugs, showSafetyModal, checking]);
 
   // Save the drug currently in the Add Drug form as a reusable Quick Template
   // (doctor's rx_templates). Save-only: it does NOT add the drug to this
@@ -549,7 +637,20 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
   };
 
   const handleSafetyAddAnyway = () => {
-    if (pendingDrug && safetyResult) {
+    if (pendingVoiceIndex !== null && safetyResult) {
+      // Voice-added drug, already on the prescription — resolve in place rather than append.
+      const drug = prescription.drugs[pendingVoiceIndex];
+      updateDrugAt(pendingVoiceIndex, { safety_status: "ack" });
+      setDrugSafetyMeta((prev) => {
+        const next = new Map(prev);
+        next.set(pendingVoiceIndex, {
+          severity: "interaction",
+          tooltip: safetyResult.interactions.map((i) => `${i.drug_a} + ${i.drug_b}: ${i.clinical_effect}`).join("; "),
+        });
+        return next;
+      });
+      if (drug) logPrescribingEvidence(drug, drug.source === "voice" ? "voice" : "manual");
+    } else if (pendingDrug && safetyResult) {
       const newIndex = prescription.drugs.length;
       addDrugDirect(pendingDrug);
       // Mark with interaction badge
@@ -564,12 +665,18 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
     }
     setShowSafetyModal(false);
     setSafetyResult(null);
+    setPendingVoiceIndex(null);
   };
 
   const handleSafetyOverride = (reason: string) => {
-    if (pendingDrug && safetyResult) {
-      const newIndex = prescription.drugs.length;
-      addDrugDirect(pendingDrug);
+    const overriddenDrug = pendingVoiceIndex !== null ? prescription.drugs[pendingVoiceIndex] : pendingDrug;
+    if (overriddenDrug && safetyResult) {
+      const newIndex = pendingVoiceIndex !== null ? pendingVoiceIndex : prescription.drugs.length;
+      if (pendingVoiceIndex !== null) {
+        updateDrugAt(pendingVoiceIndex, { safety_status: "override" });
+      } else {
+        addDrugDirect(overriddenDrug);
+      }
       // Log the override via clinical_alerts.
       //
       // BUG-P4-004: this insert previously carried only hospital_id, alert_type, severity and
@@ -590,7 +697,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
             alert_type: "drug_override",
             severity: "critical",
             alert_message:
-              `Drug safety override: ${pendingDrug.drug_name} added despite ${safetyResult.worstSeverity} alert` +
+              `Drug safety override: ${overriddenDrug.drug_name} added despite ${safetyResult.worstSeverity} alert` +
               `${conflicts ? ` (allergy conflict: ${conflicts})` : ""}. Reason: ${reason}`,
           } as never)
           .then(({ error }) => {
@@ -598,7 +705,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
               // A silent failure here recreates the exact gap this fix closes.
               toast({
                 title: "Override not recorded",
-                description: `${pendingDrug.drug_name} was added but the override could not be written to the patient record: ${error.message}`,
+                description: `${overriddenDrug.drug_name} was added but the override could not be written to the patient record: ${error.message}`,
                 variant: "destructive",
               });
             }
@@ -612,15 +719,26 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
         });
         return next;
       });
+      if (pendingVoiceIndex !== null) logPrescribingEvidence(overriddenDrug, overriddenDrug.source === "voice" ? "voice" : "manual");
     }
     setShowSafetyModal(false);
     setSafetyResult(null);
+    setPendingVoiceIndex(null);
   };
 
   const handleSafetyClose = () => {
+    // For a voice-added drug the row is already on the prescription — closing without a
+    // decision cannot make it vanish the way declining a not-yet-appended manual drug does.
+    // It is marked "issues_unresolved" instead of being silently left "pending" (which would
+    // otherwise just re-trigger this same modal again on the next render) and stays flagged
+    // on screen until the doctor deliberately reopens and resolves it.
+    if (pendingVoiceIndex !== null) {
+      updateDrugAt(pendingVoiceIndex, { safety_status: "issues_unresolved" });
+    }
     setShowSafetyModal(false);
     setSafetyResult(null);
     setPendingDrug(null);
+    setPendingVoiceIndex(null);
   };
 
   const removeDrug = (i: number) => {
@@ -708,6 +826,50 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
     );
   };
 
+  /**
+   * A voice-added drug the safety modal was dismissed on without a decision. Unlike the
+   * other voice states this one needs an explicit re-entry point — leaving it silently
+   * "pending" again would just re-trigger the modal through the effect above on the very
+   * next render, with no way for the doctor to choose to look at it later instead.
+   */
+  const reviewVoiceSafety = (index: number) => {
+    updateDrugAt(index, { safety_status: "pending" });
+  };
+
+  /**
+   * Edit one field on an already-prescribed drug in place, in the compact Rx row. Two side
+   * effects beyond the raw field write:
+   *  - A frequency or duration edit recomputes Qty the same way the Add Drug form does, via
+   *    the shared `calcQuantity` — the doctor never has to redo the arithmetic by hand.
+   *  - A drug-name edit changes WHICH drug this row is, so any prior safety clearance no
+   *    longer applies to it: this resets `safety_status` to "pending", which re-runs the
+   *    SAME interaction/allergy/duplicate gate through `runVoiceSafetyCheck`'s effect above,
+   *    for a manually- or voice-added row alike. For a voice-sourced row it also re-arms the
+   *    "AI-added — unreviewed" badge, since a confirmed identity was a confirmation of the
+   *    OLD name.
+   */
+  const editDrugField = (index: number, patch: Partial<DrugEntry>) => {
+    const drug = prescription.drugs[index];
+    if (!drug) return;
+    const next: Partial<DrugEntry> = { ...patch };
+    if ("frequency" in patch || "duration_days" in patch) {
+      const merged = { ...drug, ...next };
+      const q = calcQuantity(merged.frequency || "", merged.duration_days || "");
+      if (q) next.quantity = q;
+    }
+    if ("drug_name" in patch && patch.drug_name !== drug.drug_name) {
+      next.safety_status = "pending";
+      if (drug.source === "voice") next.ai_unreviewed = true;
+    }
+    updateDrugAt(index, next);
+  };
+
+  /** Drug name at the moment an in-place edit of an existing row started focus, keyed by row
+   *  index — lets the safety recheck above fire once on blur (an actual finished edit)
+   *  instead of on every keystroke, which would otherwise fire a fresh interaction/allergy
+   *  check mid-typing and spam the safety-check effect. */
+  const editStartName = useRef<Map<number, string>>(new Map());
+
   return (
     <div className="h-full flex overflow-hidden relative">
       {/* Main prescription area */}
@@ -732,28 +894,143 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
             </button>
           </div>
 
-          {prescription.drugs.map((drug, i) => (
-            <div key={i} className="bg-muted/50 rounded-lg p-2.5 mb-1.5 relative group">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-bold text-foreground">{drug.drug_name}</span>
-                {drug.is_ndps && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-px rounded-full font-bold">NDPS</span>}
-                <AvailabilityBadge availability={drug.availability} stockQty={drug.stock_qty} />
-                {getSafetyBadge(i)}
-              </div>
-              <div className="flex gap-2 mt-1 flex-wrap">
-                {[drug.dose, drug.route, drug.frequency, `${drug.duration_days}d`].filter(Boolean).map((v, j) => (
-                  <span key={j} className="text-[11px] bg-muted text-muted-foreground px-2 py-px rounded">{v}</span>
-                ))}
-                {drug.quantity && (
-                  <span className="text-[11px] bg-amber-100 text-amber-700 px-2 py-px rounded font-medium">Qty: {drug.quantity}</span>
+          {/* Compact, directly-editable row per drug — same shape as Quick Scribe's medicine
+              row (Drug | Dose | M-A-E | Days | Qty), so changing anything here no longer means
+              removing the drug and reopening Add Drug. Badges (NDPS, availability, safety
+              state, AI-provenance) render on a second line ONLY when at least one applies, so
+              the common case — a clean, already-reviewed drug — stays a single row. */}
+          {prescription.drugs.map((drug, i) => {
+            const hasBadges = !!drug.is_ndps
+              || (!!drug.availability && drug.availability !== "in_stock")
+              || drug.safety_status === "pending"
+              || drug.safety_status === "issues_unresolved"
+              || drugSafetyMeta.has(i)
+              || (drug.source === "voice" && !!drug.ai_unreviewed);
+            return (
+              <div key={i} className="rounded-lg border border-border bg-muted/30 p-1.5 mb-1.5">
+                <div className="grid grid-cols-12 gap-1.5 items-center">
+                  <DrugMasterSearchInput
+                    className="col-span-3"
+                    value={drug.drug_name}
+                    hospitalId={hospitalId}
+                    onChange={(text) => updateDrugAt(i, { drug_name: text })}
+                    onSelect={(r) => {
+                      editStartName.current.delete(i);
+                      editDrugField(i, { drug_name: r.drug_name, is_ndps: r.is_ndps });
+                    }}
+                    onFocus={() => {
+                      if (!editStartName.current.has(i)) editStartName.current.set(i, drug.drug_name);
+                    }}
+                    onBlur={() => {
+                      const startedAt = editStartName.current.get(i);
+                      editStartName.current.delete(i);
+                      // Only a genuine rename re-arms the safety gate — re-running it on
+                      // every focus/blur with no actual edit would re-check a drug that
+                      // never changed.
+                      if (startedAt !== undefined && startedAt !== drug.drug_name) {
+                        editDrugField(i, { drug_name: drug.drug_name });
+                      }
+                    }}
+                    placeholder="Drug"
+                    inputClassName="w-full h-8 px-2 border border-border rounded text-sm outline-none focus:border-primary bg-background text-foreground font-semibold"
+                  />
+                  <input
+                    value={drug.dose}
+                    onChange={(e) => updateDrugAt(i, { dose: e.target.value })}
+                    placeholder="Dose"
+                    className="col-span-1 h-8 px-1.5 border border-border rounded text-sm outline-none bg-background text-foreground"
+                  />
+                  <select
+                    value={drug.route}
+                    onChange={(e) => updateDrugAt(i, { route: e.target.value })}
+                    title="Route"
+                    className="col-span-1 h-8 px-0.5 border border-border rounded text-xs outline-none bg-background text-foreground"
+                  >
+                    {routeOptions.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
+                  </select>
+                  <input
+                    value={drug.frequency}
+                    onChange={(e) => editDrugField(i, { frequency: e.target.value })}
+                    placeholder="M-A-E e.g. 1-0-1"
+                    title="Morning-Afternoon-Evening, e.g. 1-0-1 or 1/2-0-0"
+                    className="col-span-2 h-8 px-2 border border-border rounded text-sm outline-none bg-background text-foreground"
+                  />
+                  <input
+                    value={drug.duration_days}
+                    onChange={(e) => editDrugField(i, { duration_days: e.target.value })}
+                    placeholder="Days"
+                    className="col-span-1 h-8 px-1.5 border border-border rounded text-sm outline-none bg-background text-foreground"
+                  />
+                  <input
+                    value={drug.quantity}
+                    onChange={(e) => updateDrugAt(i, { quantity: e.target.value })}
+                    placeholder="Qty"
+                    title="Auto-calculated from frequency x days; edit to override"
+                    className="col-span-1 h-8 px-1.5 border border-amber-300 bg-amber-50 rounded text-sm outline-none focus:border-amber-500 text-foreground font-semibold"
+                  />
+                  <input
+                    value={drug.instructions}
+                    onChange={(e) => updateDrugAt(i, { instructions: e.target.value })}
+                    placeholder="Instructions"
+                    className="col-span-2 h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
+                  />
+                  <button
+                    onClick={() => removeDrug(i)}
+                    title="Remove"
+                    className="col-span-1 h-8 flex items-center justify-center text-muted-foreground hover:text-destructive"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+                {hasBadges && (
+                  <div className="flex items-center gap-1.5 flex-wrap mt-1 pl-0.5">
+                    {/* Leads the cluster, and in blue rather than the amber every safety/NDPS
+                        badge below it uses — Kiran's design-law finding was that three
+                        same-weight amber badges read as one undifferentiated pile of warnings.
+                        This one isn't a warning, it's "confirm this is the right drug," and
+                        needs to look like a different KIND of flag at a glance, not just
+                        another shade of the same one. Nalini's condition on wiring the safety
+                        gate: a fuzzy/phonetic catalogue match can clear checkDrugSafety cleanly
+                        while having matched the WRONG drug — a clean safety check and a
+                        confirmed identity are two different things. This persists across a
+                        clean/overridden safety result and only clears on an explicit doctor
+                        click, and re-arms on any rename via editDrugField above. */}
+                    {drug.source === "voice" && drug.ai_unreviewed && (
+                      <span className="inline-flex items-center gap-1">
+                        <SectionChip label="AI-added — unreviewed" tone="info" />
+                        <button
+                          type="button"
+                          onClick={() => updateDrugAt(i, { ai_unreviewed: false })}
+                          title="Confirm this is the correct drug (matched from voice dictation)"
+                          className="text-[9px] font-semibold text-blue-700 underline hover:text-blue-900"
+                        >
+                          Confirm identity
+                        </button>
+                      </span>
+                    )}
+                    {drug.is_ndps && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-px rounded-full font-bold">NDPS</span>}
+                    <AvailabilityBadge availability={drug.availability} stockQty={drug.stock_qty} />
+                    {drug.safety_status === "pending" && (
+                      <span className="inline-flex items-center gap-0.5 text-[9px] bg-slate-200 text-slate-600 px-1.5 py-px rounded-full font-bold">
+                        Checking safety…
+                      </span>
+                    )}
+                    {drug.safety_status === "issues_unresolved" && (
+                      <button
+                        type="button"
+                        onClick={() => reviewVoiceSafety(i)}
+                        title="Safety check found an issue and was dismissed without a decision — click to review it again."
+                        className="inline-flex items-center gap-0.5 text-[9px] bg-destructive/10 text-destructive px-1.5 py-px rounded-full font-bold hover:bg-destructive/20"
+                      >
+                        <AlertTriangle className="h-2.5 w-2.5" /> Safety check needed — Review
+                      </button>
+                    )}
+                    {getSafetyBadge(i)}
+                  </div>
                 )}
               </div>
-              {drug.instructions && <p className="text-xs text-muted-foreground italic mt-1">{drug.instructions}</p>}
-              <button onClick={() => removeDrug(i)} className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                <X className="h-3.5 w-3.5 text-muted-foreground hover:text-destructive" />
-              </button>
-            </div>
-          ))}
+            );
+          })}
 
           {showAddDrug && (
             <div className="border border-border rounded-lg p-3 mt-2 bg-background">
@@ -768,40 +1045,38 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
               <div className="grid grid-cols-4 gap-2 mt-2">
                 <input
                   value={newDrug.dose}
-                  onChange={(e) => setNewDrug((d) => {
-                    const updated = { ...d, dose: e.target.value };
-                    const q = calcQty(updated.dose, updated.frequency, updated.duration_days);
-                    return { ...updated, quantity: q > 0 ? String(q) : updated.quantity };
-                  })}
+                  onChange={(e) => setNewDrug((d) => ({ ...d, dose: e.target.value }))}
                   placeholder="Dose"
                   className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
                 />
                 <select value={newDrug.route} onChange={(e) => setNewDrug((d) => ({ ...d, route: e.target.value }))} className="h-8 px-1 border border-border rounded text-xs outline-none bg-background text-foreground">
                   {routeOptions.map((r) => <option key={r.value} value={r.value}>{r.label}</option>)}
                 </select>
-                <select
+                <input
                   value={newDrug.frequency}
                   onChange={(e) => setNewDrug((d) => {
                     const updated = { ...d, frequency: e.target.value };
-                    const q = calcQty(updated.dose, updated.frequency, updated.duration_days);
-                    return { ...updated, quantity: q > 0 ? String(q) : updated.quantity };
+                    const q = calcQuantity(updated.frequency, updated.duration_days);
+                    return { ...updated, quantity: q || updated.quantity };
                   })}
-                  className="h-8 px-1 border border-border rounded text-xs outline-none bg-background text-foreground"
-                >
-                  {frequencyOptions.map((f) => <option key={f.value} value={f.value}>{f.value}</option>)}
-                </select>
+                  placeholder="M-A-E e.g. 1-0-1"
+                  title="Morning-Afternoon-Evening, e.g. 1-0-1 or 1/2-0-0"
+                  className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
+                />
                 <input
                   value={newDrug.duration_days}
                   onChange={(e) => setNewDrug((d) => {
                     const updated = { ...d, duration_days: e.target.value };
-                    const q = calcQty(updated.dose, updated.frequency, updated.duration_days);
-                    return { ...updated, quantity: q > 0 ? String(q) : updated.quantity };
+                    const q = calcQuantity(updated.frequency, updated.duration_days);
+                    return { ...updated, quantity: q || updated.quantity };
                   })}
                   placeholder="Days"
                   className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
                 />
               </div>
-              {/* Quantity row — auto-calculated, editable */}
+              {/* Quantity row — auto-calculated from Frequency x Days (never from dose
+                  strength — see prescriptionQuantity.ts for the bug that used to multiply by
+                  it), editable */}
               <div className="flex items-center gap-2 mt-2">
                 <span className="text-xs text-muted-foreground font-medium w-16 flex-shrink-0">Quantity</span>
                 <input
@@ -810,11 +1085,12 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                   value={newDrug.quantity}
                   onChange={(e) => setNewDrug((d) => ({ ...d, quantity: e.target.value }))}
                   placeholder="Auto"
-                  className="w-24 h-8 px-2 border border-amber-300 bg-amber-50 rounded text-xs outline-none focus:border-amber-500 text-foreground font-semibold"
+                  title="Auto-calculated from frequency x days; edit to override"
+                  className="w-24 h-8 px-2 border border-amber-300 bg-amber-50 rounded text-sm outline-none focus:border-amber-500 text-foreground font-semibold"
                 />
                 {newDrug.quantity && (
                   <span className="text-[11px] text-amber-700">
-                    = {newDrug.dose || "?"} × {FREQ_PER_DAY[newDrug.frequency?.toUpperCase()] ?? 1}×/day × {newDrug.duration_days || "?"} days
+                    = {perDayDose(newDrug.frequency) ?? "?"}/day × {newDrug.duration_days || "?"} days
                   </span>
                 )}
               </div>
@@ -877,7 +1153,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                     onClick={() => performSafetyCheck(templateToDrugEntry(t))}
                     className="text-[11px] px-2.5 py-1 rounded-full bg-muted/50 border border-border text-muted-foreground hover:bg-muted transition-colors"
                   >
-                    {t.drug_name} {t.frequency} × {t.duration_days}d
+                    {t.drug_name} {t.frequency} × {formatDuration(t.duration_days, "d")}
                   </button>
                 ))}
               </div>
@@ -891,7 +1167,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                   <div className="flex flex-wrap gap-1.5">
                     {rxTemplates.map((t, i) => (
                       <span key={i} className="inline-flex items-center gap-1 text-[11px] px-2.5 py-1 rounded-full bg-background border border-border text-foreground/70">
-                        {t.drug_name} {t.frequency}×{t.duration_days}d
+                        {t.drug_name} {t.frequency}×{formatDuration(t.duration_days, "d")}
                         <button
                           onClick={async () => {
                             const next = rxTemplates.filter((_, idx) => idx !== i);
@@ -924,24 +1200,33 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                         placeholder="Dose"
                         className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
                       />
-                      <select
+                      <input
                         value={newTemplate.frequency}
-                        onChange={e => setNewTemplate(d => ({ ...d, frequency: e.target.value }))}
-                        className="h-8 px-1 border border-border rounded text-xs outline-none bg-background text-foreground"
-                      >
-                        {frequencyOptions.map(f => <option key={f.value} value={f.value}>{f.value}</option>)}
-                      </select>
+                        onChange={e => setNewTemplate(d => {
+                          const updated = { ...d, frequency: e.target.value };
+                          const q = calcQuantity(updated.frequency, updated.duration_days);
+                          return { ...updated, quantity: q || updated.quantity };
+                        })}
+                        placeholder="M-A-E e.g. 1-0-1"
+                        title="Morning-Afternoon-Evening, e.g. 1-0-1 or 1/2-0-0"
+                        className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
+                      />
                       <input
                         value={newTemplate.duration_days}
-                        onChange={e => setNewTemplate(d => ({ ...d, duration_days: e.target.value }))}
+                        onChange={e => setNewTemplate(d => {
+                          const updated = { ...d, duration_days: e.target.value };
+                          const q = calcQuantity(updated.frequency, updated.duration_days);
+                          return { ...updated, quantity: q || updated.quantity };
+                        })}
                         placeholder="Days"
                         className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
                       />
                       <input
                         value={newTemplate.quantity}
                         onChange={e => setNewTemplate(d => ({ ...d, quantity: e.target.value }))}
-                        placeholder="Qty"
-                        className="h-8 px-2 border border-border rounded text-xs outline-none bg-background text-foreground"
+                        placeholder="Qty (auto)"
+                        title="Auto-calculated from frequency x days; edit to override"
+                        className="h-8 px-2 border border-amber-300 bg-amber-50 rounded text-sm outline-none focus:border-amber-500 text-foreground font-semibold"
                       />
                     </div>
                     <input
@@ -956,7 +1241,7 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                         onClick={async () => {
                           if (!newTemplate.drug_name) return;
                           await saveRx([...rxTemplates, newTemplate]);
-                          setNewTemplate({ drug_name: "", dose: "", route: "Oral", frequency: "OD", duration_days: "", instructions: "", quantity: "" });
+                          setNewTemplate({ drug_name: "", dose: "", route: "Oral", frequency: "", duration_days: "", instructions: "", quantity: "" });
                           setAddingTemplate(false);
                         }}
                         className="text-xs bg-primary text-primary-foreground px-3 py-1.5 rounded font-medium hover:bg-primary/90 disabled:opacity-50"
@@ -1374,10 +1659,10 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
       )}
 
       {/* Safety alert modal */}
-      {showSafetyModal && safetyResult && pendingDrug && (
+      {showSafetyModal && safetyResult && (pendingDrug || pendingVoiceIndex !== null) && (
         <DrugSafetyAlertModal
           open={showSafetyModal}
-          drugName={pendingDrug.drug_name}
+          drugName={pendingVoiceIndex !== null ? (prescription.drugs[pendingVoiceIndex]?.drug_name ?? "") : pendingDrug!.drug_name}
           result={safetyResult}
           hospitalId={hospitalId ?? undefined}
           onClose={handleSafetyClose}

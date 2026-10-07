@@ -19,6 +19,7 @@ import {
   type QuickScribeNoteInput,
 } from "@/lib/quickScribePrint";
 import { screenQuickScribeMedicines, describeScreening, type QuickScribeSafetyResult } from "@/lib/quickScribeSafety";
+import { calcQuantity, normalizeDurationDays } from "@/lib/prescriptionQuantity";
 
 interface QuickScribeNote {
   summary: string;
@@ -48,6 +49,9 @@ const QuickScribePage: React.FC = () => {
 
   const [safety, setSafety] = useState<QuickScribeSafetyResult | null>(null);
   const [screening, setScreening] = useState(false);
+  // Distinguishes an AI-filled draft from a blank note opened via "New" — the latter has no
+  // AI output to review, so the "AI draft — unreviewed" chip would be misleading on it.
+  const [isDraft, setIsDraft] = useState(false);
 
   // The AI's untouched output, kept so the audit trail can record whether the doctor
   // accepted the draft or overrode it. Previously every note logged "accepted".
@@ -84,14 +88,23 @@ const QuickScribePage: React.FC = () => {
   // finished note when the doctor reviews it in that panel and clicks Apply.
   useEffect(() => {
     const fillFn = (data: Record<string, unknown>) => {
+      const medicines = (Array.isArray(data.medicines) ? (data.medicines as QuickScribeMedicine[]) : [])
+        // normalizeDurationDays strips a unit word the model wrote despite being told not to
+        // ("15 days" → "15") — the Days field should only ever hold a bare number.
+        .map(m => ({ ...m, duration: normalizeDurationDays(m.duration || "") }))
+        // The AI rarely states a quantity itself — it's derived here the same way a manual
+        // Frequency/Days edit derives it, so a dictated note doesn't arrive with blank Qty
+        // every time.
+        .map(m => ({ ...m, quantity: m.quantity || calcQuantity(m.frequency || "", m.duration || "") }));
       const next: QuickScribeNote = {
         summary: typeof data.summary === "string" ? data.summary : "",
-        medicines: Array.isArray(data.medicines) ? (data.medicines as QuickScribeMedicine[]) : [],
+        medicines,
         labTests: Array.isArray(data.lab_tests) ? (data.lab_tests as string[]) : [],
         radiologyTests: Array.isArray(data.radiology_tests) ? (data.radiology_tests as string[]) : [],
       };
       aiOriginal.current = JSON.parse(JSON.stringify(next));
       setNote(next);
+      setIsDraft(true);
     };
     registerScreen("quick_scribe", fillFn);
     return () => unregisterScreen("quick_scribe");
@@ -156,7 +169,18 @@ const QuickScribePage: React.FC = () => {
   const updateMedicine = useCallback((idx: number, patch: Partial<QuickScribeMedicine>) => {
     setNote(prev => {
       if (!prev) return prev;
-      const medicines = prev.medicines.map((m, i) => (i === idx ? { ...m, ...patch } : m));
+      const medicines = prev.medicines.map((m, i) => {
+        if (i !== idx) return m;
+        const next = { ...m, ...patch };
+        // Qty is derived from Frequency x Days whenever either changes, so the doctor never
+        // has to do the arithmetic — but editing Qty directly still works and sticks until
+        // the next Frequency/Days edit recalculates it.
+        if ("frequency" in patch || "duration" in patch) {
+          const computed = calcQuantity(next.frequency || "", next.duration || "");
+          if (computed) next.quantity = computed;
+        }
+        return next;
+      });
       return { ...prev, medicines };
     });
   }, []);
@@ -217,7 +241,8 @@ const QuickScribePage: React.FC = () => {
   }, [note, hospitalId, userId, patient, printInput, safety, rawTranscript, logAudit, toast]);
 
   const handleNew = useCallback(() => {
-    setNote(null);
+    setNote({ summary: "", medicines: [], labTests: [], radiologyTests: [] });
+    setIsDraft(false);
     setPatient({ name: "", age: "", sex: "", address: "" });
     setSafety(null);
     aiOriginal.current = null;
@@ -237,7 +262,12 @@ const QuickScribePage: React.FC = () => {
     );
   }
 
-  const regMissing = regLoaded && !regNumber;
+  // Patient identity and the doctor's registration number are only a legal requirement
+  // (Drugs & Cosmetics Rules 1945 Rule 65(10); MCI reg. 1.4.1) once the note actually lists
+  // a medicine — a summary/labs-only note is not a dispensable prescription. See
+  // quickScribePrint.ts for the print-time gate this mirrors.
+  const hasMedicines = !!medicineKey;
+  const regMissing = regLoaded && !regNumber && hasMedicines;
 
   return (
     <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
@@ -246,7 +276,7 @@ const QuickScribePage: React.FC = () => {
         <span className="text-base font-bold text-foreground">🎙️ Quick Scribe</span>
         <SectionChip label="Standalone — not linked to any patient record" tone="neutral" />
         <div className="ml-auto flex items-center gap-3">
-          {note && <SectionChip label="AI draft — unreviewed" tone="draft" />}
+          {isDraft && <SectionChip label="AI draft — unreviewed" tone="draft" />}
           <VoiceDictationButton sessionType="quick_scribe" size="sm" />
         </div>
       </div>
@@ -255,15 +285,15 @@ const QuickScribePage: React.FC = () => {
           public.patients. These are the fields Rule 65(10) requires on the paper. */}
       <div className="flex-shrink-0 border-b border-border bg-muted/30 px-5 py-2 flex items-end gap-3">
         <div className="flex-1 min-w-0">
-          <label className="text-sm text-muted-foreground block mb-1">Patient name <span className="text-destructive">*</span></label>
+          <label className="text-sm text-muted-foreground block mb-1">Patient name {hasMedicines && <span className="text-destructive">*</span>}</label>
           <Input className="h-8" value={patient.name} onChange={e => setPatient(p => ({ ...p, name: e.target.value }))} />
         </div>
         <div className="w-24">
-          <label className="text-sm text-muted-foreground block mb-1">Age <span className="text-destructive">*</span></label>
+          <label className="text-sm text-muted-foreground block mb-1">Age {hasMedicines && <span className="text-destructive">*</span>}</label>
           <Input className="h-8" value={patient.age} onChange={e => setPatient(p => ({ ...p, age: e.target.value }))} />
         </div>
         <div className="w-28">
-          <label className="text-sm text-muted-foreground block mb-1">Sex <span className="text-destructive">*</span></label>
+          <label className="text-sm text-muted-foreground block mb-1">Sex {hasMedicines && <span className="text-destructive">*</span>}</label>
           <select
             className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm"
             value={patient.sex}
@@ -349,11 +379,11 @@ const QuickScribePage: React.FC = () => {
                         onChange={e => updateMedicine(idx, { drug_name: e.target.value })} />
                       <Input className="col-span-2 h-8 text-sm" placeholder="Dose" value={m.dose || ""}
                         onChange={e => updateMedicine(idx, { dose: e.target.value })} />
-                      <Input className="col-span-2 h-8 text-sm" placeholder="Freq" value={m.frequency || ""}
+                      <Input className="col-span-2 h-8 text-sm" placeholder="M-A-E e.g. 1-0-1" title="Morning-Afternoon-Evening, e.g. 1-0-1 or 1/2-0-0" value={m.frequency || ""}
                         onChange={e => updateMedicine(idx, { frequency: e.target.value })} />
                       <Input className="col-span-2 h-8 text-sm" placeholder="Days" value={m.duration || ""}
                         onChange={e => updateMedicine(idx, { duration: e.target.value })} />
-                      <Input className="col-span-2 h-8 text-sm" placeholder="Qty *" value={m.quantity || ""}
+                      <Input className="col-span-2 h-8 text-sm" placeholder="Qty *" title="Auto-calculated from frequency x days; edit to override" value={m.quantity || ""}
                         onChange={e => updateMedicine(idx, { quantity: e.target.value })} />
                     </div>
                   ))}

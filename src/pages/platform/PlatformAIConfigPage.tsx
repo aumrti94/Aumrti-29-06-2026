@@ -417,13 +417,13 @@ const PlatformAIConfigPage: React.FC = () => {
 
     try {
       if (serviceKey === "gemini") {
-        // Use v1 (stable) endpoint with gemini-2.0-flash for connection testing.
-        // gemini-1.5-flash was moved out of v1beta; preview models still use v1beta.
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ contents: [{ parts: [{ text: "Hi" }] }], generationConfig: { maxOutputTokens: 1 } }),
-        });
+        // List models rather than calling generateContent against one hardcoded model id.
+        // This used to pin "gemini-2.0-flash" specifically — Google deprecates individual
+        // model ids over time (that one just was), which broke this test for every hospital
+        // regardless of which model they'd actually configured, since the test never used
+        // their configured model to begin with. A key-validity check doesn't need to invoke
+        // any particular model at all, exactly like the OpenAI check below it.
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${apiKey}`);
         success = res.ok;
         if (!success) { const d = await res.json(); message = d.error?.message || `HTTP ${res.status}`; }
       } else if (serviceKey === "openai") {
