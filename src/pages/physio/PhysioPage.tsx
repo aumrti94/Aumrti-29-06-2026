@@ -304,7 +304,21 @@ const PhysioPage: React.FC = () => {
       }
     }
 
-    // OPD physio — create standalone bill
+    // OPD physio — create standalone bill.
+    // Guard against double-billing: booking-time postCharge() (src/lib/chargePosting.ts) already
+    // posts a line item for this exact session under this same dedupeKey (see bookSession above).
+    // The admitted-patient branch just above checks source_dedupe_key before inserting onto the
+    // IPD bill — this branch never did, so an OPD session billed twice (once at booking, once at
+    // completion) always came out as two bills. Same source_dedupe_key check, scoped to
+    // hospital_id rather than a bill_id because no OPD bill exists yet to scope it to.
+    const { data: existingOpdItem } = await (supabase as any)
+      .from("bill_line_items")
+      .select("id")
+      .eq("hospital_id", hospitalId)
+      .eq("source_dedupe_key", dedupeKey)
+      .maybeSingle();
+    if (existingOpdItem) return;
+
     const billNum = await generateBillNumber(hospitalId!, "PHYS");
 
     const { data: newBill } = await supabase

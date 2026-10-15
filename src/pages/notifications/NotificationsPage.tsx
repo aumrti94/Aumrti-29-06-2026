@@ -49,7 +49,7 @@ export default function NotificationsPage() {
   const [statusFilter, setStatusFilter] = useState("all");
   const [search, setSearch] = useState("");
 
-  // Hospital-level preferences
+  // Hospital-level preferences — the row with patient_id IS NULL.
   const [prefs, setPrefs] = useState({
     whatsapp_enabled: true,
     sms_enabled: true,
@@ -58,7 +58,41 @@ export default function NotificationsPage() {
     quiet_hours_start: "22:00",
     quiet_hours_end: "07:00",
   });
+  const [prefsRowId, setPrefsRowId] = useState<string | null>(null);
   const [savingPrefs, setSavingPrefs] = useState(false);
+
+  // notification_preferences only has UNIQUE(hospital_id, patient_id) — a plain constraint, not
+  // NULLS NOT DISTINCT — so Postgres never treats two NULL patient_id rows as a match. An
+  // onConflict upsert against this hospital-level default (patient_id always null) can therefore
+  // never find the existing row; every save silently inserted a fresh duplicate instead of
+  // updating. Loading the existing row's id up front, then choosing update vs insert explicitly,
+  // sidesteps that without needing a schema change.
+  const loadPrefs = useCallback(async () => {
+    if (!hospitalId) return;
+    const { data, error } = await (supabase as any)
+      .from("notification_preferences")
+      .select("id, whatsapp_enabled, sms_enabled, email_enabled, push_enabled, quiet_hours_start, quiet_hours_end")
+      .eq("hospital_id", hospitalId)
+      .is("patient_id", null)
+      .maybeSingle();
+    if (error) {
+      toast({ title: "Could not load notification preferences", description: error.message, variant: "destructive" });
+      return;
+    }
+    if (data) {
+      setPrefsRowId(data.id);
+      setPrefs({
+        whatsapp_enabled: data.whatsapp_enabled,
+        sms_enabled: data.sms_enabled,
+        email_enabled: data.email_enabled,
+        push_enabled: data.push_enabled,
+        quiet_hours_start: data.quiet_hours_start,
+        quiet_hours_end: data.quiet_hours_end,
+      });
+    }
+  }, [hospitalId, toast]);
+
+  useEffect(() => { loadPrefs(); }, [loadPrefs]);
 
   const fetchLogs = useCallback(async () => {
     if (!hospitalId) return;
@@ -95,12 +129,25 @@ export default function NotificationsPage() {
   const savePrefs = async () => {
     if (!hospitalId) return;
     setSavingPrefs(true);
-    await (supabase as any).from("notification_preferences").upsert({
-      hospital_id: hospitalId,
-      ...prefs,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: "hospital_id,patient_id" });
+    const { error } = prefsRowId
+      ? await (supabase as any)
+          .from("notification_preferences")
+          .update({ ...prefs, updated_at: new Date().toISOString() })
+          .eq("id", prefsRowId)
+      : await (supabase as any)
+          .from("notification_preferences")
+          .insert({ hospital_id: hospitalId, ...prefs })
+          .select("id")
+          .maybeSingle()
+          .then(({ data, error }: any) => {
+            if (data) setPrefsRowId(data.id);
+            return { error };
+          });
     setSavingPrefs(false);
+    if (error) {
+      toast({ title: "Could not save notification preferences", description: error.message, variant: "destructive" });
+      return;
+    }
     toast({ title: "Notification preferences saved" });
   };
 

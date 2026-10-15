@@ -67,6 +67,47 @@ const MLCDetailsModal: React.FC<Props> = ({
   const [medicolegalOpinion, setMedicolegalOpinion] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
+  // MLC designation timestamp — read-only display only, never part of the mlc_cases insert.
+  // Canonical source is `mlc_police_notifications.mlc_flagged_at` (Saroja, security-pod), written
+  // by the trigger in 20261106000036_mlc_police_notification_clock.sql the moment ed_visits.mlc
+  // flips true. Deliberately NOT a new column on mlc_cases — read-only join, per her ruling.
+  const [mlcFlaggedAt, setMlcFlaggedAt] = useState<string | null>(null);
+  const [mlcFlaggedAtChecked, setMlcFlaggedAtChecked] = useState(false);
+
+  useEffect(() => {
+    if (!edVisitId || !hospitalId) {
+      setMlcFlaggedAt(null);
+      setMlcFlaggedAtChecked(false);
+      return;
+    }
+    let cancelled = false;
+    setMlcFlaggedAtChecked(false);
+    supabase
+      .from("mlc_police_notifications")
+      .select("mlc_flagged_at")
+      .eq("hospital_id", hospitalId)
+      .eq("source_table", "ed_visits")
+      .eq("source_id", edVisitId)
+      .maybeSingle()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        // Race condition (trigger hasn't fired yet) or any read error both fall back to the
+        // "pending" display below — never crash, never show "Invalid Date".
+        setMlcFlaggedAt(!error && data?.mlc_flagged_at ? data.mlc_flagged_at : null);
+        setMlcFlaggedAtChecked(true);
+      });
+    return () => { cancelled = true; };
+  }, [edVisitId, hospitalId]);
+
+  // en-IN DD/MM/YYYY, HH:MM — never a raw ISO string.
+  const formatMlcFlaggedAt = (iso: string): string | null => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    const datePart = d.toLocaleDateString("en-IN");
+    const timePart = d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+    return `${datePart}, ${timePart}`;
+  };
+
   // Generate MLC number on mount. Was a COUNT(*)+1 scheme (collision-prone — two concurrent MLC
   // registrations land on the same number) with no DB constraint to catch it, since mlc_cases.
   // mlc_number had no uniqueness constraint at all (KNOWN-BUG-236, fixed alongside this). Now
@@ -150,6 +191,8 @@ const MLCDetailsModal: React.FC<Props> = ({
     onSaved(mlcNumber);
   };
 
+  const mlcFlaggedAtDisplay = mlcFlaggedAt ? formatMlcFlaggedAt(mlcFlaggedAt) : null;
+
   return (
     <Dialog open onOpenChange={(v) => { if (!v) onClose(); }}>
       <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
@@ -161,6 +204,13 @@ const MLCDetailsModal: React.FC<Props> = ({
           <DialogDescription>
             Patient: <strong>{patientName}</strong> — MLC No: <strong className="text-red-600">{mlcNumber || "Generating…"}</strong>
           </DialogDescription>
+          {edVisitId && (
+            <p className="text-sm font-semibold text-amber-700" data-testid="mlc-designated-at">
+              {mlcFlaggedAtChecked && mlcFlaggedAtDisplay
+                ? `MLC designated at: ${mlcFlaggedAtDisplay}`
+                : "Designation time pending"}
+            </p>
+          )}
         </DialogHeader>
 
         <div className="space-y-4 mt-2">

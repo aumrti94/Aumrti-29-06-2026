@@ -3,6 +3,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useHospitalId } from "@/hooks/useHospitalId";
 import { useToast } from "@/hooks/use-toast";
 import { callAI } from "@/lib/aiProvider";
+import { logNABHEvidence } from "@/lib/nabh-evidence";
 import NABHAssistantPanel from "@/components/nabh/NABHAssistantPanel";
 import NABHBadge from "@/components/nabh/NABHBadge";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -809,6 +810,21 @@ Keep each section concise and clinically actionable. Use plain text with numbere
     setAiExpanded(true);
   };
 
+  // Reviewing the AI insight is the NABH-evidence-worthy action (a clinician/quality officer
+  // attesting they read advisory AI output and will apply independent judgment). Unchecking is
+  // not — it is not a retraction of a real-world event, so it must not log a second record.
+  const handleAiAcknowledge = (checked: boolean) => {
+    setAiAcknowledged(checked);
+    if (checked && hospitalId) {
+      void logNABHEvidence(
+        hospitalId,
+        "HIC.2",
+        `IPC AI anomaly-detection insight reviewed for ${dateFrom} to ${dateTo}. ` +
+          `Insight: ${aiInsights.slice(0, 500)}${aiInsights.length > 500 ? "…" : ""}`,
+      );
+    }
+  };
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (!hospitalId) return <div className="p-8 text-muted-foreground">Loading…</div>;
@@ -1487,7 +1503,7 @@ Keep each section concise and clinically actionable. Use plain text with numbere
 
                     <div className={`rounded-md border p-3 ${aiAcknowledged ? "border-green-200 bg-green-50" : "border-amber-200 bg-amber-50"}`}>
                       <div className="flex items-start gap-2">
-                        <Checkbox id="ai_ack" checked={aiAcknowledged} onCheckedChange={v => setAiAcknowledged(!!v)} className="mt-0.5" />
+                        <Checkbox id="ai_ack" checked={aiAcknowledged} onCheckedChange={v => handleAiAcknowledge(!!v)} className="mt-0.5" />
                         <Label htmlFor="ai_ack" className="text-xs cursor-pointer leading-snug">
                           I have reviewed the AI analysis above. I confirm this is advisory output and will apply
                           independent clinical judgment before taking any action based on these insights.

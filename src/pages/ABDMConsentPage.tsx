@@ -128,7 +128,7 @@ const ActiveConsentsTab: React.FC<{ hospitalId: string; role: string }> = ({ hos
 
       await fetch(`${cfg.abdm_base_url}/v1/consents/revoke`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${cfg.abdm_access_token}`, "X-CM-ID": cfg.is_production ? "sbx" : "sbx" },
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${cfg.abdm_access_token}`, "X-CM-ID": cfg.is_production ? "abdm" : "sbx" },
         body: JSON.stringify({ consentId: consent.consent_id }),
       });
 

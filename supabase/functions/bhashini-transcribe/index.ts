@@ -11,6 +11,31 @@ const corsHeaders = {
     "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
 };
 
+/**
+ * Cache for ULCA's `getModelsPipeline` response, keyed by Bhashini language code.
+ *
+ * This was the root cause of Bhashini transcription being much slower than Sarvam's:
+ * every single chunk paid for a full extra round trip to ULCA's auth/discovery endpoint
+ * (meity-auth.ulcacontrib.org — a best-effort government service, not a fast one) BEFORE
+ * the actual ASR call could even start, doubling the external-network latency on every
+ * 25-second segment. The serviceId/callbackUrl/inferenceApiKey this returns are stable
+ * for a given language — they do not need rediscovering on every request.
+ *
+ * Kept on module scope, same pattern as `hotwordsSupported` in sarvam-transcribe: Supabase
+ * Edge Function instances stay warm across invocations, so a cache here is paid for once
+ * per language per warm instance rather than once per dictation segment. The TTL is a
+ * safety net (not a known expiry from ULCA); a stale entry is invalidated and re-fetched
+ * automatically if the ASR call it produces gets rejected as unauthorized.
+ */
+interface BhashiniPipelineConfig {
+  serviceUrl: string;
+  serviceId: string;
+  inferenceApiKey: string;
+  expiresAt: number;
+}
+const bhashiniPipelineCache = new Map<string, BhashiniPipelineConfig>();
+const PIPELINE_CACHE_TTL_MS = 55 * 60 * 1000;
+
 serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
@@ -111,76 +136,94 @@ serve(async (req) => {
     const audioFormat = typeof audio_format === "string" ? audio_format : "wav";
     const samplingRate = Number.isFinite(sampling_rate) ? Number(sampling_rate) : 16000;
 
-    // Step 1: Get ASR pipeline config from ULCA
-    const pipelineRes = await fetch(
-      "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ulcaApiKey: bhashiniApiKey,
-          userID: bhashiniUserId,
-        },
-        body: JSON.stringify({
-          pipelineTasks: [{ taskType: "asr", config: { language: { sourceLanguage: bhashiniLang } } }],
-          pipelineRequestConfig: { pipelineId: "64392f96daac500b55c543cd" },
-        }),
-      }
-    );
-
-    if (!pipelineRes.ok) {
-      // Return the reason, not just the number. The client renders this to the doctor, and
-      // "Bhashini pipeline error: 502" told nobody whether the key, the language, or the
-      // service was at fault.
-      const errText = (await pipelineRes.text()).slice(0, 500);
-      console.error("Bhashini pipeline error:", pipelineRes.status, errText);
-      return new Response(
-        JSON.stringify({
-          error: `Bhashini pipeline ${pipelineRes.status}: ${errText || "no detail returned"}`,
-          bhashini_status: pipelineRes.status,
-          language_code: bhashiniLang,
-        }),
+    // Step 1: Get ASR pipeline config from ULCA — a cached hit skips this entirely, which
+    // is the fix for why Bhashini chunks were so much slower than Sarvam's.
+    const fetchPipelineConfig = async (): Promise<Response | BhashiniPipelineConfig> => {
+      const pipelineRes = await fetch(
+        "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline",
         {
-          status: pipelineRes.status >= 400 && pipelineRes.status < 500 ? 400 : 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ulcaApiKey: bhashiniApiKey,
+            userID: bhashiniUserId,
+          },
+          body: JSON.stringify({
+            pipelineTasks: [{ taskType: "asr", config: { language: { sourceLanguage: bhashiniLang } } }],
+            pipelineRequestConfig: { pipelineId: "64392f96daac500b55c543cd" },
+          }),
         }
       );
-    }
 
-    const pipelineData = await pipelineRes.json();
-    const asrConfig = pipelineData?.pipelineResponseConfig?.[0]?.config?.[0];
-    const serviceUrl = asrConfig?.serviceId
-      ? pipelineData?.pipelineInferenceAPIEndPoint?.callbackUrl
-      : null;
-    const inferenceApiKey = pipelineData?.pipelineInferenceAPIEndPoint?.inferenceApiKey?.value;
+      if (!pipelineRes.ok) {
+        // Return the reason, not just the number. The client renders this to the doctor, and
+        // "Bhashini pipeline error: 502" told nobody whether the key, the language, or the
+        // service was at fault.
+        const errText = (await pipelineRes.text()).slice(0, 500);
+        console.error("Bhashini pipeline error:", pipelineRes.status, errText);
+        return new Response(
+          JSON.stringify({
+            error: `Bhashini pipeline ${pipelineRes.status}: ${errText || "no detail returned"}`,
+            bhashini_status: pipelineRes.status,
+            language_code: bhashiniLang,
+          }),
+          {
+            status: pipelineRes.status >= 400 && pipelineRes.status < 500 ? 400 : 502,
+            headers: { ...corsHeaders, "Content-Type": "application/json" },
+          }
+        );
+      }
 
-    if (!serviceUrl || !inferenceApiKey) {
-      // ULCA answers 200 with an empty pipeline when it has no model for the language, so
-      // this is the "language genuinely unavailable" case rather than a transport failure.
-      return new Response(
-        JSON.stringify({
-          error: `Bhashini has no ASR model available for "${bhashiniLang}".`,
-          language_code: bhashiniLang,
-          unsupported_language: true,
-        }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      const pipelineData = await pipelineRes.json();
+      const asrConfig = pipelineData?.pipelineResponseConfig?.[0]?.config?.[0];
+      const serviceUrl = asrConfig?.serviceId
+        ? pipelineData?.pipelineInferenceAPIEndPoint?.callbackUrl
+        : null;
+      const inferenceApiKey = pipelineData?.pipelineInferenceAPIEndPoint?.inferenceApiKey?.value;
+
+      if (!serviceUrl || !inferenceApiKey) {
+        // ULCA answers 200 with an empty pipeline when it has no model for the language, so
+        // this is the "language genuinely unavailable" case rather than a transport failure.
+        return new Response(
+          JSON.stringify({
+            error: `Bhashini has no ASR model available for "${bhashiniLang}".`,
+            language_code: bhashiniLang,
+            unsupported_language: true,
+          }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const config: BhashiniPipelineConfig = {
+        serviceUrl,
+        serviceId: asrConfig.serviceId,
+        inferenceApiKey,
+        expiresAt: Date.now() + PIPELINE_CACHE_TTL_MS,
+      };
+      bhashiniPipelineCache.set(bhashiniLang, config);
+      return config;
+    };
+
+    let pipeline = bhashiniPipelineCache.get(bhashiniLang);
+    if (!pipeline || pipeline.expiresAt < Date.now()) {
+      const result = await fetchPipelineConfig();
+      if (result instanceof Response) return result;
+      pipeline = result;
     }
 
     // Step 2: Call ASR inference
-    const asrStartedAt = Date.now();
-    const asrRes = await fetch(serviceUrl, {
+    const callAsr = (config: BhashiniPipelineConfig) => fetch(config.serviceUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: inferenceApiKey,
+        Authorization: config.inferenceApiKey,
       },
       body: JSON.stringify({
         pipelineTasks: [{
           taskType: "asr",
           config: {
             language: { sourceLanguage: bhashiniLang },
-            serviceId: asrConfig.serviceId,
+            serviceId: config.serviceId,
             audioFormat,
             samplingRate,
           },
@@ -190,6 +233,20 @@ serve(async (req) => {
         },
       }),
     });
+
+    const asrStartedAt = Date.now();
+    let asrRes = await callAsr(pipeline);
+
+    // A cached config can go stale before PIPELINE_CACHE_TTL_MS if ULCA rotates the
+    // inference key sooner than our safety-net TTL assumes. One re-fetch-and-retry on an
+    // auth rejection keeps that rare case self-healing instead of wedging the cache.
+    if ((asrRes.status === 401 || asrRes.status === 403)) {
+      bhashiniPipelineCache.delete(bhashiniLang);
+      const result = await fetchPipelineConfig();
+      if (result instanceof Response) return result;
+      pipeline = result;
+      asrRes = await callAsr(pipeline);
+    }
 
     if (!asrRes.ok) {
       const errText = (await asrRes.text()).slice(0, 500);
@@ -226,7 +283,7 @@ serve(async (req) => {
       await recordAsrUsage(meterClient, {
         hospitalId,
         provider: "bhashini",
-        model: asrConfig?.serviceId || "bhashini-asr",
+        model: pipeline?.serviceId || "bhashini-asr",
         seconds: estimateAudioSeconds(approxBytes, bitrate),
         estimated: true,
         latencyMs: Date.now() - asrStartedAt,

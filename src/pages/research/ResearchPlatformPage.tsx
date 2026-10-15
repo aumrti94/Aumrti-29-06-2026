@@ -6,6 +6,7 @@ import { GatedTabsTrigger } from "@/components/access/GatedTabsTrigger";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { FlaskConical, Plus, Download, Loader2, Shield, Users, CheckCircle2, Trash2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useToast } from "@/hooks/use-toast";
@@ -61,7 +62,10 @@ export default function ResearchPlatformPage() {
   const previewCohort = async () => {
     if (!hospitalId) return;
     setPreviewing(true);
-    let q = (supabase as any).from("patients").select("id, full_name, uhid, dob, gender, chronic_conditions").eq("hospital_id", hospitalId);
+    // Only a count is ever rendered from this preview (see the green banner below) — full_name
+    // and uhid were previously fetched into browser state for no reason; dropped per the PHI
+    // data-minimisation review (RP-3) since nothing in this component reads them.
+    let q = (supabase as any).from("patients").select("id, dob, gender, chronic_conditions").eq("hospital_id", hospitalId);
 
     for (const c of criteria) {
       if (c.type === "gender" && c.gender) q = q.eq("gender", c.gender);
@@ -90,7 +94,7 @@ export default function ResearchPlatformPage() {
   const saveCohort = async () => {
     if (!hospitalId || !cohortForm.name) return;
     setSaving(true);
-    await (supabase as any).from("research_cohorts").insert({
+    const { error } = await (supabase as any).from("research_cohorts").insert({
       hospital_id: hospitalId,
       name: cohortForm.name,
       description: cohortForm.description || null,
@@ -100,6 +104,13 @@ export default function ResearchPlatformPage() {
       created_by: userId || null,
     });
     setSaving(false);
+    if (error) {
+      // Fail loud, matching the Oncology toxicity-alert pattern (OncologyReportsTab.tsx
+      // submitToxicity()): surface the real error and leave the form open, filled, and
+      // unsaved — never claim success on a failed insert.
+      toast({ title: "Cohort not saved", description: error.message, variant: "destructive" });
+      return;
+    }
     setShowForm(false);
     setCohortForm({ name: "", description: "", k: "5" });
     setCriteria([]);
@@ -274,9 +285,28 @@ export default function ResearchPlatformPage() {
                       </div>
                     </div>
                     <div className="flex gap-2">
-                      <Button size="sm" variant="outline" onClick={() => exportFHIRBundle(c)} className="h-8 gap-1.5 text-[11px]">
-                        <Download size={11} /> FHIR Export
-                      </Button>
+                      {/* Disabled, not wired to exportFHIRBundle(): that function hardcodes an
+                          empty entry[] and no de-identification transform runs anywhere in this
+                          path, so the bundle it used to produce was a convincing-looking empty
+                          shell with a false "de-identified" success toast — strictly worse than
+                          an honest "not yet available," which is what this is instead. Fixing
+                          this for real needs a resource-modelling decision (does a de-identified
+                          research bundle carry per-patient FHIR resources at all, given
+                          re-identification risk through the Condition→Encounter→Patient graph)
+                          and a genuine k-anonymity equivalence-class check (patient_count >= k is
+                          not sufficient), not a wiring change — tracked for Dr. Nalini's review. */}
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button size="sm" variant="outline" disabled className="h-8 gap-1.5 text-[11px]">
+                            <Download size={11} /> FHIR Export
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs text-[11px] leading-relaxed">
+                          Not yet available — the de-identification and k-anonymity logic this
+                          export depends on isn't implemented yet. Re-enabling this requires
+                          clinical-governance review before it ships.
+                        </TooltipContent>
+                      </Tooltip>
                     </div>
                   </div>
                 ))}

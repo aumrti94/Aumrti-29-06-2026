@@ -8,12 +8,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Search, RefreshCw, Plus, CheckCircle2, AlertTriangle, Clock, Activity, Link2 } from "lucide-react";
+import { Search, RefreshCw, Plus, CheckCircle2, XCircle, AlertTriangle, Clock, Activity, Link2 } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { useHospitalId } from "@/hooks/useHospitalId";
 import { logNABHEvidence } from "@/lib/nabh-evidence";
 import { autoChargeService, MODULE_CHRONIC_CARE } from "@/lib/serviceBilling";
+import { resolveActiveEncounterLink } from "@/lib/encounterLink";
 import MedicationAdherenceTab from "@/components/chronic/MedicationAdherenceTab";
 
 const CONDITIONS = ["Type 2 Diabetes", "Hypertension", "COPD", "Chronic Kidney Disease", "Heart Failure", "Asthma", "Hypothyroidism", "Rheumatoid Arthritis", "Epilepsy", "Other"];
@@ -344,11 +345,27 @@ const ChronicDiseasePage: React.FC = () => {
       `Chronic care plan reviewed: ${selectedPlan.condition} — ${selectedPlan.patients?.full_name || ""}`,
     );
 
+    // Neither care_plans nor chronic_disease_programs carries an encounter_id —
+    // confirmed against both tables' schema (20260521000004_chronic_disease.sql,
+    // 20260328142149_..., 20260821000001_chronic_care_plans_fks.sql): a chronic
+    // review is not itself tied to a stored OPD/IPD episode. Rather than leaving
+    // the charge detached (the bug this fixes) or fabricating a link to some
+    // unrelated past visit, resolve the episode that is actually open TODAY —
+    // the same resolver Lab's external-referral flow uses for an identical
+    // "which episode does this belong to" problem (inpatient wins over
+    // outpatient; today's OPD encounter if the coordinator is doing this review
+    // during the patient's visit). A patient with neither — reviewing by phone,
+    // or outside any visit — correctly falls back to the pre-existing standalone
+    // bill, same as ambulance/mortuary/home-care visits already do.
+    const link = await resolveActiveEncounterLink(hospitalId, selectedPlan.patient_id, today);
+
     // Rate comes from service_rates via the chronic_care_review code — never
     // hardcoded. Keyed on the review id, so each cycle bills exactly once.
     autoChargeService({
       hospitalId,
       patientId:     selectedPlan.patient_id,
+      admissionId:   link.admissionId,
+      encounterId:   link.encounterId,
       serviceName:   `Chronic Care Review — ${selectedPlan.condition}`,
       serviceModule: MODULE_CHRONIC_CARE,
       sourceTable:   "care_plan_reviews",
@@ -567,7 +584,7 @@ const ChronicDiseasePage: React.FC = () => {
                         return (
                           <div key={task.id} className={cn("border rounded-lg p-2.5 flex items-start gap-2 bg-card",
                             isOverdue && "border-red-200 bg-red-50/30",
-                            task.status === "completed" && "opacity-60"
+                            (task.status === "completed" || task.status === "cancelled") && "opacity-60"
                           )}>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2">
@@ -575,6 +592,7 @@ const ChronicDiseasePage: React.FC = () => {
                                 {isOverdue && <AlertTriangle className="h-3 w-3 text-red-500 shrink-0" />}
                                 <Badge variant="secondary" className={cn("text-[9px]",
                                   task.status === "completed" ? "bg-emerald-100 text-emerald-700" :
+                                  task.status === "cancelled" ? "bg-muted text-muted-foreground" :
                                   isOverdue ? "bg-red-100 text-red-700" :
                                   "bg-amber-100 text-amber-700"
                                 )}>{task.status}</Badge>
@@ -589,8 +607,11 @@ const ChronicDiseasePage: React.FC = () => {
                             </div>
                             {task.status === "pending" && (
                               <div className="flex gap-1 shrink-0">
-                                <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-emerald-600" onClick={() => updateTaskStatus(task.id, "completed")}>
+                                <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-emerald-600" onClick={() => updateTaskStatus(task.id, "completed")} title="Mark completed">
                                   <CheckCircle2 className="h-3.5 w-3.5" />
+                                </Button>
+                                <Button size="sm" variant="ghost" className="h-6 w-6 p-0 text-muted-foreground hover:text-red-600" onClick={() => updateTaskStatus(task.id, "cancelled")} title="Cancel task">
+                                  <XCircle className="h-3.5 w-3.5" />
                                 </Button>
                               </div>
                             )}

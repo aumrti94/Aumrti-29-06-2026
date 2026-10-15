@@ -149,7 +149,7 @@ const HomeTeleMonitoringTab: React.FC = () => {
                 <td className="py-2 pr-3">{r.spo2 ? `${r.spo2}%` : "—"}</td>
                 <td className="py-2 pr-3">{r.blood_sugar ? `${r.blood_sugar} mg/dL` : "—"}</td>
                 <td className="py-2 pr-3">{r.weight_kg ? `${r.weight_kg} kg` : "—"}</td>
-                <td className="py-2 text-muted-foreground">{new Date(r.reported_at).toLocaleString()}</td>
+                <td className="py-2 text-muted-foreground">{new Date(r.reported_at).toLocaleString("en-IN")}</td>
               </tr>
             ))}
             {readings.length === 0 && (

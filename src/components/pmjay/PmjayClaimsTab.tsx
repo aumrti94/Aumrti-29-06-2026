@@ -281,7 +281,7 @@ Hospital letterhead will be added. Just write the body content.`,
       amount: settledAmt,
       description: `PMJAY Settlement — ${selected.package_name} — Claim #${selected.claim_number || selected.id.slice(0, 8)}`,
       hospitalId: userData?.hospital_id || "",
-      postedBy: user?.id || "",
+      postedBy: userData?.id || "",
     });
 
     // Clear billing on admission

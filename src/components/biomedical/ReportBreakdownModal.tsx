@@ -9,12 +9,10 @@ import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
 import { useHospitalId } from '@/hooks/useHospitalId';
 
-const DUMMY_USER = "00000000-0000-0000-0000-000000000000";
-
 interface Props { open: boolean; onClose: () => void; onSaved: () => void; }
 
 const ReportBreakdownModal: React.FC<Props> = ({ open, onClose, onSaved }) => {
-  const { hospitalId } = useHospitalId();
+  const { hospitalId, userId } = useHospitalId();
   const { toast } = useToast();
   const [equipment, setEquipment] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
@@ -29,10 +27,10 @@ const ReportBreakdownModal: React.FC<Props> = ({ open, onClose, onSaved }) => {
     if (!form.equipment_id || !form.description.trim()) {
       toast({ title: "Equipment and description required", variant: "destructive" }); return;
     }
+    if (!userId) {
+      toast({ title: "User session not ready — please retry", variant: "destructive" }); return;
+    }
     setSaving(true);
-
-    const { data: userData } = await supabase.from("users").select("id").eq("hospital_id", hospitalId).limit(1).maybeSingle();
-    const userId = userData?.id || DUMMY_USER;
 
     const { error } = await supabase.from("breakdown_logs").insert({
       hospital_id: hospitalId, equipment_id: form.equipment_id,

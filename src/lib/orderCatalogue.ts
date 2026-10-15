@@ -63,6 +63,16 @@ function expandSymbols(name: string): string {
     .replace(/\//g, " ");
 }
 
+/**
+ * The key an order name is indexed and looked up under.
+ *
+ * Exported because `byExact` / `byAlias` keys are built with it, and a caller that reaches for
+ * bare `normalizeTerm` silently misses every name containing `&`, `+` or `/`.
+ */
+export function normalizeOrderName(name: string): string {
+  return normalizeTerm(expandSymbols(name));
+}
+
 /** Below this similarity a name is left unresolved rather than matched to the wrong test. */
 const MATCH_THRESHOLD = 0.88;
 
@@ -113,9 +123,11 @@ export function buildOrderCatalogue(
   all: CatalogueEntry[],
   learnedAliases: ReadonlyArray<{ raw_name_norm: string; canonical_name: string }> = [],
 ): OrderCatalogue {
+  const effective = shadowTestsNamedAfterAPanel(all);
+
   const byExact = new Map<string, CatalogueEntry>();
-  for (const e of all) {
-    const key = normalizeTerm(expandSymbols(e.name));
+  for (const e of effective) {
+    const key = normalizeOrderName(e.name);
     if (key && !byExact.has(key)) byExact.set(key, e);
   }
 
@@ -124,10 +136,14 @@ export function buildOrderCatalogue(
   // exist here. That is what keeps "KFT" from ordering a panel the lab cannot run.
   const byAlias = new Map<string, CatalogueEntry>();
   const addAlias = (rawKey: string, canonical: string) => {
-    const key = normalizeTerm(expandSymbols(rawKey));
-    if (!key || byExact.has(key) || byAlias.has(key)) return;
-    const target = byExact.get(normalizeTerm(expandSymbols(canonical)));
-    if (target) byAlias.set(key, target);
+    const target = byExact.get(normalizeOrderName(canonical));
+    if (!target) return;
+    // Indexed under BOTH the literal spelling and the filler-word-free one, so "Ultrasound
+    // Abdomen and Pelvis" is reachable from a doctor who simply did not say "and".
+    for (const key of new Set([normalizeOrderName(rawKey), noiseStrippedKey(rawKey)])) {
+      if (!key || byExact.has(key) || byAlias.has(key)) continue;
+      byAlias.set(key, target);
+    }
   };
   for (const a of BUILT_IN_ORDER_ALIASES) addAlias(a.alias, a.canonical);
   // Learned aliases are added last so a hospital's own correction wins a key collision.
@@ -138,7 +154,51 @@ export function buildOrderCatalogue(
     }
   }
 
-  return { byExact, byAlias, all };
+  return { byExact, byAlias, all: effective };
+}
+
+/**
+ * Drop any single lab test whose name is ALSO a lab panel's name.
+ *
+ * A hospital carrying both "Thyroid Profile" the test and "Thyroid Profile" the panel made the
+ * panel unreachable by name, twice over: `byExact` keeps the first entry per key and labs are
+ * indexed before groups, and in the fuzzy tier the two scored identically, so the ambiguity
+ * guard refused to pick either. The dictated panel was then reported "not found in the lab
+ * catalogue" and neither ordered nor billed — while the panel's own chip sat on screen.
+ *
+ * A doctor who says a panel's name means the panel, so the panel wins. The shadowed test is
+ * only removed as a DICTATION target; `lab_test_master` is read directly by the order counter
+ * and the catalogue screens, so it stays orderable by hand.
+ *
+ * Deliberately the whole fix: with one candidate left the fuzzy loop cannot tie, so the
+ * ambiguity guard, both scorers and both thresholds are untouched, and a name with no panel
+ * twin sees a byte-identical candidate set.
+ */
+function shadowTestsNamedAfterAPanel(all: CatalogueEntry[]): CatalogueEntry[] {
+  const panelKeys = new Set<string>();
+  for (const e of all) {
+    if (e.kind !== "lab_group") continue;
+    const key = normalizeOrderName(e.name);
+    if (key) panelKeys.add(key);
+  }
+  if (!panelKeys.size) return all;
+  // Radiology is untouched: a study sharing a lab panel's name is a different modality, not a
+  // duplicate, and nothing can expand it.
+  return all.filter((e) => e.kind !== "lab" || !panelKeys.has(normalizeOrderName(e.name)));
+}
+
+/**
+ * The catalogue row a name matches verbatim, or undefined.
+ *
+ * Exposed because panel expansion looks up every member of a group on each pass: that is O(1)
+ * here against `matchOrderNameDetailed`'s full scan of the catalogue, which would be thousands
+ * of similarity computations per member on every keystroke.
+ */
+export function lookupExactEntry(
+  name: string,
+  catalogue: OrderCatalogue,
+): CatalogueEntry | undefined {
+  return catalogue.byExact.get(normalizeOrderName(name));
 }
 
 /**
@@ -200,6 +260,15 @@ function orderContentTokens(name: string): string[] {
     .map((t) => normalizeTerm(t))
     .filter((t) => t && !ORDER_NOISE_WORDS.has(t))
     .map((t) => phoneticNormalize(t));
+}
+
+/**
+ * The alias key with filler words removed — "chest xray please" and "chest xray" are one
+ * request. Both sides of the lookup go through this same function, so the phonetic
+ * normalisation `orderContentTokens` applies cancels out.
+ */
+function noiseStrippedKey(name: string): string {
+  return orderContentTokens(name).join("");
 }
 
 /**
@@ -295,7 +364,7 @@ export function matchOrderName(dictated: string, catalogue: OrderCatalogue): Cat
  * test is far worse than asking the doctor to pick.
  */
 export function matchOrderNameDetailed(dictated: string, catalogue: OrderCatalogue): OrderMatch | null {
-  const q = normalizeTerm(expandSymbols(dictated));
+  const q = normalizeOrderName(dictated);
   if (!q) return null;
 
   const exact = catalogue.byExact.get(q);
@@ -303,6 +372,15 @@ export function matchOrderNameDetailed(dictated: string, catalogue: OrderCatalog
 
   const alias = catalogue.byAlias?.get(q);
   if (alias) return { entry: alias, source: "alias", score: 1 };
+
+  // Same tier, filler words removed. The alias table is a set of whole-string keys, so a word
+  // that carries no catalogue meaning used to defeat it outright: "chest xray" resolved and
+  // "chest xray please" did not, and the study was ordered under the doctor's own spelling and
+  // billed at the default rate. Only ORDER_NOISE_WORDS are dropped — every word that
+  // distinguishes one study from another is still required to be there.
+  const strippedKey = noiseStrippedKey(dictated);
+  const strippedAlias = strippedKey && strippedKey !== q ? catalogue.byAlias?.get(strippedKey) : undefined;
+  if (strippedAlias) return { entry: strippedAlias, source: "alias", score: 1 };
 
   const qNorm = phoneticNormalize(expandSymbols(dictated));
   if (!qNorm) return null;

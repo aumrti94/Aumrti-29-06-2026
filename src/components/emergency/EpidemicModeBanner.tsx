@@ -45,7 +45,7 @@ const EpidemicModeBanner: React.FC<Props> = ({ protocol }) => {
         </>
       )}
       <span className="ml-auto text-xs opacity-70">
-        Since {new Date(protocol.activated_at).toLocaleString()}
+        Since {new Date(protocol.activated_at).toLocaleString("en-IN")}
       </span>
     </div>
   );

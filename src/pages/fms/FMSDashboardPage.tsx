@@ -73,9 +73,7 @@ interface BmwManifest {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const ASSET_CATEGORIES = [
-  "MRI", "CT Scanner", "X-Ray", "Ultrasound", "OT Table", "OT Light",
-  "Anaesthesia Machine", "Ventilator", "Defibrillator", "ECG Machine",
-  "Autoclave", "CSSD Equipment", "Lift", "DG Set", "AC Plant",
+  "Lift", "DG Set", "AC Plant",
   "Fire Extinguisher", "Oxygen Plant", "Vacuum System", "Water Treatment",
   "Biomedical Equipment", "Other",
 ];

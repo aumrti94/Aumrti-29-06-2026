@@ -112,7 +112,7 @@ interface OrganDonation {
 
 export default function MortuaryPage() {
   const mannerOptions = useConfigValues("death_manner_types");
-  const { hospitalId, loading: hospitalLoading } = useHospitalId();
+  const { hospitalId, userId, loading: hospitalLoading } = useHospitalId();
   const [tab, setTab] = useState("register");
   const [admissions, setAdmissions] = useState<MortuaryAdmission[]>([]);
   const [mlcRecords, setMlcRecords] = useState<MLCRecord[]>([]);
@@ -158,6 +158,7 @@ export default function MortuaryPage() {
   });
   const [aiLoading, setAiLoading] = useState(false);
   const [policeLetterModal, setPoliceLetterModal] = useState<string | null>(null);
+  const [outcomeDraft, setOutcomeDraft] = useState<{ id: string; value: string } | null>(null);
 
 
   const loadAll = useCallback(async () => {
@@ -356,7 +357,7 @@ export default function MortuaryPage() {
       hospital_id: hospitalId, mortuary_id: releaseForm.mortuary_id,
       released_to: releaseForm.released_to, relation: releaseForm.relation,
       id_proof_type: releaseForm.id_proof_type, id_proof_number: releaseForm.id_proof_number || null,
-      released_by: doctors[0]?.id || "", police_clearance: releaseForm.police_clearance,
+      released_by: userId || "", police_clearance: releaseForm.police_clearance,
       mccd_issued: releaseForm.mccd_issued, documents_given: releaseForm.documents_given,
       witness_name: releaseForm.witness_name || null,
     });
@@ -368,10 +369,12 @@ export default function MortuaryPage() {
       autoChargeService({
         hospitalId,
         patientId:     mort.patient_id,
+        admissionId:   mort.admission_id ?? null,
         serviceName:   `Mortuary Services — Body No: ${mort.body_number}`,
         serviceModule: MODULE_MORTUARY,
         sourceTable:   "mortuary_admissions",
         sourceId:      releaseForm.mortuary_id,
+        performedBy:   userId ?? null,
         serviceDate:   new Date().toISOString().split("T")[0],
       }).catch(() => {});
     }
@@ -405,6 +408,20 @@ export default function MortuaryPage() {
     setOrganModal(false);
     await loadAll();
     setLoading(false);
+  };
+
+  // Outcome (procured / not viable / family withdrew / etc.) is only known after the fact —
+  // there was previously no form field anywhere that wrote to organ_donations.outcome, so every
+  // record showed "—" forever. Inline edit on the existing row, not the creation form.
+  const handleSaveOutcome = async (donationId: string) => {
+    if (!outcomeDraft) return;
+    const { error } = await supabase.from("organ_donations")
+      .update({ outcome: outcomeDraft.value.trim() || null })
+      .eq("id", donationId);
+    if (error) { toast.error(error.message); return; }
+    toast.success("Outcome updated");
+    setOutcomeDraft(null);
+    await loadAll();
   };
 
   // Police intimation letter
@@ -710,7 +727,30 @@ export default function MortuaryPage() {
                         <TableCell>{d.family_consent ? <Badge className="text-xs bg-green-100 text-green-800">Yes</Badge> : d.family_counselled ? <Badge variant="destructive" className="text-xs">Declined</Badge> : <Badge variant="secondary" className="text-xs">Not counselled</Badge>}</TableCell>
                         <TableCell>{d.organs_pledged.length > 0 ? d.organs_pledged.join(", ") : "—"}</TableCell>
                         <TableCell className="font-mono text-xs">{d.notto_ref || "—"}</TableCell>
-                        <TableCell>{d.outcome || "—"}</TableCell>
+                        <TableCell>
+                          {outcomeDraft?.id === d.id ? (
+                            <div className="flex items-center gap-1">
+                              <Input
+                                autoFocus
+                                className="h-7 text-xs w-40"
+                                value={outcomeDraft.value}
+                                onChange={e => setOutcomeDraft({ id: d.id, value: e.target.value })}
+                                onKeyDown={e => { if (e.key === "Enter") handleSaveOutcome(d.id); if (e.key === "Escape") setOutcomeDraft(null); }}
+                              />
+                              <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => handleSaveOutcome(d.id)}>Save</Button>
+                              <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setOutcomeDraft(null)}>Cancel</Button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="text-left hover:underline"
+                              onClick={() => setOutcomeDraft({ id: d.id, value: d.outcome || "" })}
+                              title="Click to set outcome"
+                            >
+                              {d.outcome || "— (click to set)"}
+                            </button>
+                          )}
+                        </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>

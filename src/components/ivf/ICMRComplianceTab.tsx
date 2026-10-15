@@ -11,23 +11,18 @@ import { format } from "date-fns";
 
 interface ArtCycle {
   id: string;
-  cycle_number: string;
+  cycle_number: number;
   couple_name: string;
   female_name: string;
   male_name: string;
-  icmr_couple_id: string | null;
-  procedure_type: string;
-  cycle_start_date: string;
-  outcome: string | null;
+  icmr_reg_number: string | null;
+  cycle_type: string;
+  start_date: string;
+  status: string | null;
+  delivery_outcome: string | null;
+  clinical_pregnancy: boolean | null;
   embryos_transferred: number | null;
   embryos_frozen: number | null;
-  sperm_source: string | null;
-  oocyte_source: string | null;
-  gestational_carrier: boolean | null;
-  live_birth_date: string | null;
-  birth_weight_grams: number | null;
-  congenital_anomalies: string | null;
-  icmr_submitted: boolean;
 }
 
 // No props — hospitalId comes from the hook.
@@ -40,41 +35,68 @@ const ICMRComplianceTab: React.FC<Props> = () => {
   const [loading, setLoading] = useState(true);
   const [reportYear, setReportYear] = useState(new Date().getFullYear());
   const [generating, setGenerating] = useState(false);
+  // ICMR ART Act annual-report "submitted" status is tracked at the year/hospital granularity in
+  // hmis_reports (report_type = "icmr_art_annual") — ivf_cycles has no per-cycle submitted flag,
+  // and adding one is a schema change out of scope here (flagged separately to data-pod/Latha).
+  const [submittedYears, setSubmittedYears] = useState<Set<number>>(new Set());
 
   const load = useCallback(async () => {
     if (!hospitalId) return;
     setLoading(true);
-    const { data } = await (supabase as any)
-      .from("ivf_cycles")
-      .select("id, cycle_number, cycle_start_date, outcome, procedure_type, embryos_transferred, embryos_frozen, sperm_source, oocyte_source, gestational_carrier, live_birth_date, birth_weight_grams, congenital_anomalies, icmr_submitted, ivf_couples!inner(icmr_couple_id, female_patient: patients!ivf_couples_female_patient_id_fkey(full_name), male_patient: patients!ivf_couples_male_patient_id_fkey(full_name))")
-      .eq("hospital_id", hospitalId)
-      .order("cycle_start_date", { ascending: false })
-      .limit(200);
+    // Real table is `art_couples` (not `ivf_couples`), joined via its real FK constraint names
+    // art_couples_female_patient_id_fkey / art_couples_male_patient_id_fkey — verified against
+    // supabase/migrations/20260330090552_8f181820-6667-4345-ae68-d4aed2b4e34e.sql and
+    // src/integrations/supabase/types.ts. The previous select also referenced several ivf_cycles
+    // columns (cycle_start_date, outcome, procedure_type, sperm_source, oocyte_source,
+    // gestational_carrier, live_birth_date, birth_weight_grams, congenital_anomalies,
+    // icmr_submitted) that do not exist anywhere in the schema; replaced with the real columns
+    // (start_date, cycle_type, delivery_outcome, clinical_pregnancy, status).
+    const [cyclesRes, reportsRes] = await Promise.all([
+      supabase
+        .from("ivf_cycles")
+        .select("id, cycle_number, start_date, status, cycle_type, delivery_outcome, clinical_pregnancy, embryos_transferred, embryos_frozen, art_couples!inner(icmr_reg_number, female_patient:patients!art_couples_female_patient_id_fkey(full_name), male_patient:patients!art_couples_male_patient_id_fkey(full_name))")
+        .eq("hospital_id", hospitalId)
+        .order("start_date", { ascending: false })
+        .limit(200),
+      supabase
+        .from("hmis_reports")
+        .select("period_year")
+        .eq("hospital_id", hospitalId)
+        .eq("report_type", "icmr_art_annual"),
+    ]);
 
-    const mapped: ArtCycle[] = (data || []).map((c: any) => ({
+    if (cyclesRes.error) {
+      console.error(cyclesRes.error);
+      toast({ title: "Failed to load ICMR compliance data", description: cyclesRes.error.message, variant: "destructive" });
+      setCycles([]);
+      setLoading(false);
+      return;
+    }
+    if (reportsRes.error) {
+      console.error(reportsRes.error);
+    } else {
+      setSubmittedYears(new Set((reportsRes.data || []).map((r: any) => r.period_year)));
+    }
+
+    const mapped: ArtCycle[] = (cyclesRes.data || []).map((c: any) => ({
       id: c.id,
       cycle_number: c.cycle_number,
-      couple_name: `${c.ivf_couples?.female_patient?.full_name || "?"} & ${c.ivf_couples?.male_patient?.full_name || "?"}`,
-      female_name: c.ivf_couples?.female_patient?.full_name || "—",
-      male_name: c.ivf_couples?.male_patient?.full_name || "—",
-      icmr_couple_id: c.ivf_couples?.icmr_couple_id || null,
-      procedure_type: c.procedure_type,
-      cycle_start_date: c.cycle_start_date,
-      outcome: c.outcome,
+      couple_name: `${c.art_couples?.female_patient?.full_name || "?"} & ${c.art_couples?.male_patient?.full_name || "?"}`,
+      female_name: c.art_couples?.female_patient?.full_name || "—",
+      male_name: c.art_couples?.male_patient?.full_name || "—",
+      icmr_reg_number: c.art_couples?.icmr_reg_number || null,
+      cycle_type: c.cycle_type,
+      start_date: c.start_date,
+      status: c.status,
+      delivery_outcome: c.delivery_outcome,
+      clinical_pregnancy: c.clinical_pregnancy,
       embryos_transferred: c.embryos_transferred,
       embryos_frozen: c.embryos_frozen,
-      sperm_source: c.sperm_source || "self",
-      oocyte_source: c.oocyte_source || "self",
-      gestational_carrier: c.gestational_carrier || false,
-      live_birth_date: c.live_birth_date,
-      birth_weight_grams: c.birth_weight_grams,
-      congenital_anomalies: c.congenital_anomalies,
-      icmr_submitted: c.icmr_submitted || false,
     }));
 
     setCycles(mapped);
     setLoading(false);
-  }, [hospitalId]);
+  }, [hospitalId, toast]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -82,7 +104,7 @@ const ICMRComplianceTab: React.FC<Props> = () => {
     if (!hospitalId) return;
     setGenerating(true);
 
-    const yearCycles = cycles.filter((c) => new Date(c.cycle_start_date).getFullYear() === reportYear);
+    const yearCycles = cycles.filter((c) => new Date(c.start_date).getFullYear() === reportYear);
 
     if (yearCycles.length === 0) {
       toast({ title: `No cycles found for ${reportYear}` });
@@ -90,68 +112,70 @@ const ICMRComplianceTab: React.FC<Props> = () => {
       return;
     }
 
-    // Build ICMR ART Annual Report data structure per ART Act 2021 requirements
+    // Build ICMR ART Annual Report data structure per ART Act 2021 requirements, from real
+    // ivf_cycles/art_couples columns only. `cycle_type` already carries donor-egg/donor-sperm/
+    // surrogacy as distinct values (see CyclesTab.tsx CYCLE_TYPES) — there is no separate
+    // sperm_source/oocyte_source/gestational_carrier column. Neonatal outcome fields
+    // (live birth date, birth weight, congenital anomalies) have no column anywhere in the
+    // schema; that is a genuine data-capture gap for full ART Act 2021 reporting, flagged
+    // separately rather than invented here.
     const reportData = {
       report_year: reportYear,
       hospital_id: hospitalId,
       generated_at: new Date().toISOString(),
       total_cycles: yearCycles.length,
       procedure_breakdown: {
-        ivf: yearCycles.filter(c => c.procedure_type === "ivf").length,
-        icsi: yearCycles.filter(c => c.procedure_type === "icsi").length,
-        iui: yearCycles.filter(c => c.procedure_type === "iui").length,
-        fet: yearCycles.filter(c => c.procedure_type === "fet").length,
-        donor_egg: yearCycles.filter(c => c.oocyte_source === "donor").length,
-        donor_sperm: yearCycles.filter(c => c.sperm_source === "donor").length,
-        surrogacy: yearCycles.filter(c => c.gestational_carrier).length,
+        ivf: yearCycles.filter(c => c.cycle_type === "ivf").length,
+        icsi: yearCycles.filter(c => c.cycle_type === "icsi").length,
+        iui: yearCycles.filter(c => c.cycle_type === "iui").length,
+        fet: yearCycles.filter(c => c.cycle_type === "fet").length,
+        donor_egg: yearCycles.filter(c => c.cycle_type === "donor_egg").length,
+        donor_sperm: yearCycles.filter(c => c.cycle_type === "donor_sperm").length,
+        surrogacy: yearCycles.filter(c => c.cycle_type === "surrogacy").length,
       },
       outcomes: {
-        clinical_pregnancy: yearCycles.filter(c => c.outcome === "clinical_pregnancy" || c.outcome === "live_birth").length,
-        live_births: yearCycles.filter(c => c.outcome === "live_birth").length,
-        cancelled: yearCycles.filter(c => c.outcome === "cancelled").length,
-        miscarriage: yearCycles.filter(c => c.outcome === "miscarriage").length,
-        ongoing: yearCycles.filter(c => !c.outcome || c.outcome === "ongoing").length,
+        clinical_pregnancy: yearCycles.filter(c => c.clinical_pregnancy).length,
+        live_births: yearCycles.filter(c => c.delivery_outcome === "live_birth").length,
+        cancelled: yearCycles.filter(c => c.status === "cancelled").length,
+        miscarriage: yearCycles.filter(c => c.delivery_outcome === "miscarriage").length,
+        ongoing: yearCycles.filter(c => !c.delivery_outcome && c.status !== "cancelled").length,
       },
       pregnancy_rate: yearCycles.length > 0
-        ? Math.round((yearCycles.filter(c => c.outcome === "clinical_pregnancy" || c.outcome === "live_birth").length / yearCycles.length) * 100)
+        ? Math.round((yearCycles.filter(c => c.clinical_pregnancy).length / yearCycles.length) * 100)
         : 0,
       live_birth_rate: yearCycles.length > 0
-        ? Math.round((yearCycles.filter(c => c.outcome === "live_birth").length / yearCycles.length) * 100)
+        ? Math.round((yearCycles.filter(c => c.delivery_outcome === "live_birth").length / yearCycles.length) * 100)
         : 0,
-      neonatal_outcomes: {
-        total_babies: yearCycles.filter(c => c.live_birth_date).length,
-        with_congenital_anomalies: yearCycles.filter(c => c.congenital_anomalies && c.congenital_anomalies !== "none").length,
-      },
       cycle_details: yearCycles.map(c => ({
-        icmr_couple_id: c.icmr_couple_id,
+        icmr_reg_number: c.icmr_reg_number,
         cycle_number: c.cycle_number,
-        procedure: c.procedure_type,
-        start_date: c.cycle_start_date,
-        outcome: c.outcome,
+        cycle_type: c.cycle_type,
+        start_date: c.start_date,
+        status: c.status,
+        delivery_outcome: c.delivery_outcome,
+        clinical_pregnancy: c.clinical_pregnancy,
         embryos_transferred: c.embryos_transferred,
         embryos_frozen: c.embryos_frozen,
-        sperm_source: c.sperm_source,
-        oocyte_source: c.oocyte_source,
-        gestational_carrier: c.gestational_carrier,
-        live_birth_date: c.live_birth_date,
-        birth_weight_g: c.birth_weight_grams,
-        congenital_anomalies: c.congenital_anomalies,
       })),
     };
 
-    // Save to HMIS reports table for record-keeping
-    await (supabase as any).from("hmis_reports").insert({
+    // Save to HMIS reports table for record-keeping — also doubles as the per-year "submitted"
+    // marker for this tab (ivf_cycles has no per-cycle submitted flag; see submittedYears above).
+    const { error: reportError } = await supabase.from("hmis_reports").upsert({
       hospital_id: hospitalId,
       report_type: "icmr_art_annual",
       period_year: reportYear,
       status: "generated",
       generated_at: new Date().toISOString(),
       report_data: reportData,
-    });
+    } as any, { onConflict: "hospital_id,report_type,period_year,period_month,period_week" }).select().maybeSingle();
 
-    // Mark cycles as submitted
-    const cycleIds = yearCycles.map(c => c.id);
-    await (supabase as any).from("ivf_cycles").update({ icmr_submitted: true }).in("id", cycleIds);
+    if (reportError) {
+      console.error(reportError);
+      toast({ title: "Failed to save ICMR annual report", description: reportError.message, variant: "destructive" });
+      setGenerating(false);
+      return;
+    }
 
     // Download as JSON (ICMR submission format)
     const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: "application/json" });
@@ -167,8 +191,8 @@ const ICMRComplianceTab: React.FC<Props> = () => {
     load();
   };
 
-  const pendingCount = cycles.filter(c => !c.icmr_couple_id).length;
-  const unsubmittedCount = cycles.filter(c => !c.icmr_submitted).length;
+  const pendingCount = cycles.filter(c => !c.icmr_reg_number).length;
+  const unsubmittedCount = cycles.filter(c => !submittedYears.has(new Date(c.start_date).getFullYear())).length;
 
   if (loading) return <div className="flex items-center justify-center py-16"><Loader2 className="h-6 w-6 animate-spin text-primary" /></div>;
 
@@ -241,8 +265,8 @@ const ICMRComplianceTab: React.FC<Props> = () => {
                 <td className="px-3 py-2 text-xs font-mono font-bold">{c.cycle_number}</td>
                 <td className="px-3 py-2 text-xs">{c.couple_name}</td>
                 <td className="px-3 py-2 text-xs">
-                  {c.icmr_couple_id ? (
-                    <span className="font-mono text-[10px] text-green-700 bg-green-50 border border-green-200 rounded px-1.5 py-0.5">{c.icmr_couple_id}</span>
+                  {c.icmr_reg_number ? (
+                    <span className="font-mono text-[10px] text-green-700 bg-green-50 border border-green-200 rounded px-1.5 py-0.5">{c.icmr_reg_number}</span>
                   ) : (
                     <Badge variant="outline" className="text-[9px] border-amber-300 bg-amber-50 text-amber-700">
                       <AlertTriangle size={8} className="mr-1" /> Missing
@@ -250,19 +274,22 @@ const ICMRComplianceTab: React.FC<Props> = () => {
                   )}
                 </td>
                 <td className="px-3 py-2 text-center">
-                  <Badge variant="outline" className="text-[9px] uppercase">{c.procedure_type}</Badge>
+                  <Badge variant="outline" className="text-[9px] uppercase">{c.cycle_type}</Badge>
                 </td>
-                <td className="px-3 py-2 text-center text-xs">{format(new Date(c.cycle_start_date), "dd/MM/yyyy")}</td>
+                <td className="px-3 py-2 text-center text-xs">{format(new Date(c.start_date), "dd/MM/yyyy")}</td>
                 <td className="px-3 py-2 text-center">
                   <Badge variant="outline" className="text-[9px] capitalize">
-                    {c.outcome || "ongoing"}
+                    {c.delivery_outcome || c.status || "ongoing"}
                   </Badge>
                 </td>
                 <td className="px-3 py-2 text-center text-[10px] text-muted-foreground">
-                  {[c.sperm_source !== "self" && `Donor sperm`, c.oocyte_source !== "self" && `Donor oocyte`, c.gestational_carrier && `Surrogate`].filter(Boolean).join(", ") || "Own"}
+                  {c.cycle_type === "donor_sperm" ? "Donor sperm"
+                    : c.cycle_type === "donor_egg" ? "Donor oocyte"
+                    : c.cycle_type === "surrogacy" ? "Surrogate"
+                    : "Own"}
                 </td>
                 <td className="px-3 py-2 text-center">
-                  {c.icmr_submitted
+                  {submittedYears.has(new Date(c.start_date).getFullYear())
                     ? <CheckCircle2 size={14} className="text-emerald-600 mx-auto" />
                     : <span className="text-[10px] text-muted-foreground">Pending</span>}
                 </td>

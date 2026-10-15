@@ -82,6 +82,9 @@ const InboxPage: React.FC = () => {
   const [composePhone, setComposePhone] = useState("");
   const [composeMsg, setComposeMsg] = useState("");
   const [composeName, setComposeName] = useState("");
+  const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [unreadOnly, setUnreadOnly] = useState(false);
+  const [staffList, setStaffList] = useState<{ id: string; full_name: string; role: string }[]>([]);
   const threadEndRef = useRef<HTMLDivElement>(null);
 
   // ── Load data
@@ -102,6 +105,20 @@ const InboxPage: React.FC = () => {
       if (data) setMessages(data as any);
     })();
   }, []);
+
+  // ── Load staff list (for the Assign-to control — same narrow pattern as
+  // the PRO module's Grievances "Assign to Staff" dropdown)
+  useEffect(() => {
+    if (!hospitalId) return;
+    (async () => {
+      const { data } = await supabase
+        .from("users")
+        .select("id, full_name, role")
+        .eq("hospital_id", hospitalId)
+        .limit(200);
+      if (data) setStaffList(data as any);
+    })();
+  }, [hospitalId]);
 
   // ── Realtime subscription
   useEffect(() => {
@@ -154,6 +171,8 @@ const InboxPage: React.FC = () => {
       const q = search.toLowerCase();
       if (!m.message_body.toLowerCase().includes(q) && !m.sender_name?.toLowerCase().includes(q) && !m.subject?.toLowerCase().includes(q)) return false;
     }
+    if (activeTag && !(m.tags || []).includes(activeTag)) return false;
+    if (unreadOnly && m.is_read) return false;
     switch (activeSection) {
       case "whatsapp": return m.channel === "whatsapp" && m.direction === "inbound";
       case "in_app": return m.channel === "in_app" && m.direction === "inbound";
@@ -199,6 +218,13 @@ const InboxPage: React.FC = () => {
     if (!selectedMsg) return;
     await supabase.from("inbox_messages").update({ priority: val } as any).eq("id", selectedMsg.id);
     setMessages((prev) => prev.map((m) => m.id === selectedMsg.id ? { ...m, priority: val } : m));
+  };
+
+  const handleAssignChange = async (val: string) => {
+    if (!selectedMsg) return;
+    const newVal = val === "unassigned" ? null : val;
+    await supabase.from("inbox_messages").update({ assigned_to: newVal } as any).eq("id", selectedMsg.id);
+    setMessages((prev) => prev.map((m) => m.id === selectedMsg.id ? { ...m, assigned_to: newVal } : m));
   };
 
   const handleReply = async () => {
@@ -310,18 +336,28 @@ const InboxPage: React.FC = () => {
             );
           })}
 
-          {/* Tags section */}
+          {/* Tags section — filters on the real inbox_messages.tags column */}
           <div className="pt-4 px-3">
             <p className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground mb-2">Tags</p>
             <div className="flex flex-wrap gap-1.5">
-              {["Urgent", "Billing", "Appointment", "Report", "Other"].map((tag) => (
-                <button
-                  key={tag}
-                  className="px-2 py-0.5 text-[10px] rounded-full border border-border text-muted-foreground hover:bg-muted transition-colors"
-                >
-                  {tag}
-                </button>
-              ))}
+              {["Urgent", "Billing", "Appointment", "Report", "Other"].map((tag) => {
+                const tagVal = tag.toLowerCase();
+                const isActive = activeTag === tagVal;
+                return (
+                  <button
+                    key={tag}
+                    onClick={() => setActiveTag(isActive ? null : tagVal)}
+                    className={cn(
+                      "px-2 py-0.5 text-[10px] rounded-full border transition-colors",
+                      isActive
+                        ? "bg-primary/10 border-primary text-primary font-medium"
+                        : "border-border text-muted-foreground hover:bg-muted"
+                    )}
+                  >
+                    {tag}
+                  </button>
+                );
+              })}
             </div>
           </div>
         </nav>
@@ -340,7 +376,14 @@ const InboxPage: React.FC = () => {
               className="pl-8 h-8 text-xs bg-muted/50"
             />
           </div>
-          <Button size="sm" variant="ghost" className="h-8 px-2">
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setUnreadOnly((v) => !v)}
+            title="Show unread only"
+            aria-pressed={unreadOnly}
+            className={cn("h-8 px-2", unreadOnly && "bg-primary/10 text-primary")}
+          >
             <Filter size={14} />
           </Button>
         </div>
@@ -431,6 +474,17 @@ const InboxPage: React.FC = () => {
                 )}
               </div>
               <div className="flex items-center gap-2">
+                <Select value={selectedMsg.assigned_to || "unassigned"} onValueChange={handleAssignChange}>
+                  <SelectTrigger className="h-8 w-[120px] text-xs">
+                    <SelectValue placeholder="Assign to…" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="unassigned">Unassigned</SelectItem>
+                    {staffList.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>{s.full_name}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <Select value={selectedMsg.priority} onValueChange={handlePriorityChange}>
                   <SelectTrigger className="h-8 w-[110px] text-xs">
                     <SelectValue />

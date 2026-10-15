@@ -116,6 +116,13 @@ export const ALL_MODULES: ModuleDefinition[] = [
 
   // ── PATIENT-FACING ──
   { name: "Patient Portal", desc: "Patient self-service", icon: "🌐", route: "/portal", category: "Patient", roles: ["receptionist", "super_admin"] },
+  // "pro_officer" is intentionally the abbreviation, not "patient_relations_officer" — same
+  // established convention as "mrd_officer" (Medical Records). Creating a custom role titled
+  // "Patient Relations Officer" on Settings → Roles & Permissions slugifies to
+  // "patient_relations_officer" and will NOT match this list; the admin must type "PRO Officer"
+  // (see docs/training/patient-relations-officer.md, "Access check"). Do not widen this array to
+  // add "patient_relations_officer" as a silent fix — if a future role needs its natural full
+  // title to work, name the role string to match it from the start instead of aliasing here.
   { name: "Patient Relations", desc: "Grievances, feedback, visitor passes & NABH PCC", icon: "🤝", route: "/pro", category: "Patient", roles: ["pro_officer", "receptionist", "super_admin"] },
   { name: "Communication Inbox", desc: "WhatsApp & messages", icon: "📬", route: "/inbox", category: "Patient", roles: ["receptionist", "super_admin"] },
 

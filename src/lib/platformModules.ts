@@ -2,7 +2,7 @@ import type React from "react";
 import {
   Newspaper, Radar, Gift, Heart, Building2, CreditCard, Tag, BarChart3, BrainCircuit,
   AlertTriangle, ScrollText, ShieldCheck, Workflow, FlaskConical, Sparkles, KeyRound,
-  Smartphone, Headset,
+  Smartphone, Headset, PlayCircle,
 } from "lucide-react";
 
 export type PlatformModuleCategory = "Growth" | "Commerce" | "Operations";
@@ -28,6 +28,7 @@ export const ALL_PLATFORM_MODULES: PlatformModuleDefinition[] = [
   { name: "Churn Radar", desc: "Hospitals showing early risk signals", icon: Radar, path: "/platform/churn-radar", category: "Growth" },
   { name: "Referrals", desc: "Hospital-to-hospital referral program tracking", icon: Gift, path: "/platform/referrals", category: "Growth" },
   { name: "Cust. Success", desc: "Onboarding health and account-management queue", icon: Heart, path: "/platform/customer-success", category: "Growth" },
+  { name: "Training Videos", desc: "Add and manage the how-to videos hospital staff see in Settings", icon: PlayCircle, path: "/platform/customer-success?tab=videos", category: "Growth" },
 
   // ── COMMERCE ──
   { name: "Hospitals", desc: "Every tenant — status, plan, modules, billing", icon: Building2, path: "/platform/hospitals", category: "Commerce" },

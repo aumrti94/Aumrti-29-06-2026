@@ -12,6 +12,13 @@ import { toast } from "sonner";
 import { Plus, Upload, Users, Loader2, Download } from "lucide-react";
 import * as XLSX from "xlsx";
 import { useHospitalId } from '@/hooks/useHospitalId';
+import { generateBillNumber } from "@/hooks/useBillNumber";
+import { autoPostJournalEntry } from "@/lib/accounting";
+import { recalculateBillTotalsSafe } from "@/lib/billTotals";
+import { roundCurrency, calcLineTotal } from "@/lib/currency";
+import { getDefaultGSTRate } from "@/lib/gstRules";
+import { parseComponents, componentsOfType } from "@/lib/packageComponents";
+import { resolveComponentNames, STAGED_ORDERS_KEY, releasePackageOrders } from "@/lib/packageOrders";
 
 
 interface CsvEmployee {
@@ -39,7 +46,9 @@ export default function CorporateTab() {
   }, [hospitalId]);
 
   const loadPackages = useCallback(async () => {
-    const { data } = await supabase.from("health_packages").select("id, package_name, price").eq("hospital_id", hospitalId).eq("is_active", true).order("package_name");
+    // `components` is read here (not just id/package_name/price) so bulkBook can stage the
+    // package's lab/radiology orders without a second round trip per employee.
+    const { data } = await supabase.from("health_packages").select("id, package_name, price, components").eq("hospital_id", hospitalId).eq("is_active", true).order("package_name");
     setPackages(data || []);
   }, [hospitalId]);
 
@@ -114,15 +123,48 @@ export default function CorporateTab() {
   };
 
   const bulkBook = async () => {
+    if (!hospitalId) { toast.error("Hospital not resolved — reload and try again"); return; }
     if (!bulkAccountId) { toast.error("Select a corporate account"); return; }
     if (!bulkPackageId) { toast.error("Select a package"); return; }
     if (csvEmployees.length === 0) { toast.error("Upload file first"); return; }
     const validEmployees = csvEmployees.filter(e => !e._error);
     if (validEmployees.length === 0) { toast.error("No valid employees to book"); return; }
 
+    const selectedAccount = accounts.find(a => a.id === bulkAccountId);
+    const selectedPkg = packages.find(p => p.id === bulkPackageId);
+    if (!selectedAccount || !selectedPkg) { toast.error("Account or package not found — reopen the dialog"); return; }
+
     setBooking(true);
     let success = 0;
     let failed = 0;
+    let stagingIncomplete = 0;
+
+    const { data: { user } } = await supabase.auth.getUser();
+    const { data: userData } = await supabase.from("users").select("id").eq("auth_user_id", user?.id || "").maybeSingle();
+    const userId = userData?.id || null;
+
+    // Corporate account's negotiated rate — captured on the Add Corporate Account form but,
+    // until now, never read by any billing path. Apply it here so the company is billed at
+    // its contracted rate, not full list price.
+    const discountPercent = Number(selectedAccount.negotiated_rate_percent) || 0;
+    const listPrice = Number(selectedPkg.price) || 0;
+    const fee = roundCurrency(listPrice * (1 - discountPercent / 100));
+    // Health packages are a composite healthcare supply — statutory rate from gstRules
+    // (gst_master-equivalent for this item type), never a hardcoded literal.
+    const gstPercent = getDefaultGSTRate("package");
+    const { gst: gstAmount, total } = calcLineTotal(fee, gstPercent);
+    const today = new Date().toISOString().split("T")[0];
+    const creditDays = selectedAccount.credit_days ?? 30;
+
+    // Resolve the package's lab/radiology components ONCE for the whole batch — every employee
+    // in this CSV is booking the same package, so the master lookup (resolveComponentNames) is
+    // package-level, not per-employee. Identical resolution to BookPackageModal.tsx's booking-time
+    // staging; only the per-employee syncLabOrders/syncRadiologyOrders calls below vary by patient.
+    const components = parseComponents(selectedPkg.components);
+    const labNames = await resolveComponentNames(
+      hospitalId, componentsOfType(components, "lab_test"), "lab_test_master", "test_name");
+    const radNames = await resolveComponentNames(
+      hospitalId, componentsOfType(components, "radiology"), "radiology_study_master", "study_name");
 
     for (const emp of validEmployees) {
       try {
@@ -136,7 +178,7 @@ export default function CorporateTab() {
             .eq("phone", emp.phone)
             .limit(1)
             .maybeSingle();
-          
+
           if (existing) {
             patientId = existing.id;
           }
@@ -155,31 +197,178 @@ export default function CorporateTab() {
             } as any)
             .select("id")
             .maybeSingle();
-          
+
           if (pErr || !newPatient) { failed++; continue; }
           patientId = newPatient.id;
         }
 
         if (!patientId) { failed++; continue; }
 
-        // Create booking
+        // Create the deferred/credit bill FIRST, before the booking exists at all — this is
+        // the fix for the leak this function used to be: a package_bookings row was inserted
+        // with no bills row behind it, so Today's Checkups could raise real lab/radiology
+        // orders (via the Lab station's pre-staging fallback) with nothing ever billed.
+        // Corporate accounts are invoiced on credit terms (credit_days), not paid at booking
+        // time, so the bill is created unpaid/outstanding now rather than withheld like an
+        // individual walk-in package.
+        const billNumber = await generateBillNumber(hospitalId, "PKG");
+        const { data: bill, error: billErr } = await supabase.from("bills").insert({
+          hospital_id: hospitalId,
+          patient_id: patientId,
+          bill_number: billNumber,
+          bill_type: "package" as any,
+          bill_date: today,
+          subtotal: fee,
+          gst_amount: gstAmount,
+          total_amount: total,
+          patient_payable: total,
+          paid_amount: 0,
+          balance_due: total,
+          payment_status: "unpaid",
+          bill_status: "final",
+          gstin_patient: selectedAccount.gstin || null,
+          notes: `Corporate billing — ${selectedAccount.company_name} — due in ${creditDays} day(s) on credit terms. Employee: ${emp.name}${emp.employee_id ? ` (ID ${emp.employee_id})` : ""}.`,
+          created_by: userId,
+        } as any).select("id").maybeSingle();
+
+        if (billErr || !bill) { console.error("Corporate package bill failed:", billErr); failed++; continue; }
+
+        const { error: liErr } = await supabase.from("bill_line_items").insert({
+          hospital_id: hospitalId,
+          bill_id: bill.id,
+          description: `Health Package (Corporate — ${selectedAccount.company_name}): ${selectedPkg.package_name}`,
+          item_type: "package",
+          unit_rate: fee,
+          quantity: 1,
+          taxable_amount: fee,
+          gst_percent: gstPercent,
+          gst_amount: gstAmount,
+          total_amount: total,
+        } as any);
+        if (liErr) { console.error("Corporate package line item failed:", liErr); failed++; continue; }
+
+        await recalculateBillTotalsSafe(bill.id);
+
+        await autoPostJournalEntry({
+          triggerEvent: "bill_finalized_opd",
+          sourceModule: "packages",
+          sourceId: bill.id,
+          amount: total,
+          description: `Corporate Package Revenue - ${selectedAccount.company_name} - ${selectedPkg.package_name} - ${billNumber}`,
+          hospitalId,
+          postedBy: userId || "",
+        });
+
+        // Stage this employee's lab/radiology orders BEFORE the package_bookings insert, same
+        // as BookPackageModal.tsx. syncLabOrders/syncRadiologyOrders write billing_status:
+        // "unbilled" — they only become visible to the Lab/Radiology worklists once released
+        // below (or, for a non-corporate booking, on payment — see billPayments.ts). Each call
+        // is independently try/caught, matching BookPackageModal: a sync failure for one
+        // employee must not fail the booking for that employee, nor abort the batch.
+        const stagedLabIds: string[] = [];
+        const stagedRadIds: string[] = [];
+        const indication = `Health Package (Corporate — ${selectedAccount.company_name}): ${selectedPkg.package_name}`;
+        // Tracks whether any part of this employee's lab/radiology staging failed to fully
+        // land — a sync throwing, or a sync returning unmatched tests/studies. This is an
+        // audit-trail gap, not a billing error: the bill above is already correct regardless,
+        // but an operator needs to know this employee's bill may have fewer orders behind it
+        // than the package promises.
+        let empStagingIncomplete = false;
+
+        if (labNames.length > 0) {
+          try {
+            const { syncLabOrders } = await import("@/lib/investigationSync");
+            const labSync = await syncLabOrders({
+              hospitalId, patientId, orderedBy: userId || "",
+              encounterId: null, admissionId: null,
+              items: labNames.map(t => ({ test_name: t, urgency: "routine", clinical_indication: indication })),
+            });
+            stagedLabIds.push(...labSync.orderIds);
+            if (labSync.unmatched.length > 0) {
+              console.error(`Corporate package lab test(s) not in test master for ${emp.name}: ${labSync.unmatched.join(", ")}`);
+              empStagingIncomplete = true;
+            }
+          } catch (e) {
+            console.error("Corporate package lab order sync error:", e);
+            empStagingIncomplete = true;
+          }
+        }
+
+        if (radNames.length > 0) {
+          try {
+            const { syncRadiologyOrders } = await import("@/lib/investigationSync");
+            const radSync = await syncRadiologyOrders({
+              hospitalId, patientId, orderedBy: userId || "",
+              encounterId: null, admissionId: null,
+              items: radNames.map(r => ({ study_name: r, urgency: "routine", clinical_indication: indication })),
+            });
+            stagedRadIds.push(...radSync.orderIds);
+            if (radSync.unmatched.length > 0) {
+              console.error(`Corporate package radiology study(ies) not in study master for ${emp.name}: ${radSync.unmatched.join(", ")}`);
+              empStagingIncomplete = true;
+            }
+          } catch (e) {
+            console.error("Corporate package radiology order sync error:", e);
+            empStagingIncomplete = true;
+          }
+        }
+
+        // Create booking with the bill already linked, hospital_id set, and the staged order
+        // ids recorded under the reserved components_done key — identical shape to
+        // BookPackageModal.tsx so TodaysCheckupsTab's readStagedOrders()/alreadyStaged check
+        // recognises these exactly as it would a modal-booked package.
+        //
+        // Previously this insert (a) never set hospital_id — a NOT NULL column with no
+        // default and no trigger on package_bookings, so every row failed outright — and
+        // (b) sent `booking_source: "corporate"`, a column that does not exist on
+        // package_bookings in the generated schema or any migration that created/altered the
+        // table. Net effect in production: a 100% insert failure rate, so no corporate bulk
+        // booking has ever actually been created. `corporate_account_id` already identifies a
+        // corporate-sourced booking, so the invalid booking_source field is dropped rather
+        // than replaced.
         const { error: bErr } = await supabase.from("package_bookings").insert({
+          hospital_id: hospitalId,
           patient_id: patientId,
           package_id: bulkPackageId,
           scheduled_date: bulkDate,
           status: "booked",
           corporate_account_id: bulkAccountId,
-          booking_source: "corporate",
+          bill_id: bill.id,
+          components_done: {
+            [STAGED_ORDERS_KEY]: { lab: stagedLabIds, radiology: stagedRadIds },
+          },
         } as any);
 
-        if (bErr) { failed++; } else { success++; }
-      } catch {
+        if (bErr) { console.error("Corporate booking insert failed:", bErr); failed++; continue; }
+
+        // Corporate accounts are billed on credit (credit_days, applied to this bill's notes
+        // above) — the employee's bill may legitimately sit unpaid for the whole credit window.
+        // billPayments.ts only calls releasePackageOrders() when a bill is PAID, which would
+        // leave these lab/radiology orders invisible to their worklists for that entire window.
+        // For a corporate account, "bill exists under the credit contract" — already true at
+        // this point — is the correct trust boundary, not "bill paid", so release immediately
+        // rather than waiting for a payment event that may be weeks away.
+        await releasePackageOrders(bill.id);
+
+        if (empStagingIncomplete) stagingIncomplete++;
+        success++;
+      } catch (e) {
+        console.error("Corporate bulk booking error:", e);
         failed++;
       }
     }
 
     setBooking(false);
-    toast.success(`Booked ${success} employees. ${failed > 0 ? `${failed} failed.` : ""}`);
+    // `failed` is "the booking/bill itself failed" (no bill exists for this employee).
+    // `stagingIncomplete` is a distinct, narrower condition: the booking and bill succeeded,
+    // but the lab/radiology orders behind it did not fully stage (sync threw, or came back
+    // with unmatched tests/studies) — a valid corporate bill with missing orders behind it
+    // that needs a manual follow-up, not a billing-correctness problem.
+    toast.success(
+      `Booked and billed ${success} employees.` +
+      `${failed > 0 ? ` ${failed} failed.` : ""}` +
+      `${stagingIncomplete > 0 ? ` Lab/radiology orders could not be created for ${stagingIncomplete} — check manually.` : ""}`
+    );
     setCsvEmployees([]);
     setShowBulk(false);
   };

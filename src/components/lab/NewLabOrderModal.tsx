@@ -96,6 +96,9 @@ const NewLabOrderModal: React.FC<Props> = ({ hospitalId, onClose, onCreated, pre
   const [testSearch, setTestSearch] = useState("");
   const [selectedTests, setSelectedTests] = useState<Test[]>([]);
   const [groups, setGroups] = useState<TestGroup[]>([]);
+  /** Distinguishes "panels not fetched yet" from "this hospital has none" — pre-selection
+   *  latches once, so running it before the panels arrive loses them permanently. */
+  const [groupsLoaded, setGroupsLoaded] = useState(false);
   const [appliedGroups, setAppliedGroups] = useState<TestGroup[]>([]);
   const [clinicalNotes, setClinicalNotes] = useState("");
   const [linkedEncounter, setLinkedEncounter] = useState<string | null>(null);
@@ -209,26 +212,46 @@ const NewLabOrderModal: React.FC<Props> = ({ hospitalId, onClose, onCreated, pre
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Auto-select tests from OPD prescription (fires when allTests or pendingTestNames change)
+  // Auto-select tests from OPD prescription (fires when allTests, groups or pendingTestNames change)
   useEffect(() => {
-    if (preselectionDone.current || !allTests.length) return;
+    // `groups` must be loaded before this latches, or a prescription naming only panels marks
+    // pre-selection done against an empty group list and never selects anything.
+    if (preselectionDone.current || !allTests.length || !groupsLoaded) return;
     // OPD flow: names passed as prop; Lab module flow: names fetched from saved prescription
     const names = preselectedNamesRef.current.length > 0 ? preselectedNamesRef.current : pendingTestNames;
     if (!names.length) return;
     const matched = allTests.filter((t) =>
       names.some((name) => t.test_name.toLowerCase().trim() === name.toLowerCase().trim())
     );
-    if (matched.length > 0) {
-      setSelectedTests(matched);
+    // A prescribed PANEL name is not a test name, so the pass above cannot see it — it selected
+    // nothing and the panel was never ordered or billed. Expansion in the consultation fixes
+    // this going forward, but it only runs if the doctor opened the Rx tab, and every
+    // prescription saved before it existed still carries the bundle name.
+    //
+    // Exact group-name match only, never the fuzzy matcher: these names have already been
+    // through it with a clinician looking at the result. At the billing counter nobody is.
+    const matchedGroups = groups.filter((g) =>
+      g.testIds.length > 0 &&
+      names.some((name) => g.group_name.toLowerCase().trim() === name.toLowerCase().trim())
+    );
+    const groupTestIds = new Set(matchedGroups.flatMap((g) => g.testIds));
+    const alreadySelected = new Set(matched.map((t) => t.id));
+    const groupTests = allTests.filter((t) => groupTestIds.has(t.id) && !alreadySelected.has(t.id));
+
+    if (matched.length > 0 || groupTests.length > 0) {
+      setSelectedTests([...matched, ...groupTests]);
+      // Recorded as applied groups so fetchRates bills one line at the panel fee and the
+      // cashier can remove the panel as a unit.
+      if (matchedGroups.length) setAppliedGroups(matchedGroups);
       preselectionDone.current = true;
     }
-  }, [allTests, pendingTestNames]);
+  }, [allTests, groups, groupsLoaded, pendingTestNames]);
 
   // Fetch test groups
   useEffect(() => {
     (supabase as any)
       .from("lab_test_groups")
-      .select("id, group_name, group_code, fee, lab_test_group_items(test_id)")
+      .select("id, group_name, group_code, fee, lab_test_group_items(test_id, lab_test_master:test_id(is_active))")
       .eq("hospital_id", hospitalId)
       .eq("is_active", true)
       .order("group_name")
@@ -238,8 +261,14 @@ const NewLabOrderModal: React.FC<Props> = ({ hospitalId, onClose, onCreated, pre
           group_name: g.group_name,
           group_code: g.group_code,
           fee: Number(g.fee) || 0,
-          testIds: (g.lab_test_group_items || []).map((i: any) => i.test_id),
+          // Deactivated members are excluded deliberately. `allTests` is is_active-filtered, so
+          // a group holding a dead member could never satisfy the every() in fetchRates — the
+          // panel fee was simply unreachable and the patient paid the sum of the parts instead.
+          testIds: (g.lab_test_group_items || [])
+            .filter((i: any) => i.lab_test_master?.is_active)
+            .map((i: any) => i.test_id),
         })));
+        setGroupsLoaded(true);
       });
   }, [hospitalId]);
 
@@ -1131,8 +1160,11 @@ const NewLabOrderModal: React.FC<Props> = ({ hospitalId, onClose, onCreated, pre
                   const prescribed = preselectedNamesRef.current.length > 0
                     ? preselectedNamesRef.current
                     : pendingTestNames;
+                  // A panel name is not a test name but IS orderable, so it must not be listed
+                  // here — the pre-selection above resolves it to the panel's member tests.
                   const unmatched = prescribed.filter(
                     name => !allTests.some(t => t.test_name.toLowerCase().trim() === name.toLowerCase().trim())
+                      && !groups.some(g => g.testIds.length > 0 && g.group_name.toLowerCase().trim() === name.toLowerCase().trim())
                   );
                   return unmatched.length > 0 ? (
                     <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5">

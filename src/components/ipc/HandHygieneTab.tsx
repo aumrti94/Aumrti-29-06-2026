@@ -5,6 +5,16 @@ import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogAction,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
 import { Droplets, Plus, Loader2, X, AlertTriangle, CheckCircle2, TrendingUp } from "lucide-react";
 import { FormError } from "@/components/ui/FormError";
 import { getErrorMessage } from "@/lib/errorMessage";
@@ -71,6 +81,7 @@ const HandHygieneTab: React.FC<{ hospitalId: string }> = ({ hospitalId }) => {
   const [error, setError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [form, setForm] = useState({
     audit_date: today,
     area_name: "",
@@ -339,7 +350,7 @@ const HandHygieneTab: React.FC<{ hospitalId: string }> = ({ hospitalId }) => {
                     </p>
                   )}
                 </div>
-                <button onClick={() => remove(a.id)}
+                <button onClick={() => setDeleteTarget(a.id)}
                   className="p-1 text-muted-foreground hover:text-destructive shrink-0">
                   <X className="h-3.5 w-3.5" />
                 </button>
@@ -348,6 +359,25 @@ const HandHygieneTab: React.FC<{ hospitalId: string }> = ({ hospitalId }) => {
           );
         })}
       </div>
+
+      <AlertDialog open={!!deleteTarget} onOpenChange={(o) => { if (!o) setDeleteTarget(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this audit record?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently deletes the hand hygiene audit record. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => { const id = deleteTarget!; setDeleteTarget(null); remove(id); }}
+            >
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 };

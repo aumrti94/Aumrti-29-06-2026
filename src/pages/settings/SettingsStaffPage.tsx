@@ -82,14 +82,25 @@ const ROLE_META: Record<string, { icon: React.ElementType; label: string; color:
   super_admin:       { icon: Shield,        label: "Super Admin",       color: "bg-[hsl(222,55%,23%)] text-white border-transparent" },
 };
 
+// Accountant and Billing Executive are two genuinely separate jobs (src/lib/appRoles.ts,
+// APP_ROLES), not two names for one role — confirmed by reading routeRoles.ts/modules.ts
+// directly: `accountant` gates the back-office accounting screens (Accounts/ERP, Financial
+// Statements, Budget, Fixed Assets), while `billing_executive` gates day-to-day OPD/IPD
+// billing, Insurance/TPA, Govt Schemes, Medical Records, and Analytics & BI. Both need a
+// default card so a Hospital Admin's very first "Billing" hire on day one can land on
+// whichever of the two jobs they're actually hiring for, and reach every module gated on
+// that role string without a separate custom-role step. Before this, only an "accountant"
+// card existed labelled "Billing" — which silently locked out Analytics and MRD for any
+// front-desk Billing Clerk created the normal way (Phase 8/9 training findings).
 const DEFAULT_ROLE_CARDS: { role: AppRole; icon: React.ElementType; label: string }[] = [
-  { role: "doctor",         icon: Stethoscope,   label: "Doctor" },
-  { role: "nurse",          icon: HeartPulse,     label: "Nurse" },
-  { role: "accountant",     icon: Receipt,        label: "Billing" },
-  { role: "pharmacist",     icon: Pill,           label: "Pharmacist" },
-  { role: "lab_tech",       icon: TestTube,       label: "Lab Tech" },
-  { role: "receptionist",   icon: ClipboardList,  label: "Reception" },
-  { role: "hospital_admin", icon: Shield,         label: "Admin / CEO" },
+  { role: "doctor",             icon: Stethoscope,   label: "Doctor" },
+  { role: "nurse",              icon: HeartPulse,     label: "Nurse" },
+  { role: "billing_executive",  icon: Receipt,        label: "Billing Executive" },
+  { role: "accountant",         icon: Receipt,        label: "Accountant" },
+  { role: "pharmacist",         icon: Pill,           label: "Pharmacist" },
+  { role: "lab_tech",           icon: TestTube,       label: "Lab Tech" },
+  { role: "receptionist",       icon: ClipboardList,  label: "Reception" },
+  { role: "hospital_admin",     icon: Shield,         label: "Admin / CEO" },
 ];
 
 /* ─── Bulk doctor row ─── */

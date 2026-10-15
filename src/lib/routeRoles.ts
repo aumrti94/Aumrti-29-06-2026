@@ -25,10 +25,17 @@ ROUTE_ROLES['/quality/events'] = [
   'super_admin', 'hospital_admin', 'quality_officer', 'quality_manager',
   'doctor', 'nurse', 'receptionist', 'nursing_supervisor',
 ];
-ROUTE_ROLES['/ipc/dashboard'] = [
-  'super_admin', 'hospital_admin', 'quality_officer', 'quality_manager',
-  'doctor', 'nurse', 'nursing_supervisor',
-];
+// No override for /ipc/dashboard — ALL_MODULES already declares the correct role list
+// (quality_officer, quality_manager, infection_control_nurse, doctor, super_admin,
+// hospital_admin). The override that used to sit here was missing infection_control_nurse —
+// the role the catalogue created specifically to represent nursing on this module — while
+// granting access to generic nurse/nursing_supervisor instead. Investigated per Nirmala: IPC
+// surveillance data entry here (device-day logging, HAI event entry, antibiogram review, AI
+// anomaly detection) is infection-control-team work, not bedside nursing's; a ward nurse
+// performs hand hygiene in practice but does not log the audit or read microbiology/antibiogram
+// data in this dashboard — that is the IPC nurse's job, which is exactly the role the catalogue
+// already names. Same copy-paste-override shape Phase 9 found and fixed for /fms/dashboard
+// (see that comment below for precedent).
 ROUTE_ROLES['/quality/clinical-audits'] = [
   'super_admin', 'hospital_admin', 'quality_officer', 'quality_manager',
   'doctor', 'nursing_supervisor',
@@ -41,10 +48,24 @@ ROUTE_ROLES['/quality/committees'] = [
   'super_admin', 'hospital_admin', 'quality_officer', 'quality_manager',
   'doctor', 'nursing_supervisor',
 ];
-ROUTE_ROLES['/fms/dashboard'] = [
-  'super_admin', 'hospital_admin', 'quality_officer', 'quality_manager',
-];
-ROUTE_ROLES['/abdm'] = ['super_admin', 'hospital_admin', 'doctor', 'billing_executive'];
+// No override for /fms/dashboard — ALL_MODULES already declares the correct role list
+// (facility_manager, biomedical_technician, super_admin, hospital_admin). A copy-paste from
+// the /quality/committees override above used to sit here, silently locking out the two
+// roles this module was built for while granting it to quality_officer/quality_manager, who
+// have no operational reason to be on this screen (confirmed: NABH FMS-chapter safety rounds,
+// PM schedules, and BMW manifests are logged by Facility/Biomedical staff; Quality's role is
+// to audit that evidence afterward via /nabh/compliance, which already has its own entry).
+// No override for /abdm beyond restoring the catalogue list — the previous override dropped
+// receptionist and nurse (both zero-setup default role cards on Settings → Staff Members, and
+// both confirmed in use: docs/training/front-desk.md documents Receptionist capturing a
+// patient's ABHA ID and clicking Verify at registration) while granting billing_executive, which
+// has no operational tie anywhere in ABDMConsentPage.tsx or ABDMCareContextsPanel.tsx — no
+// charge, claim, or invoice logic touches /abdm; the only "payment" string on the page is the
+// HPAYMT consent-purpose label in a dropdown, not a billing-role code path. Same copy-paste-
+// override bug class as the FMS/IPC precedent fixes this sprint, not a deliberate privacy
+// restriction (a restriction that excludes the clinical "nurse" role while admitting a finance
+// role would be internally inconsistent as policy). Confirmed: ALL_MODULES already declares the
+// correct role list (receptionist, doctor, nurse, hospital_admin, super_admin).
 ROUTE_ROLES['/settings/record-retention'] = ['super_admin', 'hospital_admin'];
 ROUTE_ROLES['/settings/change-log']  = ['super_admin', 'hospital_admin'];
 ROUTE_ROLES['/settings/tv-display']    = ['super_admin', 'hospital_admin', 'receptionist'];
@@ -165,7 +186,18 @@ export function hasAccess(
   const normalizedPath = path.split("?")[0].replace(/\/$/, "") || "/";
 
   // 1.5 Core routes that all authenticated users can access
-  const coreRoutes = ["/dashboard", "/modules", "/settings/profile", "/inbox", "/my-hr", "/quick-access"];
+  //
+  // "/lms" was added here so any authenticated staff member can reach Staff Training's
+  // Staff View — their OWN assigned courses, quiz, and certificates — the same way every
+  // other module lets a logged-in user see their own record. Before this, `/lms` was
+  // gated to hr_manager/super_admin/hospital_admin ONLY (ALL_MODULES in modules.ts), which
+  // blocked a Doctor or Nurse from even taking their own "Hand Hygiene" or "Fire Safety"
+  // course. Widening this gate does NOT widen who can run the Training Coordinator's
+  // Admin View (Bulk Enrol / Add Course / Add Questions) — `LMSPage.tsx` gates that
+  // separately via `hasLmsAdminAccess` below, which reproduces the ORIGINAL gate this
+  // comment replaces. It also does not widen plan entitlement — `<ModuleGate>` still
+  // independently blocks hospitals whose plan doesn't include LMS, regardless of role.
+  const coreRoutes = ["/dashboard", "/modules", "/settings/profile", "/inbox", "/my-hr", "/quick-access", "/lms"];
   if (coreRoutes.includes(normalizedPath)) return true;
 
   // 1.6 The settings surface is gated by ROLE, never by module entitlement.
@@ -232,6 +264,39 @@ export function hasAccess(
   if (!allowedRoles) return false;
 
   return allowedRoles.includes(role);
+}
+
+/**
+ * The pre-widening `/lms` gate, preserved for Admin View eligibility.
+ *
+ * `/lms` was added to `coreRoutes` above so every authenticated staff member can reach
+ * Staff View (their own assigned training). Before that change, `hasAccess('/lms', ...)`
+ * WAS the admin gate — nothing else protected Bulk Enrol / Add Course / Add Questions.
+ * This function is that same check, verbatim, with the coreRoutes short-circuit removed,
+ * so `LMSPage.tsx` can keep Admin View and its three handlers restricted exactly as the
+ * whole page used to be: `hr_manager` / `super_admin` / `hospital_admin`, or an explicit
+ * `view` grant on the `lms` module (or its `hr` legacy-parent fallback, see
+ * `LEGACY_MODULE_PARENT` in moduleRegistry.ts) in the permission matrix.
+ */
+export function hasLmsAdminAccess(
+  role: string | null,
+  permissions?: Record<string, any> | null
+): boolean {
+  if (!role) return false;
+  if (BYPASS_ROLES.includes(role)) return true;
+
+  if (permissions !== null && permissions !== undefined) {
+    if (permissions.all === true) return true;
+    const modPerms = resolveModPerms(permissions, "lms");
+    if (modPerms) {
+      if (typeof modPerms === "string") return modPerms === "r" || modPerms === "rw";
+      if (typeof modPerms === "object") return (modPerms as any).view === true;
+    }
+    return false;
+  }
+
+  const allowedRoles = staticRolesFor("/lms");
+  return allowedRoles ? allowedRoles.includes(role) : false;
 }
 
 /**

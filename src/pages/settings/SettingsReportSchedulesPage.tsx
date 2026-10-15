@@ -12,6 +12,7 @@ import { Plus, Send, Trash2, Loader2 } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import { supabase } from "@/integrations/supabase/client";
 import { getHospitalId } from "@/lib/getHospitalId";
+import { useHospitalId } from "@/hooks/useHospitalId";
 import { format } from "date-fns";
 
 interface Schedule {
@@ -41,6 +42,7 @@ const REPORT_TYPES = [
 
 const SettingsReportSchedulesPage: React.FC = () => {
   const { toast } = useToast();
+  const { userId } = useHospitalId();
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
@@ -89,6 +91,7 @@ const SettingsReportSchedulesPage: React.FC = () => {
 
     const payload: any = {
       hospital_id: hospitalId,
+      created_by: userId,
       report_name: form.report_name.trim(),
       report_type: form.report_type,
       frequency: form.frequency,

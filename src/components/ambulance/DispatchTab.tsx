@@ -8,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Plus, MapPin, Clock } from "lucide-react";
 import { cn } from "@/lib/utils";
+import PatientSearchPicker from "@/components/shared/PatientSearchPicker";
 
 type DispatchStatus = "dispatched" | "en_route" | "at_scene" | "transporting" | "completed";
 
@@ -49,7 +50,7 @@ const DispatchTab: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [dragId, setDragId] = useState<string | null>(null);
   const [form, setForm] = useState({
-    vehicle_id: "", pickup_location: "", destination: "", complaint: "", crew_names: "",
+    vehicle_id: "", pickup_location: "", destination: "", complaint: "", crew_names: "", patient_id: "",
   });
 
   const load = useCallback(async () => {
@@ -85,10 +86,13 @@ const DispatchTab: React.FC = () => {
       destination: form.destination || null,
       complaint: form.complaint || null,
       crew_names: form.crew_names ? form.crew_names.split(",").map(s => s.trim()).filter(Boolean) : null,
+      // Previously never set anywhere on this form — moveDispatch()'s auto-bill-on-completion
+      // check is gated on patient_id, so without this every ambulance trip billed ₹0 silently.
+      patient_id: form.patient_id || null,
       dispatch_at: new Date().toISOString(),
     });
     if (error) { toast({ title: "Failed", description: error.message, variant: "destructive" }); }
-    else { toast({ title: "Dispatch created" }); setShowForm(false); setForm({ vehicle_id: "", pickup_location: "", destination: "", complaint: "", crew_names: "" }); load(); }
+    else { toast({ title: "Dispatch created" }); setShowForm(false); setForm({ vehicle_id: "", pickup_location: "", destination: "", complaint: "", crew_names: "", patient_id: "" }); load(); }
     setSaving(false);
   };
 
@@ -180,6 +184,15 @@ const DispatchTab: React.FC = () => {
         <DialogContent className="max-w-sm">
           <DialogHeader><DialogTitle>New Dispatch</DialogTitle></DialogHeader>
           <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium">Patient (if already known)</label>
+              <PatientSearchPicker
+                hospitalId={hospitalId}
+                value={form.patient_id}
+                onChange={v => setForm(f => ({ ...f, patient_id: v }))}
+                placeholder="Search by name or UHID — leave blank if not yet known"
+              />
+            </div>
             <div>
               <label className="text-xs font-medium">Pickup Location *</label>
               <Input placeholder="Patient address / location" value={form.pickup_location}

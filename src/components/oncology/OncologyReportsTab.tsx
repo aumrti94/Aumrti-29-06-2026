@@ -11,12 +11,15 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
+import { useHospitalId } from "@/hooks/useHospitalId";
+import { logNABHEvidence } from "@/lib/nabh-evidence";
 import { format } from "date-fns";
 
 const TOXICITY_TYPES = ["Haematological", "GI", "Neurological", "Renal", "Hepatic", "Alopecia", "Mucositis", "Fatigue", "Cardiac", "Dermatological"];
 
 const OncologyReportsTab: React.FC = () => {
   const { toast } = useToast();
+  const { hospitalId, userId } = useHospitalId();
   const [toxicities, setToxicities] = useState<any[]>([]);
   const [wastage, setWastage] = useState<any[]>([]);
   const [showToxForm, setShowToxForm] = useState(false);
@@ -38,10 +41,20 @@ const OncologyReportsTab: React.FC = () => {
 
   const submitToxicity = async () => {
     if (!toxForm.orderId || !toxForm.type) { toast({ title: "Order and toxicity type required", variant: "destructive" }); return; }
-    const order = orders.find((o: any) => o.id === toxForm.orderId);
-    const { error } = await (supabase as any).from("toxicity_events").insert({
-      hospital_id: (await supabase.from("patients").select("hospital_id").limit(1).maybeSingle()).data?.hospital_id,
-      patient_id: (await (supabase as any).from("chemo_orders").select("patient_id").eq("id", toxForm.orderId).maybeSingle()).data?.patient_id,
+    if (!hospitalId) { toast({ title: "Hospital context not ready", variant: "destructive" }); return; }
+
+    // hospital_id used to come from an unscoped `.limit(1).maybeSingle()` read of an arbitrary
+    // patient row instead of the current tenant — useHospitalId() is the only sanctioned source.
+    const { data: orderRow } = await (supabase as any)
+      .from("chemo_orders")
+      .select("patient_id")
+      .eq("id", toxForm.orderId)
+      .maybeSingle();
+    const patientId: string | null = orderRow?.patient_id ?? null;
+
+    const { data: inserted, error } = await (supabase as any).from("toxicity_events").insert({
+      hospital_id: hospitalId,
+      patient_id: patientId,
       order_id: toxForm.orderId,
       cycle_number: toxForm.cycleNumber,
       toxicity_type: toxForm.type,
@@ -51,9 +64,58 @@ const OncologyReportsTab: React.FC = () => {
       dose_modified: toxForm.doseModified,
       dose_modification_type: toxForm.doseModified ? toxForm.modType : null,
       hospitalised: toxForm.hospitalised,
-    });
+    }).select("id").maybeSingle();
     if (error) { toast({ title: "Error", description: error.message, variant: "destructive" }); return; }
     toast({ title: "Toxicity event recorded" });
+
+    // Grade 3+ CTCAE toxicity must raise a real-time clinical alert — the form promises this
+    // ("Clinical alert will be generated") and CLAUDE.md requires clinical alerts to be real,
+    // never mocked/skipped, and surfaced immediately, never batched. `clinical_alerts` is the
+    // same real-time alert mechanism IPDVitalsTab.tsx (vitals_critical) and RxOrdersTab.tsx
+    // (drug_override) already use — no new alert table invented here.
+    if (toxForm.grade >= 3) {
+      const alertMessage = `CTCAE Grade ${toxForm.grade} ${toxForm.type} toxicity — cycle ${toxForm.cycleNumber}` +
+        `${toxForm.hospitalised ? " — patient hospitalised" : ""}${toxForm.description ? `. ${toxForm.description}` : ""}`;
+      const { error: alertError } = await supabase.from("clinical_alerts").insert({
+        hospital_id: hospitalId,
+        patient_id: patientId,
+        created_by: userId ?? null,
+        alert_type: "oncology_toxicity_critical",
+        severity: "critical",
+        alert_message: alertMessage,
+      } as never);
+
+      if (alertError) {
+        // Never fail silently — the whole point of this fix is that the promised alert must
+        // actually reach someone; a swallowed error here recreates the same gap.
+        toast({
+          title: "Clinical alert not raised",
+          description: `Toxicity was recorded but the Grade ${toxForm.grade} alert failed to send: ${alertError.message}`,
+          variant: "destructive",
+        });
+        await logNABHEvidence(
+          hospitalId,
+          "MOM.8",
+          `Grade ${toxForm.grade} CTCAE toxicity (${toxForm.type}) documented for cycle ${toxForm.cycleNumber}, but the required clinical alert failed to raise: ${alertError.message}`,
+          "partially_compliant",
+        );
+      } else {
+        toast({ title: `⚠️ Grade ${toxForm.grade} clinical alert raised`, description: alertMessage, variant: "destructive" });
+        await logNABHEvidence(
+          hospitalId,
+          "MOM.8",
+          `Grade ${toxForm.grade} CTCAE toxicity (${toxForm.type}) alert raised for chemo cycle ${toxForm.cycleNumber}, toxicity event ${inserted?.id ?? "—"}.`,
+          "compliant",
+        );
+      }
+    } else {
+      await logNABHEvidence(
+        hospitalId,
+        "MOM.8",
+        `CTCAE Grade ${toxForm.grade} ${toxForm.type} toxicity documented for chemo cycle ${toxForm.cycleNumber}.`,
+      );
+    }
+
     setShowToxForm(false);
     loadData();
   };

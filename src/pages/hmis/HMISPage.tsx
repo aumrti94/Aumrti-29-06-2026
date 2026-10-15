@@ -185,22 +185,23 @@ const HMISPage: React.FC = () => {
         generated_at: new Date().toISOString(),
       };
 
+      // onConflict must list ALL columns of uq_hmis_report (hospital_id, report_type,
+      // period_year, period_month, period_week — see 20260901000004) or Postgres cannot infer
+      // the target and errors on every call, not just genuine duplicates.
       const { error } = await supabase.from("hmis_reports").upsert({
         hospital_id: hospitalId,
         report_type: "monthly_hmis",
         period_month: month,
+        period_week: null,
         period_year: year,
         status: "generated",
         generated_at: new Date().toISOString(),
         report_data: reportData,
-      } as any, { onConflict: "hospital_id,report_type,period_year,period_month" }).select().maybeSingle();
+      } as any, { onConflict: "hospital_id,report_type,period_year,period_month,period_week" }).select().maybeSingle();
 
       if (error) {
-        // Fallback: insert if upsert fails
-        await supabase.from("hmis_reports").insert({
-          hospital_id: hospitalId, report_type: "monthly_hmis", period_month: month, period_year: year,
-          status: "generated", generated_at: new Date().toISOString(), report_data: reportData,
-        } as any);
+        toast.error("Failed to save report: " + error.message);
+        return;
       }
 
       toast.success(`HMIS Report generated for ${MONTHS[month - 1]} ${year}`);
@@ -263,10 +264,21 @@ const HMISPage: React.FC = () => {
         generated_at: new Date().toISOString(),
       };
 
-      await supabase.from("hmis_reports").insert({
-        hospital_id: hospitalId, report_type: "weekly_idsp_p", period_week: week, period_year: year,
-        status: "generated", generated_at: new Date().toISOString(), report_data: reportData,
-      } as any);
+      const { error } = await supabase.from("hmis_reports").upsert({
+        hospital_id: hospitalId,
+        report_type: "weekly_idsp_p",
+        period_month: null,
+        period_week: week,
+        period_year: year,
+        status: "generated",
+        generated_at: new Date().toISOString(),
+        report_data: reportData,
+      } as any, { onConflict: "hospital_id,report_type,period_year,period_month,period_week" }).select().maybeSingle();
+
+      if (error) {
+        toast.error("Failed to save report: " + error.message);
+        return;
+      }
 
       toast.success(`IDSP P-Form generated for Week ${week}`);
       setViewReport(reportData);
@@ -338,10 +350,21 @@ const HMISPage: React.FC = () => {
         generated_at: new Date().toISOString(),
       };
 
-      await supabase.from("hmis_reports").insert({
-        hospital_id: hospitalId, report_type: "rmncha_monthly", period_month: month, period_year: year,
-        status: "generated", generated_at: new Date().toISOString(), report_data: reportData,
-      } as any);
+      const { error } = await supabase.from("hmis_reports").upsert({
+        hospital_id: hospitalId,
+        report_type: "rmncha_monthly",
+        period_month: month,
+        period_week: null,
+        period_year: year,
+        status: "generated",
+        generated_at: new Date().toISOString(),
+        report_data: reportData,
+      } as any, { onConflict: "hospital_id,report_type,period_year,period_month,period_week" }).select().maybeSingle();
+
+      if (error) {
+        toast.error("Failed to save report: " + error.message);
+        return;
+      }
 
       toast.success(`RMNCH+A Report generated for ${MONTHS[month - 1]} ${year}`);
       setViewReport(reportData);
@@ -406,7 +429,7 @@ const HMISPage: React.FC = () => {
         <tr><td style="padding:6px;border:1px solid #ddd;font-weight:bold">Indication for Procedure</td><td style="padding:6px;border:1px solid #ddd">${record.indication ?? "—"}</td></tr>
         <tr><td style="padding:6px;border:1px solid #ddd;font-weight:bold">Sex Determination Done?</td><td style="padding:6px;border:1px solid #ddd;${record.sex_determination_done ? "color:red;font-weight:bold" : ""}">${record.sex_determination_done ? "YES" : "No"}</td></tr>
         <tr><td style="padding:6px;border:1px solid #ddd;font-weight:bold">Remarks / Findings</td><td style="padding:6px;border:1px solid #ddd">${record.remarks ?? "—"}</td></tr>
-        <tr><td style="padding:6px;border:1px solid #ddd;font-weight:bold">Date</td><td style="padding:6px;border:1px solid #ddd">${record.signed_at ?? record.created_at?.split("T")[0] ?? "—"}</td></tr>
+        <tr><td style="padding:6px;border:1px solid #ddd;font-weight:bold">Date</td><td style="padding:6px;border:1px solid #ddd">${record.signed_at ? format(new Date(record.signed_at), "dd/MM/yyyy") : record.created_at ? format(new Date(record.created_at), "dd/MM/yyyy") : "—"}</td></tr>
       </table>
       <div style="margin-top:40px; display:flex; justify-content:flex-end;">
         <div style="text-align:center; width:200px; border-top:1px solid #333; padding-top:4px; font-size:11px">Signature of Doctor / Radiologist</div>
@@ -595,8 +618,7 @@ const HMISPage: React.FC = () => {
                     <TableCell className="text-xs font-medium">
                       {r.report_type === "monthly_hmis" ? "Monthly HMIS" :
                         r.report_type === "weekly_idsp_p" ? "IDSP P-Form" :
-                          r.report_type === "weekly_idsp_l" ? "IDSP L-Form" :
-                            r.report_type === "rmncha_monthly" ? "RMNCH+A" : r.report_type}
+                          r.report_type === "rmncha_monthly" ? "RMNCH+A" : r.report_type}
                     </TableCell>
                     <TableCell className="text-xs font-mono">
                       {r.period_month ? `${MONTHS[r.period_month - 1]} ${r.period_year}` :
@@ -658,7 +680,7 @@ const HMISPage: React.FC = () => {
               <TableBody>
                 {pcpndtRecords.map((r: any) => (
                   <TableRow key={r.id}>
-                    <TableCell className="text-xs font-mono">{r.signed_at || r.created_at?.split("T")[0]}</TableCell>
+                    <TableCell className="text-xs font-mono">{r.signed_at ? format(new Date(r.signed_at), "dd/MM/yyyy") : r.created_at ? format(new Date(r.created_at), "dd/MM/yyyy") : "—"}</TableCell>
                     <TableCell className="text-xs font-medium">{r.patient_name}</TableCell>
                     <TableCell className="text-xs">{r.patient_age ?? "—"}</TableCell>
                     <TableCell className="text-xs max-w-[200px] truncate">{r.indication ?? "—"}</TableCell>
@@ -814,7 +836,7 @@ const ReportViewerModal: React.FC<{ data: any; onClose: () => void; onMarkSubmit
           {isIDSP && (
             <>
               <div className="text-[10px] text-muted-foreground mb-2">
-                Period: {data.date_range?.from} to {data.date_range?.to} · OPD screened: {data.total_opd_screened} · IPD screened: {data.total_ipd_screened}
+                Period: {data.date_range?.from ? format(new Date(data.date_range.from), "dd/MM/yyyy") : ""} to {data.date_range?.to ? format(new Date(data.date_range.to), "dd/MM/yyyy") : ""} · OPD screened: {data.total_opd_screened} · IPD screened: {data.total_ipd_screened}
               </div>
               <Table>
                 <TableHeader>

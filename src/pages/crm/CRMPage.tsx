@@ -539,7 +539,6 @@ Guidelines:
                           </div>
                           <p className="text-sm mt-1">{r.review_text || <span className="text-muted-foreground italic">No text</span>}</p>
                           <ReviewSentimentAnalyser review={r} onUpdated={loadAll} />
-                          <p className="text-sm mt-1">{r.review_text || <span className="text-muted-foreground italic">No text</span>}</p>
                           <p className="text-xs text-muted-foreground mt-1">
                             {r.reviewer_name || "Anonymous"} · {r.review_date ? format(new Date(r.review_date), "dd/MM/yyyy") : ""}
                           </p>

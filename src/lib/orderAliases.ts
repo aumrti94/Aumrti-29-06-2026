@@ -187,6 +187,12 @@ export const BUILT_IN_ORDER_ALIASES: readonly OrderAlias[] = [
   { alias: "Chest Xray", canonical: "X-Ray Chest PA View" },
   { alias: "X Ray Chest", canonical: "X-Ray Chest PA View" },
   { alias: "Xray Chest", canonical: "X-Ray Chest PA View" },
+  // Naming the view but not the word "view". Spelled out rather than left to the matcher: the
+  // token rule treats a request short of a word the candidate has as a DIFFERENT, more general
+  // request, which is what keeps "Lipid" off "Lipid Profile".
+  { alias: "X Ray Chest PA", canonical: "X-Ray Chest PA View" },
+  { alias: "Chest X Ray PA", canonical: "X-Ray Chest PA View" },
+  { alias: "Chest X Ray PA View", canonical: "X-Ray Chest PA View" },
   { alias: "X Ray KUB", canonical: "X-Ray KUB" },
   { alias: "KUB Xray", canonical: "X-Ray KUB" },
 
@@ -200,6 +206,8 @@ export const BUILT_IN_ORDER_ALIASES: readonly OrderAlias[] = [
 
   { alias: "2D Echo", canonical: "2D Echo + Doppler" },
   { alias: "Echo", canonical: "2D Echo + Doppler" },
+  { alias: "Echo Doppler", canonical: "2D Echo + Doppler" },
+  { alias: "2D Echocardiography", canonical: "2D Echo + Doppler" },
   { alias: "Echocardiography", canonical: "2D Echo + Doppler" },
   { alias: "Echocardiogram", canonical: "2D Echo + Doppler" },
 

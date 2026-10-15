@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
@@ -55,7 +56,11 @@ function formatDuration(seconds: number | null): string {
 export default function CustomerSuccessPage() {
   const { toast } = useToast();
   const qc = useQueryClient();
-  const [activeTab, setActiveTab] = useState("nps");
+  const [searchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const [activeTab, setActiveTab] = useState(
+    requestedTab === "videos" || requestedTab === "tours" ? requestedTab : "nps"
+  );
   const [selectedHospital, setSelectedHospital] = useState("all");
   const [videoSearch, setVideoSearch] = useState("");
   const [showVideoForm, setShowVideoForm] = useState(false);

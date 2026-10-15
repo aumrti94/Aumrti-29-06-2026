@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import { supabase } from '@/integrations/supabase/client';
 import { logNABHEvidence } from '@/lib/nabh-evidence';
 import { useHospitalId } from '@/hooks/useHospitalId';
+import { hasLmsAdminAccess } from '@/lib/routeRoles';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -79,9 +80,14 @@ const categoryColors: Record<string, string> = {
 };
 
 export default function LMSPage() {
-  const { hospitalId, loading: hospitalLoading } = useHospitalId();
+  const { hospitalId, role, permissions, loading: hospitalLoading } = useHospitalId();
   const [searchParams, setSearchParams] = useSearchParams();
-  const isAdmin = searchParams.get('admin') === 'true';
+  // `/lms` itself is now open to every authenticated user (Staff View — their own assigned
+  // training), so `?admin=true` in the URL is no longer, on its own, proof of anything. This
+  // reproduces the gate that used to protect the whole page before that widening: Admin View
+  // (Bulk Enrol / Add Course / Add Questions) stays restricted to hr_manager/super_admin/
+  // hospital_admin or an explicit `lms` permission grant, exactly as before.
+  const isAdmin = searchParams.get('admin') === 'true' && hasLmsAdminAccess(role, permissions);
 
 
   const [courses, setCourses] = useState<Course[]>([]);

@@ -17,11 +17,12 @@
 import { supabase } from "@/integrations/supabase/client";
 import {
   invalidateOrderCatalogue,
+  lookupExactEntry,
   matchOrderNameDetailed,
+  normalizeOrderName,
   type CatalogueKind,
   type OrderCatalogue,
 } from "@/lib/orderCatalogue";
-import { normalizeTerm } from "@/lib/medicalLexicon";
 
 export interface AIOrderResolution {
   input: string;
@@ -67,10 +68,10 @@ export async function resolveOrdersWithAI(opts: {
 
   const names = Array.from(new Set(
     (opts.names ?? []).map((n) => (n ?? "").trim()).filter(Boolean),
-  )).filter((n) => !asked.has(`${hospitalId}:${normalizeTerm(n)}`));
+  )).filter((n) => !asked.has(`${hospitalId}:${normalizeOrderName(n)}`));
 
   if (!names.length) return [];
-  for (const n of names) asked.add(`${hospitalId}:${normalizeTerm(n)}`);
+  for (const n of names) asked.add(`${hospitalId}:${normalizeOrderName(n)}`);
 
   try {
     const { data, error } = await supabase.functions.invoke("ai-resolve-orders", {
@@ -124,11 +125,14 @@ async function persistAliases(
 ): Promise<void> {
   const rows = accepted.map((a) => ({
     hospital_id: hospitalId,
-    raw_name_norm: normalizeTerm(a.input),
+    // Both keys must be built the way the catalogue's own indexes are, or a name containing
+    // "&", "+" or "/" is stored under a key the lookup path can never produce: the alias never
+    // hits, and the row is written with a null catalogue_id.
+    raw_name_norm: normalizeOrderName(a.input),
     raw_name: a.input,
     canonical_name: a.canonicalName,
     catalogue_kind: a.kind,
-    catalogue_id: catalogue.byExact.get(normalizeTerm(a.canonicalName))?.id ?? null,
+    catalogue_id: lookupExactEntry(a.canonicalName, catalogue)?.id ?? null,
     source: "llm",
     confidence: a.confidence,
   }));

@@ -8,6 +8,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { toast } from "@/hooks/use-toast";
 import { Loader2, Plus, Pill, AlertTriangle } from "lucide-react";
 import { useConfigValues } from "@/hooks/useConfigValues";
+import { checkDrugSafety, type DrugSafetyResult } from "@/lib/drugSafetyCheck";
+import DrugSafetyAlertModal from "@/components/opd/DrugSafetyAlertModal";
 
 interface MedRow {
   id: string;
@@ -33,8 +35,11 @@ interface Props {
 
 /**
  * ED medication administration record (eMAR) — Phase 7.
- * Records administered emergency drugs, warns on a likely allergy match against the
- * AMPLE allergies, and optionally bills the drug/consumable via the Phase-1 ed_charge_items.
+ * Records administered emergency drugs and bills the drug/consumable via the Phase-1
+ * ed_charge_items path. Before any drug is recorded as administered, it is run through the
+ * shared `checkDrugSafety()` gate — the same allergy / drug-drug interaction / duplicate-
+ * molecule check used by OPD prescribing and IPD medication administration — so this
+ * drug-administration screen never relies on a narrower, ED-only substring match.
  */
 const EDMedicationPanel: React.FC<Props> = ({
   hospitalId, userId, edVisitId, patientId, patientName, allergies, onClose, onAdministered,
@@ -53,6 +58,15 @@ const EDMedicationPanel: React.FC<Props> = ({
   const [billConsumable, setBillConsumable] = useState(false);
   const [rate, setRate] = useState("");
 
+  // The patient's CONFIRMED structured allergy record (patients.allergies), as distinct from
+  // this visit's unconfirmed AMPLE free-text field below. Neither replaces the other — see
+  // combinedAllergies.
+  const [structuredAllergies, setStructuredAllergies] = useState<string | null>(null);
+
+  const [safetyResult, setSafetyResult] = useState<DrugSafetyResult | null>(null);
+  const [showSafetyModal, setShowSafetyModal] = useState(false);
+  const [checkingSafety, setCheckingSafety] = useState(false);
+
   const loadRows = useCallback(async () => {
     const { data } = await (supabase as any).from("ed_medications")
       .select("id, drug_name, dose, route, administered_at, notes, ed_charge_item_id")
@@ -64,17 +78,54 @@ const EDMedicationPanel: React.FC<Props> = ({
 
   useEffect(() => { loadRows(); }, [loadRows]);
 
-  // Likely-allergy detection: token match between the drug name and recorded allergies.
+  // Confirmed structured allergy record for this patient — the input RxOrdersTab reads via
+  // ConsultationWorkspace's `token.patient.allergies`, fetched directly here since the ED
+  // visit object only carries the AMPLE free-text field.
+  useEffect(() => {
+    let cancelled = false;
+    (supabase as any).from("patients").select("allergies").eq("id", patientId).maybeSingle()
+      .then(({ data, error }: any) => {
+        if (cancelled) return;
+        if (error) {
+          // A failed lookup must not silently read as "no known allergies" — surface it so a
+          // clinician isn't shown a falsely clean allergy line, and leave the AMPLE text (the
+          // other input) still in play for the safety check below.
+          toast({ title: "Could not load patient allergy record", description: error.message, variant: "destructive" });
+          setStructuredAllergies(null);
+          return;
+        }
+        setStructuredAllergies(data?.allergies ?? null);
+      });
+    return () => { cancelled = true; };
+  }, [patientId]);
+
+  // The allergy set fed into checkDrugSafety(): the union of the patient's confirmed structured
+  // record AND this visit's AMPLE free-text — AMPLE may carry information not yet transcribed
+  // into the structured record, so neither input is dropped in favour of the other.
+  const combinedAllergies = useMemo(() => {
+    const parse = (s: string | null | undefined) =>
+      (s || "").split(/[,;/]+/).map(a => a.trim()).filter(a => a.length > 2);
+    const set = new Set<string>([...parse(structuredAllergies), ...parse(allergies)]);
+    return [...set];
+  }, [structuredAllergies, allergies]);
+
+  // Likely-allergy detection for the inline hint shown while typing — informational only, not
+  // the gate. The authoritative, blocking check runs in administer() via checkDrugSafety().
   const allergyHit = useMemo(() => {
-    const list = (allergies || "").split(/[,;/]+/).map(s => s.trim().toLowerCase()).filter(a => a.length > 2);
     const drug = drugName.trim().toLowerCase();
     if (!drug) return null;
-    const match = list.find(a => drug.includes(a) || a.includes(drug));
+    const match = combinedAllergies.find(a => {
+      const al = a.toLowerCase();
+      return drug.includes(al) || al.includes(drug);
+    });
     return match || null;
-  }, [allergies, drugName]);
+  }, [combinedAllergies, drugName]);
 
-  const administer = async () => {
-    if (!drugName.trim()) { toast({ title: "Enter a drug name", variant: "destructive" }); return; }
+  /** Drugs already administered this ED visit — the "currentDrugs" input to checkDrugSafety(),
+   *  so a drug-drug interaction or duplicate-molecule against today's own eMAR is caught. */
+  const currentDrugNames = useMemo(() => rows.map(r => r.drug_name), [rows]);
+
+  const doAdminister = async () => {
     setSaving(true);
     try {
       let chargeItemId: string | null = null;
@@ -132,7 +183,85 @@ const EDMedicationPanel: React.FC<Props> = ({
     }
   };
 
+  /**
+   * The gate. Every drug typed into this eMAR is run through the shared `checkDrugSafety()` —
+   * the patient's structured allergy record, this visit's AMPLE allergies, drug-drug
+   * interactions against everything already given this visit, and duplicate-molecule detection
+   * — before it can be recorded as administered. `result.hasIssues` routes to the same
+   * `DrugSafetyAlertModal` OPD/IPD use rather than a bypassable inline note; a failed lookup
+   * (`checkUnavailable`) is surfaced the same way, never treated as a clean result.
+   */
+  const administer = async () => {
+    if (!drugName.trim()) { toast({ title: "Enter a drug name", variant: "destructive" }); return; }
+    setCheckingSafety(true);
+    try {
+      const result = await checkDrugSafety(drugName.trim(), currentDrugNames, combinedAllergies, hospitalId ?? "");
+      if (result.hasIssues) {
+        setSafetyResult(result);
+        setShowSafetyModal(true);
+        return;
+      }
+      await doAdminister();
+    } catch (e) {
+      // Same fail-loud shape as RxOrdersTab's performSafetyCheck (KNOWN-BUG-108): an
+      // unexpected throw here must surface as an incomplete/unsafe result, never let the drug
+      // through unchecked.
+      setSafetyResult({
+        hasIssues: true,
+        interactions: [],
+        allergyConflicts: [],
+        duplicates: [],
+        worstSeverity: "major",
+        checkUnavailable: true,
+        unavailableReasons: [`Drug safety check failed: ${e instanceof Error ? e.message : String(e)}`],
+      });
+      setShowSafetyModal(true);
+    } finally {
+      setCheckingSafety(false);
+    }
+  };
+
+  const closeSafetyModal = () => {
+    setShowSafetyModal(false);
+    setSafetyResult(null);
+  };
+
+  const handleSafetyAddAnyway = () => {
+    closeSafetyModal();
+    void doAdminister();
+  };
+
+  /** Mirrors RxOrdersTab's handleSafetyOverride (BUG-P4-004): patient_id AND created_by must
+   *  both be populated, or the override is logged to nobody. */
+  const handleSafetyOverride = (reason: string) => {
+    const result = safetyResult;
+    closeSafetyModal();
+    if (hospitalId && result) {
+      const conflicts = result.allergyConflicts.map(c => `${c.allergy} (${c.type})`).join(", ");
+      supabase.from("clinical_alerts").insert({
+        hospital_id: hospitalId,
+        patient_id: patientId ?? null,
+        created_by: userId ?? null,
+        alert_type: "drug_override",
+        severity: "critical",
+        alert_message:
+          `ED medication safety override: ${drugName.trim()} administered despite ${result.worstSeverity} alert` +
+          `${conflicts ? ` (allergy conflict: ${conflicts})` : ""}. Reason: ${reason}`,
+      } as never).then(({ error }) => {
+        if (error) {
+          toast({
+            title: "Override not recorded",
+            description: `${drugName.trim()} was administered but the override could not be written to the patient record: ${error.message}`,
+            variant: "destructive",
+          });
+        }
+      });
+    }
+    void doAdminister();
+  };
+
   return (
+    <>
     <Dialog open onOpenChange={v => { if (!v) onClose(); }}>
       <DialogContent className="max-w-lg max-h-[92vh] overflow-y-auto">
         <DialogHeader>
@@ -144,7 +273,12 @@ const EDMedicationPanel: React.FC<Props> = ({
         <div className="space-y-3">
           {allergies?.trim() && (
             <p className="text-[11px] text-muted-foreground">
-              Recorded allergies: <span className="font-medium text-foreground">{allergies}</span>
+              AMPLE allergies: <span className="font-medium text-foreground">{allergies}</span>
+            </p>
+          )}
+          {structuredAllergies?.trim() && (
+            <p className="text-[11px] text-muted-foreground">
+              Confirmed allergy record: <span className="font-medium text-foreground">{structuredAllergies}</span>
             </p>
           )}
 
@@ -186,8 +320,9 @@ const EDMedicationPanel: React.FC<Props> = ({
               {billConsumable && (
                 <Input type="number" min="0" value={rate} onChange={e => setRate(e.target.value)} className="h-8 w-24" placeholder="Rate ₹" />
               )}
-              <Button onClick={administer} disabled={saving} className="ml-auto h-9">
-                {saving ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Plus className="h-4 w-4 mr-1" />} Administer
+              <Button onClick={administer} disabled={saving || checkingSafety} className="ml-auto h-9">
+                {(saving || checkingSafety) ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
+                {checkingSafety ? "Checking…" : "Administer"}
               </Button>
             </div>
           </div>
@@ -228,6 +363,22 @@ const EDMedicationPanel: React.FC<Props> = ({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+
+    {/* Same blocking/warning treatment OPD (RxOrdersTab) and IPD (IPDMedicationsTab) use for
+        drug safety — rendered outside the Dialog's own content node so it is never clipped by
+        the eMAR panel's `overflow-y-auto`, and sits above it in the modal stack. */}
+    {showSafetyModal && safetyResult && (
+      <DrugSafetyAlertModal
+        open={showSafetyModal}
+        drugName={drugName.trim()}
+        result={safetyResult}
+        hospitalId={hospitalId}
+        onClose={closeSafetyModal}
+        onAddAnyway={handleSafetyAddAnyway}
+        onOverride={handleSafetyOverride}
+      />
+    )}
+    </>
   );
 };
 

@@ -241,14 +241,21 @@ const DietPage: React.FC = () => {
       `Nutritional screening completed: ${selectedPatient.patient_name || "Patient"}, Tool: NRS-2002, Risk: ${riskLevel}, NRS: ${nrsTotal}`);
 
     if (needsReferral) {
-      await supabase.from("clinical_alerts").insert({
+      const { error: alertError } = await supabase.from("clinical_alerts").insert({
         hospital_id: hospitalId,
         patient_id: selectedPatient.patient_id,
         admission_id: selectedPatient.id,
         alert_type: "high_nutritional_risk",
-        message: `High nutritional risk (NRS ${nrsTotal}) — ${selectedPatient.patients?.full_name}`,
+        // Real column is `alert_message` (NOT NULL) — this previously wrote to a nonexistent
+        // `message` column, so the error was discarded and the alert never saved.
+        alert_message: `High nutritional risk (NRS ${nrsTotal}) — ${selectedPatient.patients?.full_name}`,
         severity: "medium",
+        created_by: userId,
       } as any);
+      if (alertError) {
+        // Clinical alerts must never fail silently — surface it rather than just logging.
+        toast.error(`Screening saved, but the high-risk alert failed to send: ${alertError.message}`);
+      }
     }
 
     // Auto-bill dietitian screening consultation. sourceTable/sourceId were never passed before

@@ -98,6 +98,14 @@ const STATUS_CONFIG: Record<string, { bg: string; text: string; label?: string }
   diagnostic:  { bg: "bg-cyan-100",    text: "text-cyan-700",    label: "Diagnostic Centre" },
   pharmacy:    { bg: "bg-emerald-100", text: "text-emerald-700", label: "Pharmacy" },
   institute:   { bg: "bg-amber-100",   text: "text-amber-700",   label: "Medical Institute" },
+  // MRD — MLC police-intimation TAT (mlc_police_notifications.notification_deadline, the
+  // 6h-from-designation clock per 20261106000036/20261108000006). Labels are always passed via
+  // the `label` override below since the remaining/overdue duration is computed per-row, not a
+  // fixed string per status key.
+  mlc_tat_ok:       { bg: "bg-emerald-100", text: "text-emerald-700" },
+  mlc_tat_warning:  { bg: "bg-amber-100",   text: "text-amber-700" },
+  mlc_tat_overdue:  { bg: "bg-red-100",     text: "text-red-700" },
+  mlc_tat_resolved: { bg: "bg-slate-100",   text: "text-slate-600", label: "Informed" },
 };
 
 /**
@@ -115,12 +123,18 @@ export function getStatusBadgeClasses(status: string): string {
 interface StatusBadgeProps {
   status: string;
   className?: string;
+  /**
+   * Overrides the displayed label while keeping the colour keyed off `status`. For callers whose
+   * text is computed per-row (e.g. a live "2h 15m left" / "Overdue by 1h 05m" TAT countdown) and
+   * can't be a fixed STATUS_CONFIG label. Optional — existing callers are unaffected.
+   */
+  label?: string;
 }
 
-export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, className }) => {
+export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, className, label: labelOverride }) => {
   const key = status?.toLowerCase() ?? "";
   const config = STATUS_CONFIG[key] ?? { bg: "bg-slate-100", text: "text-slate-600" };
-  const label = config.label ?? (status?.replace(/_/g, " ") ?? "Unknown");
+  const label = labelOverride ?? config.label ?? (status?.replace(/_/g, " ") ?? "Unknown");
   return (
     <span
       className={cn(

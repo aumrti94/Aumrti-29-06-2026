@@ -7,17 +7,19 @@ import { toast } from "sonner";
 import { callAI } from "@/lib/aiProvider";
 import { FileText, Download, MessageSquare, Loader2 } from "lucide-react";
 import { useHospitalId } from '@/hooks/useHospitalId';
-
+import { fetchHospitalBrand, printHeader, printDocument } from "@/lib/printUtils";
+import { sendWhatsApp } from "@/lib/whatsapp-send";
 
 export default function ProgressTrackerTab() {
   const { hospitalId } = useHospitalId();
   const [bookings, setBookings] = useState<any[]>([]);
   const [generating, setGenerating] = useState<string | null>(null);
   const [reports, setReports] = useState<Record<string, string>>({});
+  const [sendingWhatsApp, setSendingWhatsApp] = useState<string | null>(null);
 
   useEffect(() => {
     supabase.from("package_bookings")
-      .select("*, health_packages(package_name), patients(full_name, uhid, dob, gender)")
+      .select("*, health_packages(package_name), patients(full_name, uhid, dob, gender, phone)")
       .eq("hospital_id", hospitalId)
       .in("status", ["awaiting_report", "completed"])
       .order("created_at", { ascending: false })
@@ -74,6 +76,71 @@ Keep language professional but accessible. Max 300 words.`,
     }
   };
 
+  const downloadReport = async (booking: any) => {
+    const report = reports[booking.id];
+    if (!report) {
+      toast.error("No report available to download yet");
+      return;
+    }
+    if (!hospitalId) {
+      toast.error("Missing hospital context");
+      return;
+    }
+    const patient = booking.patients;
+    const age = patient?.dob
+      ? Math.floor((Date.now() - new Date(patient.dob).getTime()) / 31557600000)
+      : "N/A";
+    const scheduledDate = booking.scheduled_date
+      ? new Date(booking.scheduled_date).toLocaleDateString("en-IN")
+      : "N/A";
+
+    const brand = await fetchHospitalBrand(supabase, hospitalId);
+    const body = `
+${printHeader(brand.name, "Preventive Health Checkup Report")}
+<div class="section-title">Patient Details</div>
+<div class="row"><span class="label">Name</span><span>${patient?.full_name ?? "—"}</span></div>
+<div class="row"><span class="label">UHID</span><span>${patient?.uhid ?? "—"}</span></div>
+<div class="row"><span class="label">Age / Gender</span><span>${age} / ${patient?.gender ?? "N/A"}</span></div>
+<div class="row"><span class="label">Package</span><span>${booking.health_packages?.package_name ?? "—"}</span></div>
+<div class="row"><span class="label">Checkup Date</span><span>${scheduledDate}</span></div>
+<div class="section-title">Health Report Summary</div>
+<pre>${report}</pre>
+`;
+    printDocument(`Health Report — ${patient?.full_name ?? "Patient"}`, body);
+  };
+
+  const whatsAppReport = async (booking: any) => {
+    const report = reports[booking.id];
+    if (!report) {
+      toast.error("No report available to send yet");
+      return;
+    }
+    const patient = booking.patients;
+    if (!patient?.phone) {
+      toast.error("No phone number on file for this patient");
+      return;
+    }
+    if (!hospitalId) {
+      toast.error("Missing hospital context");
+      return;
+    }
+    setSendingWhatsApp(booking.id);
+    try {
+      const scheduledDate = booking.scheduled_date
+        ? new Date(booking.scheduled_date).toLocaleDateString("en-IN")
+        : "N/A";
+      const message = `Hello ${patient.full_name}, your health report for the "${booking.health_packages?.package_name ?? "package"}" checkup on ${scheduledDate} is ready.\n\n${report}\n\nPlease consult your doctor for any follow-up recommended above.`;
+      const cleanPhone = String(patient.phone).replace(/\D/g, "");
+      const fullPhone = cleanPhone.startsWith("91") ? cleanPhone : `91${cleanPhone}`;
+      await sendWhatsApp({ hospitalId, phone: fullPhone, message });
+      toast.success("Report sent via WhatsApp");
+    } catch (e) {
+      toast.error("Failed to send report via WhatsApp");
+    } finally {
+      setSendingWhatsApp(null);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {bookings.length === 0 && <p className="text-center text-muted-foreground py-8">No bookings awaiting report</p>}
@@ -102,8 +169,29 @@ Keep language professional but accessible. Max 300 words.`,
                 )}
                 {(b.status === "completed" || report) && (
                   <>
-                    <Button size="sm" variant="outline"><Download className="h-4 w-4 mr-1" /> Download Report</Button>
-                    <Button size="sm" variant="outline"><MessageSquare className="h-4 w-4 mr-1" /> WhatsApp to Patient</Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => downloadReport(b)}
+                      disabled={!report}
+                      title={!report ? "Report text isn't loaded in this session — reopen or regenerate it to download" : undefined}
+                    >
+                      <Download className="h-4 w-4 mr-1" /> Download Report
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={() => whatsAppReport(b)}
+                      disabled={!report || sendingWhatsApp === b.id}
+                      title={!report ? "Report text isn't loaded in this session — reopen or regenerate it to send" : undefined}
+                    >
+                      {sendingWhatsApp === b.id ? (
+                        <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                      ) : (
+                        <MessageSquare className="h-4 w-4 mr-1" />
+                      )}
+                      WhatsApp to Patient
+                    </Button>
                   </>
                 )}
               </div>

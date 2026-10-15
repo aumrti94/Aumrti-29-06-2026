@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Users, Plus, CheckCircle2, Search } from "lucide-react";
 import { format } from "date-fns";
 import { useHospitalId } from "@/hooks/useHospitalId";
@@ -193,9 +194,17 @@ const PmjayBeneficiariesTab: React.FC<Props> = ({ showNewForm, onFormClosed }) =
                   <td className="px-3 py-2 text-[12px]">{b.expiry_date ? format(new Date(b.expiry_date), "dd/MM/yyyy") : "—"}</td>
                   <td className="px-3 py-2">
                     {b.verification_status === "pending" && (
-                      <Button size="sm" variant="ghost" className="h-7 text-[11px] gap-1" onClick={() => verifyBeneficiary(b.id)}>
-                        <CheckCircle2 size={12} /> Verify
-                      </Button>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button size="sm" variant="ghost" className="h-7 text-[11px] gap-1" onClick={() => verifyBeneficiary(b.id)}>
+                            <CheckCircle2 size={12} /> Mark as Verified
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs text-[11px] leading-relaxed">
+                          Manual status flip only — does not call the NHA/BIS eligibility check. Use Pre-Auth's
+                          "Verify PMJAY Card Eligibility" for a real card verification.
+                        </TooltipContent>
+                      </Tooltip>
                     )}
                   </td>
                 </tr>

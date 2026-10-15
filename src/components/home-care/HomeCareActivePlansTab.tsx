@@ -139,7 +139,7 @@ const HomeCareActivePlansTab: React.FC = () => {
             <div key={p.id} className="p-3 border rounded-lg bg-card flex items-center gap-3">
               <div className="flex-1">
                 <p className="text-sm font-medium">{p.patient_name}</p>
-                <p className="text-xs text-muted-foreground">{PLAN_TYPES[p.plan_type as keyof typeof PLAN_TYPES]} | {p.frequency?.replace("_", " ")} | {p.start_date}{p.end_date ? ` → ${p.end_date}` : ""}</p>
+                <p className="text-xs text-muted-foreground">{PLAN_TYPES[p.plan_type as keyof typeof PLAN_TYPES]} | {p.frequency?.replace("_", " ")} | {new Date(p.start_date).toLocaleDateString("en-IN")}{p.end_date ? ` → ${new Date(p.end_date).toLocaleDateString("en-IN")}` : ""}</p>
                 {p.diagnosis && <p className="text-xs text-muted-foreground mt-0.5">Dx: {p.diagnosis}</p>}
                 {p.services_needed && p.services_needed.length > 0 && (
                   <div className="flex flex-wrap gap-1 mt-1">

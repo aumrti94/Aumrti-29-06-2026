@@ -26,6 +26,7 @@ import AdvanceReceiptModal from "@/components/billing/AdvanceReceiptModal";
 import EDMedicationPanel from "@/components/emergency/EDMedicationPanel";
 import EDHandoverNotePanel from "@/components/emergency/EDHandoverNotePanel";
 import ConsentSignatureModal from "@/components/consent/ConsentSignatureModal";
+import MLCDetailsModal from "@/components/emergency/MLCDetailsModal";
 import { routeEdPatientToMortuary } from "@/lib/edMortuary";
 import { calculateNEWS2, getNEWS2BadgeClasses, getNEWS2Label } from "@/lib/news2";
 import type { OTRoom } from "@/pages/ot/OTPage";
@@ -67,6 +68,12 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
   const [showSpecialistDialog, setShowSpecialistDialog] = useState(false);
   const [showDischargeConfirm, setShowDischargeConfirm] = useState(false);
   const [showMlcDialog, setShowMlcDialog] = useState(false);
+  // Whether an `mlc_cases` row already exists for this ed_visit_id — null while unknown/loading.
+  // Drives the "MLC Register" action: no row yet → open the real documentation form
+  // (MLCDetailsModal, same component the registration-time flow uses); row exists → the
+  // existing read-only summary dialog below (unchanged).
+  const [mlcCaseDocumented, setMlcCaseDocumented] = useState<boolean | null>(null);
+  const [showMlcFormModal, setShowMlcFormModal] = useState(false);
   const [showOTModal, setShowOTModal] = useState(false);
   const [otRooms, setOtRooms] = useState<OTRoom[]>([]);
 
@@ -315,7 +322,27 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
     setTriageSuggestion(null);
     setDispositionSuggestion(null);
     setInvestigationsSuggested([]);
+    setMlcCaseDocumented(null);
   }, [visitId]);
+
+  // MLC case-documentation status for this ed_visit — mirrors IPDWorkspace's mlc_cases
+  // count-check for admissions. A case can be flagged MLC either at registration (which
+  // already creates the real mlc_cases row via MLCDetailsModal) or later via the checkbox
+  // above (which only touches ed_visits.mlc_details) — this tells the "MLC Register" action
+  // which of those two states it's in. Re-runs after the form modal closes so a freshly
+  // documented case flips the button over to the summary view without a page refresh.
+  useEffect(() => {
+    if (!mlc || !visitId || !hospitalId) { setMlcCaseDocumented(null); return; }
+    (supabase as any)
+      .from("mlc_cases")
+      .select("id", { count: "exact", head: true })
+      .eq("hospital_id", hospitalId)
+      .eq("ed_visit_id", visitId)
+      .then(({ count, error }: any) => {
+        if (error) { console.error("ED: MLC case-status check failed:", error.message); return; }
+        setMlcCaseDocumented((count ?? 0) > 0);
+      });
+  }, [mlc, visitId, hospitalId, showMlcFormModal]);
 
   // Register screen for voice scribe
   useEffect(() => {
@@ -615,7 +642,19 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
   };
 
   return (
-    <div className="h-full flex" style={{ background: "#1E293B", borderTop: "1px solid #334155" }}>
+    <div className="h-full flex flex-col" style={{ background: "#1E293B", borderTop: "1px solid #334155" }}>
+      {/* MLC — undocumented banner (blocking). Mirrors IPDWorkspace.tsx's mlcCaseStatus === false
+          banner: same classes, icon, and copy, so the ED and IPD gates read as one pattern. */}
+      {mlc && mlcCaseDocumented === false && (
+        <button
+          onClick={() => setShowMlcFormModal(true)}
+          className="flex-shrink-0 w-full bg-red-50 border-b border-red-400 px-5 py-2 flex items-center gap-2 text-red-800 hover:bg-red-100 transition-colors text-left"
+        >
+          <AlertTriangle className="h-4 w-4 text-red-600 shrink-0" />
+          <span className="text-xs font-bold">⚠️ MLC CASE: Details not documented. Click here to complete. Discharge is blocked until MLC details are recorded.</span>
+        </button>
+      )}
+    <div className="flex-1 flex overflow-hidden">
       {/* LEFT: Timeline */}
       <div className="w-[200px] flex-shrink-0 flex flex-col p-3 overflow-y-auto" style={{ background: "#162032", borderRight: "1px solid #334155" }}>
         <p className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-3">Timeline</p>
@@ -956,7 +995,19 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
             <SelectItem value="referred_out">Referred Out (transfer)</SelectItem>
           </SelectContent>
         </Select>
-        {mlc && <ActionBtn label="📄 MLC Register" bg="#7C3AED" onClick={() => setShowMlcDialog(true)} />}
+        {mlc && (
+          <ActionBtn
+            label="📄 MLC Register"
+            bg="#7C3AED"
+            onClick={() => {
+              // No mlc_cases row yet (flagged after registration, never documented) →
+              // open the real form. Row already exists (from registration or a prior
+              // save here) → unchanged read-only summary.
+              if (mlcCaseDocumented === false) setShowMlcFormModal(true);
+              else setShowMlcDialog(true);
+            }}
+          />
+        )}
         {mlc && (
           <ActionBtn label="📋 Police Intimation" bg="#6D28D9" onClick={() => {
             const now = new Date();
@@ -1051,6 +1102,7 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
           <p className="text-xs text-slate-300 capitalize font-medium mt-0.5">{visit.disposition}</p>
         </div>
       </div>
+    </div>
 
       {/* === MODALS === */}
 
@@ -1252,7 +1304,13 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => { handleDisposition("discharged"); setShowDischargeConfirm(false); }}
+            <AlertDialogAction onClick={() => {
+              if (mlc && mlcCaseDocumented === false) {
+                toast({ title: "Cannot discharge — MLC details not documented", variant: "destructive" });
+                return;
+              }
+              handleDisposition("discharged"); setShowDischargeConfirm(false);
+            }}
               className="bg-emerald-600 hover:bg-emerald-700">
               Confirm Discharge
             </AlertDialogAction>
@@ -1347,6 +1405,20 @@ const EmergencyWorkspace: React.FC<Props> = ({ visit, hospitalId, userId, onRefr
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* MLC Case Documentation form — opened from the "MLC Register" action when the case
+          was flagged MLC after registration and no mlc_cases row exists yet. Identical
+          component and onSaved shape to the registration-time flow in EmergencyPage.tsx. */}
+      {showMlcFormModal && hospitalId && (
+        <MLCDetailsModal
+          hospitalId={hospitalId}
+          patientId={visit.patient_id}
+          patientName={visit.patient_name}
+          edVisitId={visit.id}
+          onClose={() => setShowMlcFormModal(false)}
+          onSaved={() => { setShowMlcFormModal(false); setMlcCaseDocumented(true); onRefresh(); }}
+        />
+      )}
 
       {/* MLC Summary Dialog */}
       <Dialog open={showMlcDialog} onOpenChange={setShowMlcDialog}>

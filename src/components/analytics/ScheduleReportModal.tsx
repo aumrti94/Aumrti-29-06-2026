@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { Calendar, Mail, MessageSquare, Save, X } from "lucide-react";
 import { toast } from "sonner";
+import { useHospitalId } from "@/hooks/useHospitalId";
 
 interface ScheduleReportModalProps {
   open: boolean;
@@ -23,6 +24,7 @@ const FREQUENCIES = [
 const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
 
 const ScheduleReportModal: React.FC<ScheduleReportModalProps> = ({ open, onOpenChange, reportName }) => {
+  const { userId } = useHospitalId();
   const [frequency, setFrequency] = useState("daily");
   const [time, setTime] = useState("07:00");
   const [weekDay, setWeekDay] = useState("Monday");
@@ -61,6 +63,7 @@ const ScheduleReportModal: React.FC<ScheduleReportModalProps> = ({ open, onOpenC
 
     const payload: any = {
       hospital_id: hospitalId,
+      created_by: userId,
       report_name: reportName,
       report_type: "custom",
       frequency,

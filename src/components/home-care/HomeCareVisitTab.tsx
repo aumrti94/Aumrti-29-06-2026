@@ -9,6 +9,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { Badge } from "@/components/ui/badge";
 import { Calendar, CheckCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useConfigValues } from "@/hooks/useConfigValues";
 
 const STATUS_COLORS: Record<string, string> = {
   scheduled: "bg-blue-100 text-blue-800", completed: "bg-green-100 text-green-800",
@@ -25,6 +26,7 @@ interface Visit {
 const HomeCareVisitTab: React.FC = () => {
   const { hospitalId, userId } = useHospitalId();
   const { toast } = useToast();
+  const services = useConfigValues("home_care_services");
   const [visits, setVisits] = useState<Visit[]>([]);
   const [filter, setFilter] = useState<"today" | "week" | "overdue">("today");
   const [loading, setLoading] = useState(true);
@@ -61,6 +63,15 @@ const HomeCareVisitTab: React.FC = () => {
   const openRecord = (visit: Visit) => {
     setSelectedVisit(visit);
     setRecordForm({ vital_bp: visit.vital_bp || "", vital_pulse: String(visit.vital_pulse || ""), vital_temp: "", vital_spo2: "", wound_condition: visit.wound_condition || "na", services_done: [], patient_feedback: "", nurse_notes: visit.nurse_notes || "" });
+  };
+
+  const toggleServiceDone = (s: string) => {
+    setRecordForm(f => ({
+      ...f,
+      services_done: f.services_done.includes(s)
+        ? f.services_done.filter(x => x !== s)
+        : [...f.services_done, s],
+    }));
   };
 
   const saveRecord = async () => {
@@ -131,7 +142,7 @@ const HomeCareVisitTab: React.FC = () => {
               <div key={v.id} className="p-3 border rounded-lg bg-card flex items-center gap-3">
                 <div className="flex-1">
                   <p className="text-sm font-medium">{v.patient_name}</p>
-                  <p className="text-xs text-muted-foreground">{v.scheduled_date} | {v.plan_type?.replace("_", " ")}</p>
+                  <p className="text-xs text-muted-foreground">{new Date(v.scheduled_date).toLocaleDateString("en-IN")} | {v.plan_type?.replace("_", " ")}</p>
                 </div>
                 <Badge className={cn("text-xs", STATUS_COLORS[v.status] || "")}>{v.status}</Badge>
                 {v.status === "scheduled" && (
@@ -169,6 +180,17 @@ const HomeCareVisitTab: React.FC = () => {
                 <option value="static">Static</option>
                 <option value="deteriorating">Deteriorating</option>
               </select>
+            </div>
+            <div>
+              <label className="text-xs font-medium mb-1 block">Services Performed</label>
+              <div className="grid grid-cols-2 gap-1">
+                {services.map(s => (
+                  <label key={s.value} className="flex items-center gap-1.5 text-xs cursor-pointer">
+                    <input type="checkbox" checked={recordForm.services_done.includes(s.value)} onChange={() => toggleServiceDone(s.value)} />
+                    {s.label}
+                  </label>
+                ))}
+              </div>
             </div>
             <div>
               <label className="text-xs font-medium">Patient Feedback</label>

@@ -12,12 +12,23 @@ import { recordBillPayment } from "@/lib/billPayments";
 import { printReceiptDoc } from "@/lib/receiptPrint";
 import PaymentLinkModal from "@/components/billing/PaymentLinkModal";
 import type { BillRecord } from "@/pages/billing/BillingPage";
-import { printDocument } from "@/lib/printUtils";
+import { fetchHospitalBrand, printHeader, printDocument } from "@/lib/printUtils";
+import { formatINR } from "@/lib/currency";
 
 // Razorpay payment method -> this app's payment_mode enum. Unrecognised
 // methods (wallet, emi, ...) fall back to "upi" (always has a seeded
 // auto_posting_rules row, so GL posting never silently no-ops).
 const RAZORPAY_METHOD_MAP: Record<string, string> = { upi: "upi", card: "card", netbanking: "net_banking" };
+
+// Local HTML escape for the print summary below — mirrors printUtils.ts's private esc(),
+// which is not exported for callers outside that module.
+function esc(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
 const modeColors: Record<string, string> = {
   cash: "#10B981",
@@ -43,6 +54,19 @@ const modeIcons: Record<string, string> = {
   advance_adjust: "🔄",
   credit: "🏥",
   donation: "🤝",
+};
+
+const modeLabels: Record<string, string> = {
+  cash: "Cash",
+  upi: "UPI",
+  card: "Card",
+  insurance: "Insurance",
+  pmjay: "PM-JAY",
+  net_banking: "Net Banking",
+  cheque: "Cheque",
+  advance_adjust: "Advance Adjust",
+  credit: "Credit",
+  donation: "Donation",
 };
 
 interface PaymentRow {
@@ -321,7 +345,7 @@ const PaymentsPage: React.FC = () => {
   const chartData = Object.entries(byMode).map(([mode, amount]) => ({ mode, amount }));
 
   // Outstanding (separate query would be ideal, using placeholder)
-  const fmt = (n: number) => "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 0 });
+  const fmt = (n: number) => formatINR(n);
 
   const dateFilters = [
     { value: "today", label: "Today" },
@@ -329,6 +353,48 @@ const PaymentsPage: React.FC = () => {
     { value: "week", label: "This Week" },
     { value: "month", label: "This Month" },
   ];
+
+  const printOutstandingSummary = async () => {
+    if (!hospitalId) return;
+    const brand = await fetchHospitalBrand(supabase, hospitalId);
+    const activeDateLabel = dateFilters.find((f) => f.value === dateFilter)?.label || "Today";
+    const activeModeLabel = modeFilter === "all" ? "All Modes" : (modeLabels[modeFilter] || modeFilter);
+
+    const kpiRows = `
+<div class="row"><span class="label">Collected (${esc(activeDateLabel)})</span><span class="amount">${fmt(todayTotal)}</span></div>
+<div class="row"><span class="label">Outstanding (unpaid bills)</span><span class="amount">${outstandingTotal !== null ? fmt(outstandingTotal) : "—"}</span></div>
+<div class="row"><span class="label">Links Sent (${esc(activeDateLabel)})</span><span>${linksSentCount !== null ? linksSentCount : "—"}</span></div>
+<div class="row"><span class="label">Advances on hold</span><span class="amount">${advancesOnHold !== null ? fmt(advancesOnHold) : "—"}</span></div>`;
+
+    const modeBreakdownRows = Object.entries(byMode)
+      .map(([mode, amount]) => `<tr><td>${esc(modeLabels[mode] || mode)}</td><td class="amount" style="text-align:right">${fmt(amount)}</td></tr>`)
+      .join("");
+
+    const ledgerRows = payments
+      .map((p) => `<tr>
+  <td>${p.payment_time ? esc(new Date(p.payment_time).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })) : "—"}</td>
+  <td>${esc(p.patient_name)}<br/><span class="label">${esc(p.uhid)}</span></td>
+  <td>${esc(p.bill_number)}</td>
+  <td>${esc(modeLabels[p.payment_mode] || p.payment_mode)}</td>
+  <td class="amount" style="text-align:right">${fmt(p.amount)}</td>
+  <td>${esc(p.transaction_id || "—")}</td>
+</tr>`)
+      .join("");
+
+    const body = `
+${printHeader(brand.name, "Outstanding Payments Summary", `<div class="label" style="margin-top:4px;">Generated on ${esc(new Date().toLocaleDateString("en-IN"))} · Period: ${esc(activeDateLabel)} · Mode filter: ${esc(activeModeLabel)}</div>`)}
+<div class="section-title">Summary</div>
+${kpiRows}
+<div class="section-title">Collections by Mode</div>
+${modeBreakdownRows ? `<table><thead><tr><th>Mode</th><th style="text-align:right">Amount</th></tr></thead><tbody>${modeBreakdownRows}</tbody></table>` : `<p class="label">No collections recorded for this period.</p>`}
+<div class="section-title">Ledger — ${esc(activeDateLabel)}${modeFilter !== "all" ? ` · ${esc(activeModeLabel)}` : ""}</div>
+${ledgerRows
+      ? `<table><thead><tr><th>Time</th><th>Patient</th><th>Bill #</th><th>Mode</th><th style="text-align:right">Amount</th><th>Reference</th></tr></thead><tbody>${ledgerRows}</tbody></table>`
+      : `<p class="label">No payments found for this period.</p>`}
+<div class="total-row"><span>Total</span><span>${fmt(todayTotal)}</span></div>`;
+
+    printDocument("Outstanding Payments Summary", body);
+  };
 
   return (
     <div className="flex flex-col h-[calc(100vh-56px)] overflow-hidden bg-muted/30">
@@ -339,9 +405,7 @@ const PaymentsPage: React.FC = () => {
           <p className="text-xs text-muted-foreground">{new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long", year: "numeric" })}</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button variant="outline" size="sm" className="gap-1 text-xs" onClick={() => {
-            printDocument("Outstanding Payments Summary", `<h2 style="color:#1A2F5A">Outstanding Payments Summary</h2><p class="label">Generated on ${new Date().toLocaleDateString("en-IN")}</p>`);
-          }}>
+          <Button variant="outline" size="sm" className="gap-1 text-xs" onClick={printOutstandingSummary}>
             <Printer size={14} /> Print Summary
           </Button>
         </div>
@@ -415,7 +479,12 @@ const PaymentsPage: React.FC = () => {
                 <SelectItem value="upi">UPI</SelectItem>
                 <SelectItem value="card">Card</SelectItem>
                 <SelectItem value="insurance">Insurance</SelectItem>
+                <SelectItem value="pmjay">PM-JAY</SelectItem>
+                <SelectItem value="net_banking">Net Banking</SelectItem>
                 <SelectItem value="cheque">Cheque</SelectItem>
+                <SelectItem value="advance_adjust">Advance Adjust</SelectItem>
+                <SelectItem value="credit">Credit</SelectItem>
+                <SelectItem value="donation">Donation</SelectItem>
               </SelectContent>
             </Select>
           </div>

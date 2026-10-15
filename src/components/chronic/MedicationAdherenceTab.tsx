@@ -38,6 +38,7 @@ const MedicationAdherenceTab: React.FC<Props> = ({ hospitalId, carePlanId, patie
   const [saving, setSaving] = useState(false);
   const [drugName, setDrugName] = useState("");
   const [days, setDays] = useState("30");
+  const [perDay, setPerDay] = useState("1");
 
   const load = useCallback(async () => {
     if (!hospitalId || !carePlanId) { setRows([]); return; }
@@ -58,31 +59,52 @@ const MedicationAdherenceTab: React.FC<Props> = ({ hospitalId, carePlanId, patie
 
   useEffect(() => { load(); }, [load]);
 
-  /** Create one scheduled dose row per day for the requested window. */
+  /**
+   * Create scheduled dose rows for the requested window — one row per day when
+   * the drug is taken once daily (the previous, only behaviour), or one row
+   * per dose per day when a per-day frequency is given (e.g. 2 for "BD",
+   * 3 for "TDS"). medication_adherence has no time-of-day column and no
+   * unique constraint on (care_plan_id, drug_name, scheduled_date) — nothing
+   * stops two rows sharing a date, which is what makes multiple doses/day
+   * possible without a schema change. Each row beyond the first on a given
+   * day gets a "Dose N/M" suffix on its own drug_name so the mark-taken/missed
+   * list (which renders drug_name as the row's only label) can tell two
+   * same-day doses apart instead of showing two identical-looking rows.
+   */
   const addSchedule = async () => {
     if (!carePlanId || !patientId || !drugName.trim()) {
       toast.error("Drug name is required");
       return;
     }
     const n = Math.min(Math.max(Number(days) || 0, 1), 90);
+    const dosesPerDay = Math.min(Math.max(Number(perDay) || 1, 1), 4);
     setSaving(true);
     const start = new Date();
-    const inserts = Array.from({ length: n }, (_, i) => {
+    const baseName = drugName.trim();
+    const inserts: any[] = [];
+    for (let i = 0; i < n; i++) {
       const d = new Date(start);
       d.setDate(d.getDate() + i);
-      return {
-        hospital_id: hospitalId,
-        patient_id: patientId,
-        care_plan_id: carePlanId,
-        drug_name: drugName.trim(),
-        scheduled_date: toISODate(d),
-        adherence_status: "unknown",
-      };
-    });
+      const scheduledDate = toISODate(d);
+      for (let dose = 1; dose <= dosesPerDay; dose++) {
+        inserts.push({
+          hospital_id: hospitalId,
+          patient_id: patientId,
+          care_plan_id: carePlanId,
+          drug_name: dosesPerDay > 1 ? `${baseName} — Dose ${dose}/${dosesPerDay}` : baseName,
+          scheduled_date: scheduledDate,
+          adherence_status: "unknown",
+        });
+      }
+    }
     const { error } = await (supabase as any).from("medication_adherence").insert(inserts);
     setSaving(false);
     if (error) { toast.error(error.message); return; }
-    toast.success(`${drugName.trim()} scheduled for ${n} days`);
+    toast.success(
+      dosesPerDay > 1
+        ? `${baseName} scheduled for ${n} days, ${dosesPerDay} doses/day`
+        : `${baseName} scheduled for ${n} days`,
+    );
     setDrugName(""); setShowAdd(false);
     load();
   };
@@ -149,6 +171,11 @@ const MedicationAdherenceTab: React.FC<Props> = ({ hospitalId, carePlanId, patie
             <Label className="text-[14px]">Days</Label>
             <Input type="number" min={1} max={90} value={days} onChange={e => setDays(e.target.value)}
               className="h-8 text-sm mt-0.5" />
+          </div>
+          <div className="w-28">
+            <Label className="text-[14px]">Doses/day</Label>
+            <Input type="number" min={1} max={4} value={perDay} onChange={e => setPerDay(e.target.value)}
+              className="h-8 text-sm mt-0.5" title="e.g. 2 for BD, 3 for TDS" />
           </div>
           <Button size="sm" className="h-8 text-xs" onClick={addSchedule} disabled={saving}>
             {saving ? "Saving…" : "Schedule"}

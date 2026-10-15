@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 import { formatINRExact } from "@/lib/currency";
 import { getInvokeError } from "@/lib/errorMessage";
+import { useAIFeatureFlag } from "@/hooks/useAIFeatureFlag";
 
 async function getHospitalId(): Promise<string | null> {
   const { data: { user } } = await supabase.auth.getUser();
@@ -96,6 +97,7 @@ function detectAnomalies(snapshot: Record<string, number>) {
 }
 
 const AIDigestTab: React.FC = () => {
+  const executiveDigestEnabled = useAIFeatureFlag("executive_digest");
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [isGenerating, setIsGenerating] = useState(false);
   const [isSendingWA, setIsSendingWA] = useState(false);
@@ -131,6 +133,9 @@ const AIDigestTab: React.FC = () => {
   const anomalies = kpiData ? detectAnomalies(kpiData.snapshot) : [];
 
   const generateDigest = async () => {
+    // Functional choke point: even if a stale UI control somehow renders, never call the
+    // edge function when the hospital admin has turned this feature off.
+    if (!executiveDigestEnabled) return;
     setIsGenerating(true);
     try {
       const hospitalId = await getHospitalId();
@@ -268,6 +273,14 @@ const AIDigestTab: React.FC = () => {
             <div className="space-y-4 text-[13px] text-foreground leading-relaxed whitespace-pre-wrap">
               {digest.digest_text}
             </div>
+          ) : !executiveDigestEnabled ? (
+            <div className="flex flex-col items-center justify-center h-full text-center gap-3">
+              <Bot size={48} className="text-muted-foreground/30" />
+              <div className="border rounded-lg px-3 py-2.5 bg-muted/30 flex items-center gap-2">
+                <Bot className="h-4 w-4 text-muted-foreground" />
+                <span className="text-xs text-muted-foreground">AI Executive Digest is disabled by your administrator.</span>
+              </div>
+            </div>
           ) : (
             <div className="flex flex-col items-center justify-center h-full text-center gap-3">
               <Bot size={48} className="text-muted-foreground/30" />
@@ -295,10 +308,16 @@ const AIDigestTab: React.FC = () => {
                   ? <><CheckCircle size={12} className="text-emerald-600" />Delivered ✓</>
                   : <><Send size={12} />Send to WhatsApp</>}
             </Button>
-            <Button size="sm" variant="outline" className="text-[11px] flex-1 gap-1.5" onClick={generateDigest} disabled={isGenerating}>
-              {isGenerating ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-              Regenerate
-            </Button>
+            {executiveDigestEnabled ? (
+              <Button size="sm" variant="outline" className="text-[11px] flex-1 gap-1.5" onClick={generateDigest} disabled={isGenerating}>
+                {isGenerating ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                Regenerate
+              </Button>
+            ) : (
+              <div className="text-[11px] flex-1 flex items-center justify-center gap-1.5 text-muted-foreground border border-dashed rounded px-2 py-1.5">
+                <Bot size={12} /> Disabled by administrator
+              </div>
+            )}
           </div>
         )}
       </div>

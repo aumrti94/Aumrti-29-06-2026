@@ -8,6 +8,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { useHospitalId } from "@/hooks/useHospitalId";
 import { toast } from "sonner";
 import { CalendarCheck, Activity, CheckCircle2, IndianRupee, Plus, Loader2, ExternalLink } from "lucide-react";
+import { formatCurrency } from "@/lib/currency";
 import PackageCatalogueTab from "@/components/packages/PackageCatalogueTab";
 import TodaysCheckupsTab from "@/components/packages/TodaysCheckupsTab";
 import ProgressTrackerTab from "@/components/packages/ProgressTrackerTab";
@@ -25,19 +26,26 @@ export default function PackagesPage() {
 
   const loadKPIs = useCallback(async () => {
     const today = new Date().toISOString().split("T")[0];
-    const [booked, inProgress, completed] = await Promise.all([
+    const [booked, inProgress, completed, revenueToday] = await Promise.all([
       supabase.from("package_bookings").select("id", { count: "exact", head: true })
         .eq("hospital_id", hospitalId).eq("scheduled_date", today),
       supabase.from("package_bookings").select("id", { count: "exact", head: true })
         .eq("hospital_id", hospitalId).eq("status", "in_progress"),
       supabase.from("package_bookings").select("id", { count: "exact", head: true })
         .eq("hospital_id", hospitalId).eq("status", "completed").gte("completed_at", today + "T00:00:00"),
+      supabase.from("bills").select("total_amount")
+        .eq("hospital_id", hospitalId).eq("bill_type", "package")
+        .neq("bill_status", "cancelled").neq("bill_status", "refunded")
+        .gte("created_at", today + "T00:00:00").lt("created_at", today + "T23:59:59.999"),
     ]);
+    const revenue = revenueToday.error
+      ? 0
+      : (revenueToday.data || []).reduce((sum, b) => sum + (b.total_amount || 0), 0);
     setKpis({
       booked: booked.count || 0,
       inProgress: inProgress.count || 0,
       completed: completed.count || 0,
-      revenue: 0,
+      revenue,
     });
   }, [hospitalId]);
 
@@ -47,7 +55,7 @@ export default function PackagesPage() {
     { label: "Booked Today", value: kpis.booked, icon: CalendarCheck, color: "text-blue-600" },
     { label: "In Progress", value: kpis.inProgress, icon: Activity, color: "text-amber-600" },
     { label: "Completed Today", value: kpis.completed, icon: CheckCircle2, color: "text-emerald-600" },
-    { label: "Revenue Today", value: `₹${kpis.revenue.toLocaleString("en-IN")}`, icon: IndianRupee, color: "text-primary" },
+    { label: "Revenue Today", value: formatCurrency(kpis.revenue), icon: IndianRupee, color: "text-primary" },
   ];
 
   if (hospitalLoading || !hospitalId) return <div className="flex items-center justify-center h-64"><Loader2 className="h-8 w-8 animate-spin text-primary" /></div>;

@@ -55,21 +55,13 @@ describe("validateForPrint — Rule 65(10) fields", () => {
   });
 
   it.each([
+    ["doctor registration number", { doctorRegistrationNumber: "" }, "doctor registration number"],
     ["patient name", { patientName: "" }, "patient name"],
     ["patient age", { patientAge: "" }, "patient age"],
     ["patient sex", { patientSex: "" }, "patient sex"],
-    ["doctor registration number", { doctorRegistrationNumber: "" }, "doctor registration number"],
-  ])("blocks printing when %s is missing", (_label, over, expected) => {
+  ])("does not block printing when %s is missing", (_label, over, expected) => {
     const missing = validateForPrint(base(over as Partial<QuickScribeNoteInput>));
-    expect(missing).toContain(expected);
-  });
-
-  it("treats whitespace-only values as missing, not present", () => {
-    // "   " is truthy in JS, so a naive `!value` check would pass it straight through onto
-    // a printed prescription as a blank name.
-    const missing = validateForPrint(base({ patientName: "   ", patientAge: "\t" }));
-    expect(missing).toContain("patient name");
-    expect(missing).toContain("patient age");
+    expect(missing).not.toContain(expected);
   });
 
   it("requires a quantity per drug and names the offending drug", () => {

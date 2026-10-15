@@ -144,8 +144,8 @@ const AdultImmunizationTab: React.FC = () => {
                 <div className="flex-1">
                   <p className="text-sm font-medium">{d.vaccine_name}</p>
                   <p className="text-xs text-muted-foreground">
-                    {d.due_date ? `Due: ${d.due_date}` : "No due date"}
-                    {d.given_date && ` | Given: ${d.given_date}`}
+                    {d.due_date ? `Due: ${new Date(d.due_date).toLocaleDateString("en-IN")}` : "No due date"}
+                    {d.given_date && ` | Given: ${new Date(d.given_date).toLocaleDateString("en-IN")}`}
                     {d.batch_no && ` | Batch: ${d.batch_no}`}
                   </p>
                 </div>

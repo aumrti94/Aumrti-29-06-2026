@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { cn } from "@/lib/utils";
-import { X, Plus, AlertTriangle, ShieldX, CheckCircle2, Pencil, RotateCcw, Clock, FileText } from "lucide-react";
+import { X, Plus, AlertTriangle, ShieldX, CheckCircle2, Pencil, RotateCcw, Clock, FileText, ChevronDown, ChevronRight } from "lucide-react";
+import { formatCurrency } from "@/lib/currency";
 import type { PrescriptionData, DrugEntry, LabOrder, RadiologyOrder, OrderAvailability } from "../ConsultationWorkspace";
 import { checkDrugSafety, type DrugSafetyResult } from "@/lib/drugSafetyCheck";
 import DrugSafetyAlertModal from "@/components/opd/DrugSafetyAlertModal";
@@ -19,9 +20,11 @@ import TestGroupPickerModal from "@/components/opd/TestGroupPickerModal";
 import SectionChip from "@/components/quick-scribe/SectionChip";
 import {
   loadOrderCatalogue,
+  lookupExactEntry,
   matchOrderNameDetailed,
   type OrderCatalogue,
 } from "@/lib/orderCatalogue";
+import { expandLabPanels, type LabPanel } from "@/lib/labPanelExpansion";
 import { resolveOrdersWithAI } from "@/lib/orderCatalogueAI";
 import { useAIFeature } from "@/hooks/useAIFeature";
 import { calcQuantity, perDayDose, formatDuration } from "@/lib/prescriptionQuantity";
@@ -81,6 +84,14 @@ type OrderStateMap = Map<string, OrderState>;
 const orderStateOf = (map: OrderStateMap, name: string): OrderState | null =>
   map.get(name.toLowerCase().trim()) ?? null;
 
+/** A lab order row keeping its index into `prescription.lab_orders`, which the controls edit by position. */
+interface LabOrderRow { order: LabOrder; index: number }
+
+/** One entry in the Selected list: a loose test, or every member of one expanded panel. */
+type LabOrderGroup =
+  | ({ kind: "single" } & LabOrderRow)
+  | { kind: "panel"; panel: string; rows: LabOrderRow[] };
+
 /** The chip on a prescribed investigation. `null` state = PRESCRIBED (no order row yet). */
 export const OrderStateChip: React.FC<{ state: OrderState | null; className?: string }> = ({
   state, className,
@@ -132,6 +143,12 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
   const [labMaster, setLabMaster] = useState<{ name: string; category: string }[]>([]);
   const [radMaster, setRadMaster] = useState<{ name: string; modality: string }[]>([]);
   const [labGroups, setLabGroups] = useState<{ id: string; group_name: string; fee: number; testNames: string[] }[]>([]);
+  /** An empty `labGroups` means both "not fetched yet" and "this hospital has no panels".
+   *  Panel expansion must not run on the first reading, or a prescribed panel is dropped. */
+  const [labGroupsLoaded, setLabGroupsLoaded] = useState(false);
+  /** Panels whose member rows are showing. Collapsed by default — an 11-analyte LFT opened on
+   *  arrival is exactly the page-level scrollbar the Zero Scroll law forbids. */
+  const [openLabPanels, setOpenLabPanels] = useState<Set<string>>(new Set());
   const [labSuggestions, setLabSuggestions] = useState<string[]>([]);
   const [radSuggestions, setRadSuggestions] = useState<string[]>([]);
   const [orderedLabTests, setOrderedLabTests] = useState<OrderStateMap>(new Map());
@@ -176,12 +193,15 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
       .eq("hospital_id", hospitalId)
       .eq("is_active", true)
       .order("group_name")
-      .then(({ data }: any) => setLabGroups((data || []).map((g: any) => ({
-        id: g.id,
-        group_name: g.group_name,
-        fee: Number(g.fee) || 0,
-        testNames: (g.lab_test_group_items || []).map((i: any) => i.lab_test_master?.test_name).filter(Boolean),
-      }))));
+      .then(({ data }: any) => {
+        setLabGroups((data || []).map((g: any) => ({
+          id: g.id,
+          group_name: g.group_name,
+          fee: Number(g.fee) || 0,
+          testNames: (g.lab_test_group_items || []).map((i: any) => i.lab_test_master?.test_name).filter(Boolean),
+        })));
+        setLabGroupsLoaded(true);
+      });
     (supabase as any)
       .from("radiology_study_master")
       .select("study_name, modality_id, radiology_modalities:modality_id(name)")
@@ -268,12 +288,100 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [catalogue, prescription.lab_orders, prescription.radiology_orders]);
 
-  /** Names that resolve to nothing this hospital offers — the only ones that earn the badge. */
+  const labPanelsById = useMemo(
+    () => new Map<string, LabPanel>(labGroups.map((g) => [g.id, g])),
+    [labGroups],
+  );
+
+  /**
+   * Expand a prescribed panel into the tests the lab actually runs.
+   *
+   * "Thyroid Profile" is not something a lab performs — T3, T4 and TSH are. Until this ran, a
+   * panel that arrived by voice, from an AI Guidance chip or typed into the search box stayed
+   * as one line carrying the bundle name, which `NewLabOrderModal` then failed to match against
+   * `lab_test_master` at all: nothing selected, nothing billed. The panel CHIP always added the
+   * members; this is what makes saying the name do the same thing.
+   *
+   * Deliberately a second pass rather than part of the resolver above: that one is a 1:1
+   * rename across two lists, this is a 1:N replace within one. Running after it means the panel
+   * line already carries the group's `catalogue_id`, so this matches on id, not text.
+   */
+  useEffect(() => {
+    if (!catalogue?.all.length || !labGroupsLoaded) return;
+    const { labOrders } = expandLabPanels(prescription.lab_orders, catalogue, labPanelsById);
+    // Reference-equal when nothing expanded, which is how this converges after one pass.
+    if (labOrders !== prescription.lab_orders) onChange({ lab_orders: labOrders });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [catalogue, labGroupsLoaded, labPanelsById, prescription.lab_orders]);
+
+  /**
+   * Members a prescribed panel claims but that are not on the prescription — a test
+   * deactivated in `lab_test_master` since the panel was built.
+   *
+   * Derived from the EXPANDED rows, not from the expansion itself: once the panel line is gone
+   * there is nothing left to expand, so asking the reducer again would report nothing. A panel
+   * silently arriving with 2 of its 3 analytes is how a doctor comes to believe the third was
+   * ordered.
+   */
+  const omittedPanelMembers = useMemo(() => {
+    const byPanel = new Map<string, string[]>();
+    const present = new Set(prescription.lab_orders.map((l) => l.test_name.toLowerCase().trim()));
+    for (const name of new Set(prescription.lab_orders.map((l) => l.expanded_from).filter(Boolean))) {
+      const panel = labGroups.find((g) => g.group_name === name);
+      const missing = (panel?.testNames ?? []).filter((t) => !present.has(t.toLowerCase().trim()));
+      if (missing.length) byPanel.set(name as string, missing);
+    }
+    return byPanel;
+  }, [labGroups, prescription.lab_orders]);
+
+  /**
+   * The Selected list as it renders: loose tests stay single rows, expanded panel members
+   * collapse under one header.
+   *
+   * Without this an "LFT, CBC, KFT" dictation is 29 rows and the panel disappears into a wall
+   * of analytes — both the Zero Scroll law and the thing the doctor actually asked for.
+   */
+  const labOrderGroups = useMemo(() => {
+    const out: LabOrderGroup[] = [];
+    const panelAt = new Map<string, number>();
+    prescription.lab_orders.forEach((order, index) => {
+      const panel = order.expanded_from;
+      if (!panel) { out.push({ kind: "single", order, index }); return; }
+      const at = panelAt.get(panel);
+      if (at === undefined) {
+        panelAt.set(panel, out.length);
+        out.push({ kind: "panel", panel, rows: [{ order, index }] });
+      } else {
+        (out[at] as Extract<LabOrderGroup, { kind: "panel" }>).rows.push({ order, index });
+      }
+    });
+    return out;
+  }, [prescription.lab_orders]);
+
+  /** Names that resolve to nothing this hospital offers. Drives the tier-four AI lookup. */
   const unresolvedLabNames = useMemo(() => {
     const s = new Set<string>();
     if (!catalogue?.all.length) return s;
     for (const l of prescription.lab_orders) {
       if (!matchOrderNameDetailed(l.test_name, catalogue)) s.add(l.test_name);
+    }
+    return s;
+  }, [catalogue, prescription.lab_orders]);
+
+  /**
+   * Names the counter will not be able to turn into an order — the ones that earn the warning.
+   *
+   * Deliberately a different question from `unresolvedLabNames` above, which asks whether the
+   * MATCHER recognises the name. The counter matches prescribed names verbatim, so a line the
+   * doctor pinned with `keep_as_typed` is never ordered or billed however well it fuzzy-matches
+   * — and it was showing a PRESCRIBED chip, asserting a queue it was not in.
+   */
+  const unbillableLabNames = useMemo(() => {
+    const s = new Set<string>();
+    if (!catalogue?.all.length) return s;
+    for (const l of prescription.lab_orders) {
+      const kind = lookupExactEntry(l.test_name, catalogue)?.kind;
+      if (kind !== "lab" && kind !== "lab_group") s.add(l.test_name);
     }
     return s;
   }, [catalogue, prescription.lab_orders]);
@@ -319,6 +427,35 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
             availability: "unresolved" as const, keep_as_typed: true }
     ));
     onChange({ lab_orders: next });
+  }, [prescription.lab_orders, onChange]);
+
+  /**
+   * Undo a panel expansion: the members go, the doctor's own request comes back.
+   *
+   * The exact inverse of `expandLabPanels`, and it has to collapse the whole group at once —
+   * removing analytes one at a time would leave a half-panel that still bills as loose tests.
+   * `keep_as_typed` is what stops the resolver expanding it straight back again, the same
+   * permanence contract `revertLabMatch` has.
+   */
+  const revertPanelExpansion = useCallback((panel: string) => {
+    const members = prescription.lab_orders.filter((l) => l.expanded_from === panel);
+    if (!members.length) return;
+    const at = prescription.lab_orders.findIndex((l) => l.expanded_from === panel);
+    const rest = prescription.lab_orders.filter((l) => l.expanded_from !== panel);
+    const restored: LabOrder = {
+      // The doctor's own wording where it was recorded, else the panel's catalogue name.
+      test_name: members.find((m) => m.matched_from)?.matched_from ?? panel,
+      urgency: members[0].urgency,
+      clinical_indication: members[0].clinical_indication,
+      availability: "unresolved",
+      keep_as_typed: true,
+    };
+    onChange({ lab_orders: [...rest.slice(0, at), restored, ...rest.slice(at)] });
+  }, [prescription.lab_orders, onChange]);
+
+  /** Remove a whole expanded panel. A half-panel left behind would bill as loose tests. */
+  const removeLabPanel = useCallback((panel: string) => {
+    onChange({ lab_orders: prescription.lab_orders.filter((l) => l.expanded_from !== panel) });
   }, [prescription.lab_orders, onChange]);
 
   const revertRadMatch = useCallback((idx: number) => {
@@ -1430,33 +1567,104 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
                     <div className="flex-1 border-t border-blue-200" />
                   </div>
                   <div className="space-y-1">
-                    {prescription.lab_orders.map((l, i) => {
-                      const orderState = orderStateOf(orderedLabTests, l.test_name);
-                      // Resolved through the same matcher syncLabOrders uses, over tests AND
-                      // panels AND aliases. The old check compared raw lowercase strings
-                      // against labMaster alone, so every panel — Fever Panel included — was
-                      // reported as missing from a catalogue it was sitting in.
-                      const notInCatalogue = unresolvedLabNames.has(l.test_name);
-                      return (
-                        <div key={i} className="flex items-center justify-between bg-blue-50 border border-blue-100 rounded px-2 py-1.5">
-                          <div className="flex flex-col">
-                            <span className="text-xs font-medium text-foreground/80 flex items-center gap-1.5">
-                              {l.test_name}
-                              <AvailabilityBadge availability={l.availability} kind="test" />
-                            </span>
-                            {/* The catalogue warning replaces the state chip rather than joining it:
-                                a test that cannot be matched will never become an order, so showing
-                                PRESCRIBED next to it implies a queue it is not in. */}
-                            {notInCatalogue && !orderState ? (
-                              <span className="text-[9px] text-amber-700 font-bold flex items-center gap-1">
-                                Prescribed test not found in the lab catalogue — not ordered or billed
+                    {labOrderGroups.map((g) => {
+                      const renderRow = ({ order: l, index: i }: LabOrderRow, nested: boolean) => {
+                        const orderState = orderStateOf(orderedLabTests, l.test_name);
+                        // Resolved through the same matcher syncLabOrders uses, over tests AND
+                        // panels AND aliases. The old check compared raw lowercase strings
+                        // against labMaster alone, so every panel — Fever Panel included — was
+                        // reported as missing from a catalogue it was sitting in.
+                        const notInCatalogue = unbillableLabNames.has(l.test_name);
+                        return (
+                          <div key={i} className={cn(
+                            "flex items-center justify-between rounded px-2 py-1.5",
+                            nested ? "bg-white/60 border border-blue-100/60 ml-3" : "bg-blue-50 border border-blue-100",
+                          )}>
+                            <div className="flex flex-col">
+                              <span className="text-xs font-medium text-foreground/80 flex items-center gap-1.5">
+                                {l.test_name}
+                                <AvailabilityBadge availability={l.availability} kind="test" />
                               </span>
-                            ) : (
-                              <OrderStateChip state={orderState} className="text-[9px]" />
-                            )}
-                            <MatchTrace matchedFrom={l.matched_from} onRevert={() => revertLabMatch(i)} />
+                              {/* The catalogue warning replaces the state chip rather than joining it:
+                                  a test that cannot be matched will never become an order, so showing
+                                  PRESCRIBED next to it implies a queue it is not in. */}
+                              {notInCatalogue && !orderState ? (
+                                <span className="text-[9px] text-amber-700 font-bold flex items-center gap-1">
+                                  Prescribed test not found in the lab catalogue — not ordered or billed
+                                </span>
+                              ) : (
+                                <OrderStateChip state={orderState} className="text-[9px]" />
+                              )}
+                              {/* A member's own trace is suppressed — the panel header carries the
+                                  one undo that can put the doctor's wording back intact. */}
+                              {!nested && <MatchTrace matchedFrom={l.matched_from} onRevert={() => revertLabMatch(i)} />}
+                            </div>
+                            <button onClick={() => removeLab(i)}><X className="h-3 w-3 text-muted-foreground hover:text-destructive" /></button>
                           </div>
-                          <button onClick={() => removeLab(i)}><X className="h-3 w-3 text-muted-foreground hover:text-destructive" /></button>
+                        );
+                      };
+
+                      if (g.kind === "single") return renderRow(g, false);
+
+                      const open = openLabPanels.has(g.panel);
+                      const fee = labGroups.find((lg) => lg.group_name === g.panel)?.fee ?? 0;
+                      const omitted = omittedPanelMembers.get(g.panel) ?? [];
+                      const dictatedAs = g.rows.find((r) => r.order.matched_from)?.order.matched_from;
+                      // Aggregate so the collapsed header never understates where the money is:
+                      // anything short of every member paid is reported as the weakest state.
+                      const states = g.rows.map((r) => orderStateOf(orderedLabTests, r.order.test_name));
+                      const panelState: OrderState | null =
+                        states.every((s) => s === "paid") ? "paid"
+                        : states.some((s) => s) ? "awaiting_payment"
+                        : null;
+                      return (
+                        <div key={`panel:${g.panel}`} className="bg-blue-50 border border-blue-100 rounded">
+                          <div className="flex items-center justify-between px-2 py-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setOpenLabPanels((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(g.panel)) next.delete(g.panel); else next.add(g.panel);
+                                return next;
+                              })}
+                              className="flex flex-col items-start min-w-0 flex-1 text-left"
+                              title={omitted.length ? `Not offered here: ${omitted.join(", ")}` : undefined}
+                            >
+                              <span className="text-xs font-medium text-foreground/80 flex items-center gap-1.5">
+                                {open ? <ChevronDown className="h-3 w-3 shrink-0" /> : <ChevronRight className="h-3 w-3 shrink-0" />}
+                                {g.panel}
+                                <span className="text-[10px] font-normal text-muted-foreground">
+                                  {g.rows.length} {g.rows.length === 1 ? "test" : "tests"}
+                                  {fee > 0 && ` · ${formatCurrency(fee)}`}
+                                </span>
+                                {omitted.length > 0 && (
+                                  <span className="text-[9px] text-amber-700 font-bold">
+                                    {omitted.length} not offered
+                                  </span>
+                                )}
+                              </span>
+                              {/* Collapsed, the members still have to be readable: a panel that
+                                  silently stands in for three billable tests is the substitution
+                                  the doctor most needs to see. */}
+                              {!open && (
+                                <span className="text-[9px] text-muted-foreground truncate max-w-full">
+                                  {g.rows.map((r) => r.order.test_name).join(" · ")}
+                                </span>
+                              )}
+                              <OrderStateChip state={panelState} className="text-[9px]" />
+                            </button>
+                            <button onClick={() => removeLabPanel(g.panel)} title={`Remove ${g.panel}`}>
+                              <X className="h-3 w-3 text-muted-foreground hover:text-destructive" />
+                            </button>
+                          </div>
+                          <div className="px-2 pb-1.5">
+                            <MatchTrace
+                              matchedFrom={dictatedAs}
+                              panel={g.panel}
+                              onRevert={() => revertPanelExpansion(g.panel)}
+                            />
+                          </div>
+                          {open && <div className="space-y-1 px-2 pb-1.5">{g.rows.map((r) => renderRow(r, true))}</div>}
                         </div>
                       );
                     })}
@@ -1638,6 +1846,9 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
           items={openLabPicker.testNames}
           selectedNames={new Set(prescription.lab_orders.map(l => l.test_name))}
           orderedNames={orderedLabTests}
+          // A panel is a defined bundle, so it opens fully ticked. A test category or "All Tests"
+          // is a browsing list — it stays unticked so a click does not order the whole catalogue.
+          defaultSelectAll={openLabPicker.groupKey.startsWith("panel:")}
           onClose={() => setOpenLabPicker(null)}
           onConfirm={(finalNames) => applyLabPickerSelection(openLabPicker.testNames, finalNames)}
           onReorder={(newOrder) => saveGroupPriorityOrder(openLabPicker.groupKey, newOrder)}
@@ -1700,15 +1911,23 @@ const RxOrdersTab: React.FC<Props> = ({ prescription, onChange, hospitalId, pati
  *
  * Renders nothing when the name matched verbatim, which is the overwhelmingly common case.
  */
-const MatchTrace: React.FC<{ matchedFrom?: string; onRevert: () => void }> = ({ matchedFrom, onRevert }) => {
-  if (!matchedFrom) return null;
+const MatchTrace: React.FC<{ matchedFrom?: string; panel?: string; onRevert: () => void }> = ({
+  matchedFrom, panel, onRevert,
+}) => {
+  // A panel expansion is a substitution too, and it has to offer its undo even when the doctor
+  // named the panel verbatim — `matchedFrom` is unset in that case, which used to hide the
+  // control entirely.
+  if (!matchedFrom && !panel) return null;
+  const pinned = matchedFrom ?? panel!;
   return (
     <span className="text-[9px] text-muted-foreground flex items-center gap-1">
-      matched from “{matchedFrom}”
+      {panel
+        ? (matchedFrom ? `expanded from “${matchedFrom}”` : `expanded from the ${panel} panel`)
+        : `matched from “${matchedFrom}”`}
       <button
         type="button"
         onClick={onRevert}
-        title={`Keep "${matchedFrom}" exactly as written. It will not be auto-ordered or billed.`}
+        title={`Keep "${pinned}" exactly as written. It will not be auto-ordered or billed.`}
         className="underline hover:text-destructive"
       >
         undo

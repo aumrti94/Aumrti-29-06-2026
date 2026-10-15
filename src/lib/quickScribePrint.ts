@@ -20,11 +20,11 @@
  *      shield. It is replaced by an honest statement of what WAS screened (duplicate therapy
  *      and interactions, which need no patient record) and what was not (allergies).
  *
- * Without a dispensable document the predictable real-world outcome is that the chemist
- * dispenses anyway and invents a patient name for the statutory Schedule H1 register — i.e.
- * the product's normal operating mode would produce fabricated entries in a government
- * register. Hence: patient name/age/sex are mandatory upstream, and this renderer refuses to
- * produce a medicines page without them.
+ * Patient name/age/sex and the doctor registration number are printed when the doctor fills
+ * them in, but — per product decision — are not required to print: the only field this renderer
+ * still blocks on is a per-drug quantity (Rule 65(10)(c)), since that one is derived by the app
+ * itself rather than typed by the doctor, and a blank quantity usually means a calculation
+ * bug rather than a deliberate omission.
  *
  * Reuses the same branded header/print-window pipeline every other document in the app uses
  * — see receiptPrint.ts / billPrint.ts.
@@ -46,7 +46,7 @@ export interface QuickScribeMedicine {
 
 export interface QuickScribeNoteInput {
   doctorName: string;
-  /** MCI reg. 1.4.1 — mandatory. Printing is blocked upstream when this is absent. */
+  /** Printed when on file; not required to print. */
   doctorRegistrationNumber: string;
   /** Rule 65(10)(b) — mandatory whenever medicines are listed. */
   patientName: string;
@@ -77,18 +77,14 @@ export class QuickScribePrintBlocked extends Error {
 }
 
 /**
- * Rule 65(10) validation. Only enforced when medicines are present — a note carrying nothing
- * but a summary and test advice is not a prescription and does not need the drug fields.
+ * Only enforced when medicines are present — a note carrying nothing but a summary and test
+ * advice is not a prescription and does not need the drug fields. Patient name/age/sex and the
+ * doctor registration number are printed when filled in but are not required to print.
  */
 export function validateForPrint(input: QuickScribeNoteInput): string[] {
   const missing: string[] = [];
   const hasMedicines = (input.medicines || []).some(m => (m.drug_name || "").trim());
   if (!hasMedicines) return missing;
-
-  if (!(input.patientName || "").trim()) missing.push("patient name");
-  if (!(input.patientAge || "").toString().trim()) missing.push("patient age");
-  if (!(input.patientSex || "").toString().trim()) missing.push("patient sex");
-  if (!(input.doctorRegistrationNumber || "").trim()) missing.push("doctor registration number");
 
   const unquantified = (input.medicines || [])
     .filter(m => (m.drug_name || "").trim() && !(m.quantity || "").trim())

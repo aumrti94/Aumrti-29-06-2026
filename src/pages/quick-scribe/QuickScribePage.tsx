@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Printer, Plus, AlertTriangle, ShieldAlert, Loader2 } from "lucide-react";
+import { Printer, Plus, AlertTriangle, Loader2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useHospitalId } from "@/hooks/useHospitalId";
 import { useAIFeatureFlag } from "@/hooks/useAIFeatureFlag";
@@ -41,11 +41,9 @@ const QuickScribePage: React.FC = () => {
   const [note, setNote] = useState<QuickScribeNote | null>(null);
   const [patient, setPatient] = useState({ name: "", age: "", sex: "", address: "" });
 
-  // Registration number is a print prerequisite (MCI reg. 1.4.1), not decoration. It is
-  // fetched once on mount so the doctor learns it is missing BEFORE dictating a full
-  // consultation, rather than at the moment they press Print.
+  // Fetched once on mount so it can be embedded on the printed prescription when on file.
+  // Not a print prerequisite — printing proceeds without it if it's missing.
   const [regNumber, setRegNumber] = useState<string | null>(null);
-  const [regLoaded, setRegLoaded] = useState(false);
 
   const [safety, setSafety] = useState<QuickScribeSafetyResult | null>(null);
   const [screening, setScreening] = useState(false);
@@ -60,7 +58,7 @@ const QuickScribePage: React.FC = () => {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      if (!userId) { setRegLoaded(true); return; }
+      if (!userId) return;
       const { data, error } = await (supabase as any)
         .from("staff_profiles")
         .select("registration_number")
@@ -77,7 +75,6 @@ const QuickScribePage: React.FC = () => {
         });
       }
       setRegNumber(data?.registration_number ?? null);
-      setRegLoaded(true);
     })();
     return () => { cancelled = true; };
   }, [userId, toast]);
@@ -164,7 +161,7 @@ const QuickScribePage: React.FC = () => {
   }, [note, fullName, regNumber, patient, safety]);
 
   const missing = useMemo(() => (printInput ? validateForPrint(printInput) : []), [printInput]);
-  const canPrint = !!note && regLoaded && missing.length === 0 && !isSaving;
+  const canPrint = !!note && missing.length === 0 && !isSaving;
 
   const updateMedicine = useCallback((idx: number, patch: Partial<QuickScribeMedicine>) => {
     setNote(prev => {
@@ -262,13 +259,6 @@ const QuickScribePage: React.FC = () => {
     );
   }
 
-  // Patient identity and the doctor's registration number are only a legal requirement
-  // (Drugs & Cosmetics Rules 1945 Rule 65(10); MCI reg. 1.4.1) once the note actually lists
-  // a medicine — a summary/labs-only note is not a dispensable prescription. See
-  // quickScribePrint.ts for the print-time gate this mirrors.
-  const hasMedicines = !!medicineKey;
-  const regMissing = regLoaded && !regNumber && hasMedicines;
-
   return (
     <div className="flex flex-col overflow-hidden" style={{ height: "calc(100vh - 56px)" }}>
       {/* Top bar */}
@@ -282,18 +272,18 @@ const QuickScribePage: React.FC = () => {
       </div>
 
       {/* Patient identity. Not a patient record — no MRN, no chart, nothing written to
-          public.patients. These are the fields Rule 65(10) requires on the paper. */}
+          public.patients. Not required to print. */}
       <div className="flex-shrink-0 border-b border-border bg-muted/30 px-5 py-2 flex items-end gap-3">
         <div className="flex-1 min-w-0">
-          <label className="text-sm text-muted-foreground block mb-1">Patient name {hasMedicines && <span className="text-destructive">*</span>}</label>
+          <label className="text-sm text-muted-foreground block mb-1">Patient name</label>
           <Input className="h-8" value={patient.name} onChange={e => setPatient(p => ({ ...p, name: e.target.value }))} />
         </div>
         <div className="w-24">
-          <label className="text-sm text-muted-foreground block mb-1">Age {hasMedicines && <span className="text-destructive">*</span>}</label>
+          <label className="text-sm text-muted-foreground block mb-1">Age</label>
           <Input className="h-8" value={patient.age} onChange={e => setPatient(p => ({ ...p, age: e.target.value }))} />
         </div>
         <div className="w-28">
-          <label className="text-sm text-muted-foreground block mb-1">Sex {hasMedicines && <span className="text-destructive">*</span>}</label>
+          <label className="text-sm text-muted-foreground block mb-1">Sex</label>
           <select
             className="h-8 w-full rounded-md border border-input bg-background px-2 text-sm"
             value={patient.sex}
@@ -311,16 +301,7 @@ const QuickScribePage: React.FC = () => {
         </div>
       </div>
 
-      {/* Blocking conditions and clinical alerts, surfaced immediately rather than at print. */}
-      {regMissing && (
-        <div className="flex-shrink-0 bg-destructive/10 border-b border-destructive/30 px-5 py-2 flex items-center gap-2">
-          <ShieldAlert className="h-4 w-4 text-destructive flex-shrink-0" />
-          <span className="text-sm text-destructive font-medium">
-            Your medical registration number is not on file. It is required on any prescription — add it in HR → Staff Directory before printing.
-          </span>
-        </div>
-      )}
-
+      {/* Clinical alerts, surfaced immediately rather than at print. */}
       {safety?.hasIssues && (
         <div className="flex-shrink-0 bg-amber-500/10 border-b border-amber-500/40 px-5 py-2">
           <div className="flex items-start gap-2">

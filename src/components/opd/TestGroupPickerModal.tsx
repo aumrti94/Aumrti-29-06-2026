@@ -26,6 +26,11 @@ interface TestGroupPickerModalProps {
    *  pickable and carries no chip at all (an unordered catalogue row is the normal case; a
    *  PRESCRIBED chip on every unticked test would be noise). */
   orderedNames?: Map<string, OrderState>;
+  /** Opens with every row ticked. True for a defined panel — a doctor who clicks "Kidney
+   *  Function Test" wants the panel, so unticking the odd analyte is fewer clicks than ticking
+   *  six. Left false for a browsing list (a test category, "All Tests", a radiology modality),
+   *  where ticking everything by default would raise — and bill — the whole catalogue. */
+  defaultSelectAll?: boolean;
   onClose: () => void;
   onConfirm: (finalSelectedNames: string[]) => void;
   /** Persists the doctor's drag-to-reorder priority for this group. */
@@ -39,6 +44,7 @@ const TestGroupPickerModal: React.FC<TestGroupPickerModalProps> = ({
   items,
   selectedNames,
   orderedNames,
+  defaultSelectAll = false,
   onClose,
   onConfirm,
   onReorder,
@@ -49,7 +55,16 @@ const TestGroupPickerModal: React.FC<TestGroupPickerModalProps> = ({
 
   useEffect(() => {
     if (open) {
-      setLocal(new Set(selectedNames));
+      // Scoped to this group's rows: names the prescription holds from *other* groups are never
+      // consulted on Apply, and counting them made the footer read "11 selected" over 8 rows.
+      const preselected = items.filter((name) => {
+        if (selectedNames.has(name)) return true;
+        if (!defaultSelectAll) return false;
+        // An order row already exists for this encounter — the row is disabled so the same test
+        // is not raised and billed twice, so it must not be ticked for the doctor either.
+        return !orderedNames?.has(name.toLowerCase().trim());
+      });
+      setLocal(new Set(preselected));
       setOrder(items);
       setMode("select");
     }

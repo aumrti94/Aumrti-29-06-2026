@@ -45,7 +45,7 @@ function computeDeteriorationScore(vitals: any, admission: any, patient: any): {
   // Chronic conditions
   const conditions = (patient?.chronic_conditions || []).length;
   if (conditions >= 3) { score += 15; reasons.push(`${conditions} chronic conditions`); }
-  else if (conditions >= 1) { score += 5; }
+  else if (conditions >= 1) { score += 5; reasons.push(`${conditions} chronic condition${conditions > 1 ? "s" : ""}`); }
 
   // LOS
   const los = admission?.admitted_at ? differenceInHours(new Date(), new Date(admission.admitted_at)) / 24 : 0;

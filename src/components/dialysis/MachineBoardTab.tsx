@@ -220,12 +220,17 @@ const MachineBoardTab: React.FC<Props> = ({ onRefresh }) => {
 
     if (!dialysisPatient) return;
 
+    // admissions.status default/live value for "currently occupying a bed" is "active" (see
+    // supabase/migrations/20260322100400_6c9a79a1-7e9c-4765-b9ee-5f84aa2a6291.sql line 20 and
+    // IPDPage.tsx/PhysioPage.tsx). "admitted" is never written to this column anywhere in the
+    // codebase, so this check always matched zero admissions and every dialysis session for an
+    // admitted IPD patient billed to a fresh OPD-style bill instead of the existing IPD bill.
     const { data: admission } = await supabase
       .from("admissions")
       .select("id")
       .eq("hospital_id", hospitalId)
       .eq("patient_id", dialysisPatient.patient_id)
-      .eq("status", "admitted")
+      .eq("status", "active")
       .maybeSingle();
 
     const { data: rate } = await (supabase as any)

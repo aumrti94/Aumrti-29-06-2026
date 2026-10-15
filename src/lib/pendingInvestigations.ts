@@ -16,27 +16,90 @@ export interface PendingInvestigationRow {
   doctorName: string;
   pendingLabTests: string[];
   pendingRadiologyStudies: string[];
-  estimatedRevenue: number; // sum of lab_test_master.fee + radiology_study_master.fee for pending names
+  /** What the counter will actually collect for the pending items — panel pricing included. */
+  estimatedRevenue: number;
+}
+
+/** A lab panel and the active member tests that make it up, for group pricing. */
+export interface LabPanelPricing {
+  groupName: string;
+  fee: number;
+  testNames: string[];
 }
 
 interface FeeMaps {
   labFeeMap: Record<string, number>;
   radFeeMap: Record<string, number>;
+  labPanels: LabPanelPricing[];
+}
+
+const key = (s: string) => (s ?? "").toLowerCase().trim();
+
+/**
+ * What the counter will charge for a set of pending lab tests.
+ *
+ * Must mirror `NewLabOrderModal`'s `fetchRates`, which collapses a fully-covered panel to ONE
+ * line at the panel fee: a Pre-Operative Screening prescribed as its eight analytes is ₹1400 on
+ * the bill, not the ₹2750 those analytes cost one at a time. Summing the parts made the "Est.
+ * revenue" on the pending worklist overstate every panel the doctor ordered.
+ *
+ * A bare panel NAME is priced too — prescriptions saved before panels were expanded still carry
+ * one, and the counter now resolves it to the panel.
+ */
+export function estimateLabRevenue(
+  pendingTestNames: readonly string[],
+  labFeeMap: Record<string, number>,
+  labPanels: readonly LabPanelPricing[],
+): number {
+  const pending = new Set(pendingTestNames.map(key));
+  const covered = new Set<string>();
+  let total = 0;
+
+  for (const panel of labPanels) {
+    const members = panel.testNames.map(key).filter(Boolean);
+    // `members.length > 0` matters: a panel whose members are all deactivated would otherwise
+    // satisfy every() vacuously and bill its fee against nothing.
+    const wholePanelPending = members.length > 0 && members.every((m) => pending.has(m));
+    if (!wholePanelPending && !pending.has(key(panel.groupName))) continue;
+    total += panel.fee;
+    for (const m of members) covered.add(m);
+    covered.add(key(panel.groupName));
+  }
+
+  for (const name of pending) {
+    if (covered.has(name)) continue;
+    total += labFeeMap[name] || 0;
+  }
+  return total;
 }
 
 /** Fee lookups for revenue estimation. Best-effort — an unconfigured test is worth 0. */
 async function fetchFeeMaps(hospitalId: string): Promise<FeeMaps> {
-  const [{ data: labMaster }, { data: radMaster }] = await Promise.all([
+  const [{ data: labMaster }, { data: radMaster }, { data: groups }] = await Promise.all([
     (supabase as any).from("lab_test_master")
       .select("test_name, fee").eq("hospital_id", hospitalId).eq("is_active", true),
     (supabase as any).from("radiology_study_master")
       .select("study_name, fee").eq("hospital_id", hospitalId).eq("is_active", true),
+    (supabase as any).from("lab_test_groups")
+      .select("group_name, fee, lab_test_group_items(lab_test_master:test_id(test_name, is_active))")
+      .eq("hospital_id", hospitalId).eq("is_active", true),
   ]);
   const labFeeMap: Record<string, number> = {};
-  for (const t of labMaster || []) labFeeMap[String(t.test_name).toLowerCase().trim()] = Number(t.fee) || 0;
+  for (const t of labMaster || []) labFeeMap[key(String(t.test_name))] = Number(t.fee) || 0;
   const radFeeMap: Record<string, number> = {};
-  for (const s of radMaster || []) radFeeMap[String(s.study_name).toLowerCase().trim()] = Number(s.fee) || 0;
-  return { labFeeMap, radFeeMap };
+  for (const s of radMaster || []) radFeeMap[key(String(s.study_name))] = Number(s.fee) || 0;
+  const labPanels: LabPanelPricing[] = (groups || []).map((g: any) => ({
+    groupName: String(g.group_name),
+    fee: Number(g.fee) || 0,
+    // Active members only, matching the counter: a panel holding a deactivated test can never
+    // be fully selected there, so pricing it as a bundle here would overstate nothing but
+    // would disagree with the bill.
+    testNames: (g.lab_test_group_items || [])
+      .filter((i: any) => i.lab_test_master?.is_active)
+      .map((i: any) => i.lab_test_master?.test_name)
+      .filter(Boolean),
+  }));
+  return { labFeeMap, radFeeMap, labPanels };
 }
 
 /**
@@ -136,7 +199,7 @@ export async function getPendingInvestigations(
   }
 
   // 6. Fee maps for revenue estimation (best-effort — 0 if not configured)
-  const { labFeeMap, radFeeMap } = await fetchFeeMaps(hospitalId);
+  const { labFeeMap, radFeeMap, labPanels } = await fetchFeeMaps(hospitalId);
 
   // 7. Encounter map for O(1) lookup
   const encMap: Record<string, any> = {};
@@ -165,8 +228,8 @@ export async function getPendingInvestigations(
     if (!pendingLabTests.length && !pendingRadiologyStudies.length) continue;
 
     const estimatedRevenue =
-      pendingLabTests.reduce((s, n) => s + (labFeeMap[n.toLowerCase().trim()] || 0), 0) +
-      pendingRadiologyStudies.reduce((s, n) => s + (radFeeMap[n.toLowerCase().trim()] || 0), 0);
+      estimateLabRevenue(pendingLabTests, labFeeMap, labPanels) +
+      pendingRadiologyStudies.reduce((s, n) => s + (radFeeMap[key(n)] || 0), 0);
 
     const patient = enc.patients as any;
     const createdAt: string = enc.created_at || enc.visit_date;
@@ -192,7 +255,7 @@ export async function getPendingInvestigations(
   }
 
   // Ward rows join the same list — the counter works one worklist, not two.
-  const wardRows = await getPendingWardInvestigations(hospitalId, { labFeeMap, radFeeMap });
+  const wardRows = await getPendingWardInvestigations(hospitalId, { labFeeMap, radFeeMap, labPanels });
   results.push(...wardRows);
 
   // Sort newest encounter date first, then by time
@@ -307,8 +370,8 @@ async function getPendingWardInvestigations(
       pendingLabTests,
       pendingRadiologyStudies,
       estimatedRevenue:
-        pendingLabTests.reduce((s, n) => s + (fees.labFeeMap[n.toLowerCase().trim()] || 0), 0) +
-        pendingRadiologyStudies.reduce((s, n) => s + (fees.radFeeMap[n.toLowerCase().trim()] || 0), 0),
+        estimateLabRevenue(pendingLabTests, fees.labFeeMap, fees.labPanels) +
+        pendingRadiologyStudies.reduce((s, n) => s + (fees.radFeeMap[key(n)] || 0), 0),
     });
   }
   return rows;

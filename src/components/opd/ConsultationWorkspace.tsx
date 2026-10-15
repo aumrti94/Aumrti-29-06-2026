@@ -150,6 +150,15 @@ export interface DrugEntry {
 export interface OrderMatchTrace {
   matched_from?: string;
   keep_as_typed?: boolean;
+  /**
+   * Canonical `lab_test_groups.group_name` this line was expanded out of.
+   *
+   * A prescribed panel becomes one line per member test, because that is what the lab actually
+   * runs and bills. This records which panel a member came from, so the rows can be rendered
+   * back under one panel header and the expansion undone as a unit — and, because the resolver
+   * skips any line that carries it, it is also what makes expansion converge after one pass.
+   */
+  expanded_from?: string;
 }
 
 export interface LabOrder extends OrderMatchTrace {
@@ -169,6 +178,21 @@ export interface RadiologyOrder extends OrderMatchTrace {
   /** radiology_study_master.id once resolved. */
   catalogue_id?: string;
 }
+
+/**
+ * Idle gap before an edit is written. Short enough that a single typed word or one ticked test
+ * survives the doctor being called away mid-sentence.
+ */
+const SAVE_IDLE_MS = 800;
+
+/**
+ * Ceiling on how long an unsaved edit can sit, measured from the first one.
+ *
+ * A debounce alone is cleared by the next keystroke, so a history typed without a pause never
+ * reached the database at all. This is what bounds the loss to a few seconds of typing however
+ * long the doctor keeps going.
+ */
+const SAVE_MAX_WAIT_MS = 3000;
 
 const emptyEncounter: EncounterData = {
   chief_complaint: "", history_of_present_illness: "", vitals: {},
@@ -262,6 +286,9 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
   const [saved, setSaved] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const saveTimer = useRef<ReturnType<typeof setTimeout>>();
+  /** When the oldest still-unsaved edit happened. Drives the autosave ceiling. */
+  const firstDirtyAt = useRef<number | null>(null);
+  const flushSaveRef = useRef<() => Promise<void>>();
   const prevTokenId = useRef<string | null>(null);
   const isDirtyRef = useRef(false);
   /**
@@ -298,6 +325,26 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
     };
     window.addEventListener("beforeunload", handler);
     return () => window.removeEventListener("beforeunload", handler);
+  }, []);
+
+  /**
+   * Write pending edits the moment the workspace stops being looked at.
+   *
+   * `beforeunload` can only warn — a Supabase write is asynchronous and the page is gone
+   * before it lands. These two fire while the document is still alive. On the tablet at a
+   * nurse station this is the common case by far: the doctor switches app or locks the screen
+   * mid-note, which raises neither a close nor a navigation.
+   */
+  useEffect(() => {
+    const flushIfHidden = () => {
+      if (document.visibilityState === "hidden") void flushSaveRef.current?.();
+    };
+    document.addEventListener("visibilitychange", flushIfHidden);
+    window.addEventListener("pagehide", flushIfHidden);
+    return () => {
+      document.removeEventListener("visibilitychange", flushIfHidden);
+      window.removeEventListener("pagehide", flushIfHidden);
+    };
   }, []);
 
 
@@ -577,6 +624,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
       prevTokenId.current = null;
       prescriptionLoadedFor.current = null;
       isDirtyRef.current = false;
+      firstDirtyAt.current = null;
       setEncounter(emptyEncounter);
       setPrescription(emptyPrescription);
       setEncounterId(null);
@@ -587,6 +635,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
     if (tokenId === prevTokenId.current) return;
     prevTokenId.current = tokenId;
     isDirtyRef.current = false;
+    firstDirtyAt.current = null;
     prescriptionLoadedFor.current = null;
     setDiagnosisSeed(null);
 
@@ -792,6 +841,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
       }
       setSaved(true);
       isDirtyRef.current = false;
+      firstDirtyAt.current = null;
       setTimeout(() => setSaved(false), 2000);
       return savedId;
     } catch (err) {
@@ -949,16 +999,53 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
   }, [token, hospitalId, userId, encounterId, prescriptionId, toast]);
   autoSavePrescriptionRef.current = autoSavePrescription;
 
-  // Debounced update
+  /**
+   * Write whatever is unsaved, encounter and prescription together.
+   *
+   * Always both, never one. The two used to be scheduled on a single shared timer that each
+   * updater overwrote with its own callback, so adding a drug and then typing in the complaint
+   * within the debounce window replaced the pending prescription write with an encounter-only
+   * one — the drug stayed on screen and never reached the database.
+   *
+   * Sequential, and the encounter first: `autoSavePrescription` needs an encounter id and
+   * silently returns without one. Fired concurrently on a consultation whose encounter row did
+   * not exist yet, it read `encounterId` as null and dropped the write, which is why the FIRST
+   * test or drug picked on a fresh consultation never saved. `autoSaveEncounter` returns the
+   * id it created precisely so the caller can hand it straight over.
+   */
+  const flushSave = useCallback(async () => {
+    if (saveTimer.current) { clearTimeout(saveTimer.current); saveTimer.current = undefined; }
+    firstDirtyAt.current = null;
+    if (!isDirtyRef.current) return;
+    const encId = await autoSaveEncounter(encounterRef.current);
+    await autoSavePrescription(prescriptionRef.current, encId ?? undefined);
+  }, [autoSaveEncounter, autoSavePrescription]);
+  flushSaveRef.current = flushSave;
+
+  /**
+   * Arm the autosave after an edit.
+   *
+   * Debounced on an idle gap so a burst of keystrokes is one write, but capped: a pure
+   * debounce is cleared by the NEXT keystroke, so a doctor typing a long history without
+   * pausing for two seconds had written nothing at all. The ceiling is measured from the first
+   * unsaved change, so continuous typing still reaches the database on a fixed cadence.
+   */
+  const scheduleSave = useCallback(() => {
+    isDirtyRef.current = true;
+    const now = Date.now();
+    if (firstDirtyAt.current === null) firstDirtyAt.current = now;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    const remainingToCeiling = SAVE_MAX_WAIT_MS - (now - firstDirtyAt.current);
+    saveTimer.current = setTimeout(
+      () => { void flushSave(); },
+      Math.max(0, Math.min(SAVE_IDLE_MS, remainingToCeiling)),
+    );
+  }, [flushSave]);
+
   const updateEncounter = useCallback((partial: Partial<EncounterData>) => {
-    setEncounter((prev) => {
-      const next = { ...prev, ...partial };
-      isDirtyRef.current = true;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => autoSaveEncounter(next), 2000);
-      return next;
-    });
-  }, [autoSaveEncounter]);
+    setEncounter((prev) => ({ ...prev, ...partial }));
+    scheduleSave();
+  }, [scheduleSave]);
   updateEncounterRef.current = updateEncounter;
 
   /**
@@ -1003,6 +1090,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
         await autoSaveEncounter(encounter);
         await autoSavePrescription(prescriptionRef.current, encounterId ?? undefined);
         isDirtyRef.current = false;
+        firstDirtyAt.current = null;
       }
     }
 
@@ -1203,17 +1291,9 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
   };
 
   const updatePrescription = useCallback((partial: Partial<PrescriptionData>) => {
-    setPrescription((prev) => {
-      const next = { ...prev, ...partial };
-      isDirtyRef.current = true;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => {
-        autoSaveEncounter(encounter);
-        autoSavePrescription(next);
-      }, 2000);
-      return next;
-    });
-  }, [autoSaveEncounter, autoSavePrescription, encounter]);
+    setPrescription((prev) => ({ ...prev, ...partial }));
+    scheduleSave();
+  }, [scheduleSave]);
   updatePrescriptionRef.current = updatePrescription;
 
   /**
@@ -1324,19 +1404,16 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
     setPrescription((prev) => {
       // Case-insensitive so "Fever Profile" can't be added alongside "fever profile".
       if (prev.lab_orders.some((l) => l.test_name.trim().toLowerCase() === name.trim().toLowerCase())) return prev;
-      const next = {
+      return {
         ...prev,
         lab_orders: [
           ...prev.lab_orders,
           { test_name: name, urgency: "routine", clinical_indication: "", availability: "unresolved" as const },
         ],
       };
-      isDirtyRef.current = true;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => autoSavePrescription(next), 2000);
-      return next;
     });
-  }, [autoSavePrescription]);
+    scheduleSave();
+  }, [scheduleSave]);
 
   const handleStartConsultation = async () => {
     if (!token) return;
@@ -1405,6 +1482,7 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
 
     await autoSavePrescription(prescription, encounterId);
     isDirtyRef.current = false;
+    firstDirtyAt.current = null;
 
     // Lab / Radiology handoff — PAYMENT FIRST, ORDER SECOND.
     //
@@ -1685,18 +1763,18 @@ const ConsultationWorkspace: React.FC<Props> = ({ token, hospitalId, userId, onT
       return;
     }
 
-    // updatePrescription/addLabOrder arm a 2s debounced autosave (saveTimer) that calls
-    // autoSaveEncounter + autoSavePrescription on its own. If Complete is clicked before that
-    // timer fires, it survives this function and later runs concurrently with the saves below.
-    // autoSavePrescription decides insert-vs-update from the prescriptionId React state, which
-    // neither call has updated yet at that point, so both insert — leaving two prescriptions
-    // rows for one encounter_id. The reload query uses .maybeSingle(), which then throws on the
-    // duplicate and silently falls back to an empty prescription (BUG: chips/orders vanish on
-    // reopen). Cancel the pending debounce so completion is the only save that runs.
+    // Every edit arms the autosave (saveTimer, see scheduleSave). If Complete is clicked before
+    // that timer fires, it survives this function and later runs concurrently with the saves
+    // below. autoSavePrescription decides insert-vs-update from the prescriptionId React state,
+    // which neither call has updated yet at that point, so both insert — leaving two
+    // prescriptions rows for one encounter_id. The reload query uses .maybeSingle(), which then
+    // throws on the duplicate and silently falls back to an empty prescription (BUG: chips/orders
+    // vanish on reopen). Cancel the pending autosave so completion is the only save that runs.
     if (saveTimer.current) {
       clearTimeout(saveTimer.current);
       saveTimer.current = undefined;
     }
+    firstDirtyAt.current = null;
 
     setFinalizing(true);
     try {

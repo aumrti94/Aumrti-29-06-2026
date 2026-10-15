@@ -28,7 +28,7 @@ export interface DayCarePaymentPolicy {
 export const DEFAULT_DAY_CARE_POLICY: DayCarePaymentPolicy = {
   requireClearance: true,
   depositPercent: 100,
-  overrideRoles: ["admin", "billing"],
+  overrideRoles: ["hospital_admin", "super_admin", "billing_executive"],
 };
 
 /** hospital_settings key holding the policy — mirrors the 'teleconsult_payment' shape. */

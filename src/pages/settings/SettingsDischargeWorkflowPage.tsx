@@ -146,10 +146,23 @@ const SettingsDischargeWorkflowPage: React.FC = () => {
     if (!hospitalId) return;
     const updated = customWorkflows.filter((w) => w.id !== id);
     setCustomWorkflows(updated);
-    await (supabase as any).from("hospitals").update({ discharge_workflow_presets: updated as any } as any).eq("id", hospitalId);
+    const wasActive = activeId === id;
+    // `discharge_workflow` — not `discharge_workflow_presets` — is the field IPDOverviewTab.tsx
+    // actually reads to drive the live ward discharge stepper. Deleting a preset used to only
+    // remove it from the saved list; if it was the active one, the dangerous step list stayed
+    // live-enforced until someone happened to overwrite it via Save. Falling back to Standard
+    // here, in the same write, closes that gap.
+    const payload: any = { discharge_workflow_presets: updated };
+    if (wasActive) payload.discharge_workflow = { id: "standard", steps: BUILTIN[1].steps };
+    const { error } = await (supabase as any).from("hospitals").update(payload).eq("id", hospitalId);
+    if (error) {
+      toast({ title: "Could not delete workflow", description: error.message, variant: "destructive" });
+      setCustomWorkflows(customWorkflows);
+      return;
+    }
     if (selectedId === id) handleSelectWorkflow(BUILTIN[1]);
-    if (activeId === id) setActiveId("standard");
-    toast({ title: `"${name}" deleted` });
+    if (wasActive) setActiveId("standard");
+    toast({ title: `"${name}" deleted`, description: wasActive ? "Active workflow reset to Standard." : undefined });
   };
 
   const handleRenameConfirm = async (id: string) => {

@@ -178,14 +178,19 @@ const BulkDrugImportModal: React.FC<Props> = ({ open, onClose, hospitalId }) => 
     if (valid.length === 0) { toast({ title: "Nothing to import", variant: "destructive" }); return; }
     setImporting(true);
     try {
+      // drug_master has no `strength`/`form` columns — confirmed against the generated schema,
+      // which has `dosage_forms`/`standard_doses` instead, both string[]. Every bulk-import
+      // attempt previously failed on the insert with a Postgres undefined-column error, masked
+      // by a generic "Import failed" toast. Wrapping each row's single value into a one-element
+      // array matches the real column shape without inventing a new column or a migration.
       const payload = valid.map(r => ({
         hospital_id:  hospitalId,
         drug_name:    r.drug_name.trim(),
         generic_name: r.generic_name.trim()  || null,
         category:     r.category.trim()      || null,
         schedule_type: r.schedule_type.trim() || null,
-        strength:     r.strength.trim()      || null,
-        form:         r.form.trim()          || null,
+        dosage_forms: r.form.trim()      ? [r.form.trim()]     : null,
+        standard_doses: r.strength.trim() ? [r.strength.trim()] : null,
         hsn_code:     r.hsn_code.trim()      || null,
         gst_percent:  r.gst_percent !== "" ? Number(r.gst_percent) : null,
         is_ndps:      r.schedule_type.trim().toUpperCase() === "X",

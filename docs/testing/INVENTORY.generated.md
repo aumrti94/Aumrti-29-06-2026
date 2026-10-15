@@ -12,18 +12,18 @@ that does not match a rule lands in Phase 10 explicitly rather than falling off 
 
 | Layer | Source registry | Rows | Unit-tested |
 |---|---|---:|---:|
-| Modules | `ALL_MODULES` | 68 | — |
-| Settings screens | `SETTINGS_CATALOG` | 54 | — |
-| Routes | `ROUTE_ROLES` | 88 | — |
+| Modules | `ALL_MODULES` | 69 | — |
+| Settings screens | `SETTINGS_CATALOG` | 55 | — |
+| Routes | `ROUTE_ROLES` | 89 | — |
 | Edge functions | `supabase/functions/` | 108 | 0 |
-| Database tables | generated `types.ts` | 568 | — |
-| Business logic | `src/lib/**` | 190 | 35 |
+| Database tables | generated `types.ts` | 573 | — |
+| Business logic | `src/lib/**` | 200 | 43 |
 
 **E2E column** is computed by searching the `e2e/` sources for the route or function name,
 so it starts reporting on its own as specs land — no edit to the generator needed.
 `e2e/` exists (Phase 3). Its only spec so far is the harness smoke test, so the column is still `—` almost everywhere; Phases 5.5+ fill it in.
 
-## Modules — `ALL_MODULES` (68)
+## Modules — `ALL_MODULES` (69)
 
 Source: [src/lib/modules.ts](../../src/lib/modules.ts). Every module is smoke-covered in
 Phase 5.5 as both tenants (D11); the adoption spine gets journey coverage in Phase 7.5 (D7).
@@ -33,15 +33,16 @@ Phase 5.5 as both tenants (D11); the adoption spine gets journey coverage in Pha
 | OPD Queue | `/opd` | Clinical | — | yes | 7.5 | clinical-pod |
 | IPD / Wards | `/ipd` | Clinical | — | yes | 5.5 | quality-pod |
 | Day Care Unit | `/ipd/day-care` | Clinical | — | — | 5.5 | quality-pod |
-| Emergency | `/emergency` | Clinical | — | — | 5.5 | quality-pod |
+| Emergency | `/emergency` | Clinical | — | yes | 5.5 | quality-pod |
 | Operation Theatre | `/ot` | Clinical | — | yes | 5.5 | quality-pod |
 | Nursing | `/nursing` | Clinical | — | yes | 5.5 | quality-pod |
 | Telemedicine | `/telemedicine` | Clinical | — | — | 5.5 | quality-pod |
 | Health Packages | `/packages` | Clinical | — | — | 5.5 | quality-pod |
+| Quick Scribe | `/quick-scribe` | Clinical | — | — | 5.5 | quality-pod |
 | Laboratory (LIS) | `/lab` | Diagnostics | — | yes | 7.5 | clinical-pod |
 | Radiology (RIS) | `/radiology` | Diagnostics | — | yes | 7.5 | clinical-pod |
-| Blood Bank | `/blood-bank` | Surgical | — | — | 5.5 | quality-pod |
-| CSSD | `/cssd` | Surgical | — | — | 5.5 | quality-pod |
+| Blood Bank | `/blood-bank` | Surgical | — | yes | 5.5 | quality-pod |
+| CSSD | `/cssd` | Surgical | — | yes | 5.5 | quality-pod |
 | Pharmacy (IP) | `/pharmacy` | Pharmacy | — | yes | 7.5 | clinical-pod |
 | Pharmacy Retail | `/pharmacy?mode=retail` | Pharmacy | — | yes | 7.5 | clinical-pod |
 | Billing | `/billing` | Finance | — | yes | 5.5 | quality-pod |
@@ -58,17 +59,17 @@ Phase 5.5 as both tenants (D11); the adoption spine gets journey coverage in Pha
 | Oncology | `/oncology` | Specialized | — | yes | 5.5 | quality-pod |
 | Physiotherapy | `/physio` | Specialized | — | — | 5.5 | quality-pod |
 | Mortuary & Medico-Legal | `/mortuary` | Specialized | — | yes | 5.5 | quality-pod |
-| Vaccination | `/vaccination` | Clinical | — | — | 5.5 | quality-pod |
+| Vaccination | `/vaccination` | Clinical | — | yes | 5.5 | quality-pod |
 | Ambulance Service | `/ambulance` | Clinical | — | yes | 5.5 | quality-pod |
 | Home Care | `/home-care` | Clinical | — | yes | 5.5 | quality-pod |
 | Dental | `/dental` | Specialized | — | — | 5.5 | quality-pod |
 | AYUSH | `/ayush` | Specialized | — | — | 5.5 | quality-pod |
-| IVF & ART | `/ivf` | Specialized | — | — | 5.5 | quality-pod |
+| IVF & ART | `/ivf` | Specialized | — | yes | 5.5 | quality-pod |
 | Obstetric ANC | `/specialty/anc` | Specialized | — | yes | 5.5 | quality-pod |
 | Neonatal EMR | `/specialty/neonatal` | Specialized | — | yes | 5.5 | quality-pod |
-| Anaesthesia EMR | `/specialty/anaesthesia` | Specialized | — | — | 5.5 | quality-pod |
+| Anaesthesia EMR | `/specialty/anaesthesia` | Specialized | — | yes | 5.5 | quality-pod |
 | Ophthalmology EMR | `/specialty/ophthalmology` | Specialized | — | — | 5.5 | quality-pod |
-| Partograph | `/specialty/partograph` | Specialized | — | — | 5.5 | quality-pod |
+| Partograph | `/specialty/partograph` | Specialized | — | yes | 5.5 | quality-pod |
 | Delivery Record | `/specialty/delivery` | Specialized | — | yes | 5.5 | quality-pod |
 | Mental Health / Psychiatry | `/mental-health` | Specialized | — | yes | 5.5 | quality-pod |
 | Chronic Disease Management | `/chronic-disease` | Clinical | — | yes | 5.5 | quality-pod |
@@ -82,7 +83,7 @@ Phase 5.5 as both tenants (D11); the adoption spine gets journey coverage in Pha
 | CRM & Marketing | `/crm` | Operations | — | — | 5.5 | quality-pod |
 | ABDM / ABHA | `/abdm` | Operations | — | yes | 5.5 | quality-pod |
 | JCI Accreditation | `/quality/jci` | Operations | — | — | 5.5 | quality-pod |
-| MCI / Disaster Response | `/emergency/mci` | Operations | — | — | 5.5 | quality-pod |
+| MCI / Disaster Response | `/emergency/mci` | Operations | — | yes | 5.5 | quality-pod |
 | Population Health | `/analytics/population-health` | Analytics | — | — | 5.5 | quality-pod |
 | Revenue Intelligence | `/analytics/revenue-intelligence` | Analytics | — | — | 5.5 | quality-pod |
 | AI Clinical Intelligence | `/ai/clinical-intelligence` | Analytics | — | — | 5.5 | quality-pod |
@@ -99,11 +100,11 @@ Phase 5.5 as both tenants (D11); the adoption spine gets journey coverage in Pha
 | TV Display | `/tv-display` | Analytics | — | — | 5.5 | quality-pod |
 | Settings Hub | `/settings` | Settings | — | — | 5.5 | quality-pod |
 
-Category split: Operations 15, Specialized 14, Clinical 13, Finance 9, Analytics 7, Patient 3, Diagnostics 2, Surgical 2, Pharmacy 2, Settings 1.
+Category split: Operations 15, Clinical 14, Specialized 14, Finance 9, Analytics 7, Patient 3, Diagnostics 2, Surgical 2, Pharmacy 2, Settings 1.
 
 ---
 
-## Settings screens — `SETTINGS_CATALOG` (54)
+## Settings screens — `SETTINGS_CATALOG` (55)
 
 Source: [src/lib/settingsCatalog.ts](../../src/lib/settingsCatalog.ts). Phase 5 requires each
 to be behaviour-tested (seed two values, assert the configured module's runtime decision
@@ -145,6 +146,7 @@ differs) or explicitly listed as having no verified consumer.
 | Approval Rules | `/settings/approvals` | — | 5 | quality-pod |
 | OPD Queue Config | `/settings/opd-workflow` | — | 5 | quality-pod |
 | IPD Ancillary Payment | `/settings/ipd-ancillary-payment` | — | 5 | quality-pod |
+| Patient Credit / Pay Later | `/settings/patient-credit-payment` | — | 5 | quality-pod |
 | Notification Config | `/settings/notifications` | — | 5 | quality-pod |
 | WhatsApp Bot | `/settings/whatsapp` | — | 5 | quality-pod |
 | Scheduled Reports | `/settings/report-schedules` | — | 5 | quality-pod |
@@ -168,7 +170,7 @@ differs) or explicitly listed as having no verified consumer.
 
 ---
 
-## Routes — `ROUTE_ROLES` (88)
+## Routes — `ROUTE_ROLES` (89)
 
 Source: [src/lib/routeRoles.ts](../../src/lib/routeRoles.ts), generated from `ALL_MODULES`
 plus explicit overrides. Phase 5.5 sweep 1 asserts each loads for an entitled role and is
@@ -193,17 +195,17 @@ refused for a non-entitled one.
 | `/billing` | explicit override | yes | 5.5 | quality-pod |
 | `/billing/closure` | explicit override | — | 5.5 | quality-pod |
 | `/biomedical` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/blood-bank` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/blood-bank` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/chronic-disease` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/crm` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/cssd` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/cssd` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/dashboard` | explicit override | — | 5.5 | quality-pod |
 | `/dental` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/design-system` | explicit override | — | 5.5 | quality-pod |
 | `/dialysis` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/dietetics` | from ALL_MODULES | yes | 5.5 | quality-pod |
-| `/emergency` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/emergency/mci` | explicit override | — | 5.5 | quality-pod |
+| `/emergency` | from ALL_MODULES | yes | 5.5 | quality-pod |
+| `/emergency/mci` | explicit override | yes | 5.5 | quality-pod |
 | `/fms/dashboard` | explicit override | — | 5.5 | quality-pod |
 | `/hmis` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/hod-dashboard` | from ALL_MODULES | — | 5.5 | quality-pod |
@@ -216,7 +218,7 @@ refused for a non-entitled one.
 | `/ipc/dashboard` | explicit override | — | 5.5 | quality-pod |
 | `/ipd` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/ipd/day-care` | explicit override | — | 5.5 | quality-pod |
-| `/ivf` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/ivf` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/lab` | explicit override | yes | 5.5 | quality-pod |
 | `/lms` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/mental-health` | from ALL_MODULES | yes | 5.5 | quality-pod |
@@ -243,6 +245,7 @@ refused for a non-entitled one.
 | `/quality/events` | explicit override | — | 5.5 | quality-pod |
 | `/quality/jci` | explicit override | — | 5.5 | quality-pod |
 | `/quality/qi-projects` | explicit override | — | 5.5 | quality-pod |
+| `/quick-scribe` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/radiology` | explicit override | yes | 5.5 | quality-pod |
 | `/research` | explicit override | — | 5.5 | quality-pod |
 | `/schedule` | explicit override | yes | 5.5 | quality-pod |
@@ -255,15 +258,15 @@ refused for a non-entitled one.
 | `/settings/record-retention` | explicit override | — | 5.5 | quality-pod |
 | `/settings/tv-display` | explicit override | — | 5.5 | quality-pod |
 | `/settings/white-label` | explicit override | — | 5.5 | quality-pod |
-| `/specialty/anaesthesia` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/specialty/anaesthesia` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/specialty/anc` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/specialty/delivery` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/specialty/neonatal` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/specialty/ophthalmology` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/specialty/partograph` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/specialty/partograph` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/telemedicine` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/tv-display` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/vaccination` | from ALL_MODULES | — | 5.5 | quality-pod |
+| `/vaccination` | from ALL_MODULES | yes | 5.5 | quality-pod |
 
 ---
 
@@ -285,7 +288,7 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `abdm-hpr-verify` | 3 Statutory | — | yes | 6 | security-pod |
 | `abdm-sandbox-test` | 3 Statutory | — | yes | 6 | security-pod |
 | `admin-impersonate-start` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
-| `admin-set-staff-password` | 5 Long tail | — | — | 10 | quality-pod |
+| `admin-set-staff-password` | 5 Long tail | — | yes | 10 | quality-pod |
 | `ai-clarifying-questions` | 1 PHI | — | yes | 6 | security-pod |
 | `ai-clinical-guidelines` | 1 PHI | — | yes | 6 | security-pod |
 | `ai-clinical-voice` | 1 PHI | — | yes | 6 | security-pod |
@@ -305,19 +308,19 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `ai-safety-guard` | 1 PHI | — | yes | 6 | security-pod |
 | `alert-escalation` | 5 Long tail | — | — | 10 | quality-pod |
 | `api-gateway` | 5 Long tail | — | — | 10 | quality-pod |
-| `bhashini-patient-transcribe` | 5 Long tail | — | — | 10 | quality-pod |
-| `bhashini-transcribe` | 5 Long tail | — | — | 10 | quality-pod |
+| `bhashini-patient-transcribe` | 5 Long tail | — | yes | 10 | quality-pod |
+| `bhashini-transcribe` | 5 Long tail | — | yes | 10 | quality-pod |
 | `cghs-eligibility` | 3 Statutory | — | yes | 6 | security-pod |
 | `change-subscription-plan` | 2 Money | — | yes | 6 | revenue-pod |
 | `check-drugbank-ddi` | 5 Long tail | — | — | 10 | quality-pod |
 | `churn-remediation-scan` | 5 Long tail | — | — | 10 | quality-pod |
-| `create-razorpay-order` | 5 Deferred | — | — | 10 | platform-pod |
+| `create-razorpay-order` | 5 Deferred | — | yes | 10 | platform-pod |
 | `create-razorpay-payment-link` | 5 Deferred | — | — | 10 | platform-pod |
 | `create-razorpay-subscription` | 2 Money | — | yes | 6 | revenue-pod |
 | `create-staff-login` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
 | `daily-leakage-scan` | 2 Money | — | yes | 6 | revenue-pod |
 | `delete-hospital` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
-| `donor-reengagement` | 5 Long tail | — | — | 10 | quality-pod |
+| `donor-reengagement` | 5 Long tail | — | yes | 10 | quality-pod |
 | `dunning-processor` | 2 Money | — | yes | 6 | revenue-pod |
 | `email-tally-xml` | 2 Money | — | yes | 6 | revenue-pod |
 | `esi-claim-submit` | 3 Statutory | — | yes | 6 | security-pod |
@@ -337,7 +340,7 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `idsp-alert-submit` | 3 Statutory | — | yes | 6 | security-pod |
 | `insurance-automation` | 5 Long tail | — | yes | 10 | quality-pod |
 | `insurance-daily-alerts` | 5 Long tail | — | — | 10 | quality-pod |
-| `invite-doctors` | 5 Long tail | — | — | 10 | quality-pod |
+| `invite-doctors` | 5 Long tail | — | yes | 10 | quality-pod |
 | `lab-analyzer-ingest` | 1 PHI | — | yes | 6 | security-pod |
 | `lifecycle-nudge-scan` | 5 Long tail | — | — | 10 | quality-pod |
 | `mrr-snapshot-job` | 5 Long tail | — | — | 10 | quality-pod |
@@ -348,18 +351,18 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `pmjay-claim-submit` | 3 Statutory | — | yes | 6 | security-pod |
 | `pmjay-eligibility` | 3 Statutory | — | yes | 6 | security-pod |
 | `purge-orphaned-users` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
-| `razorpay-lookup` | 5 Long tail | — | — | 10 | quality-pod |
+| `razorpay-lookup` | 5 Long tail | — | yes | 10 | quality-pod |
 | `razorpay-settlement-reconcile` | 2 Money | — | yes | 6 | revenue-pod |
 | `razorpay-subscription-webhook` | 2 Money | — | yes | 6 | revenue-pod |
 | `razorpay-webhook` | 2 Money | — | yes | 6 | revenue-pod |
 | `reconcile-bill-claim-balance` | 5 Long tail | — | yes | 10 | quality-pod |
 | `reconcile-journal-postings` | 2 Money | — | yes | 6 | revenue-pod |
 | `register-hospital` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
-| `reset-staff-mfa` | 5 Long tail | — | — | 10 | quality-pod |
+| `reset-staff-mfa` | 5 Long tail | — | yes | 10 | quality-pod |
 | `sarvam-transcribe` | 5 Long tail | — | — | 10 | quality-pod |
-| `scan-drug-list` | 5 Long tail | — | — | 10 | quality-pod |
-| `scan-invoice` | 5 Long tail | — | — | 10 | quality-pod |
-| `scan-lab-tests` | 5 Long tail | — | — | 10 | quality-pod |
+| `scan-drug-list` | 5 Long tail | — | yes | 10 | quality-pod |
+| `scan-invoice` | 5 Long tail | — | yes | 10 | quality-pod |
+| `scan-lab-tests` | 5 Long tail | — | yes | 10 | quality-pod |
 | `seed-dashboard` | 5 Long tail | — | — | 10 | quality-pod |
 | `seed-drugs` | 5 Long tail | — | — | 10 | quality-pod |
 | `seed-pharmacy` | 5 Long tail | — | — | 10 | quality-pod |
@@ -373,8 +376,8 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `send-whatsapp-test` | 5 Long tail | — | — | 10 | quality-pod |
 | `setup-hospital` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
 | `submit-pre-auth-hcx` | 3 Statutory | — | yes | 6 | security-pod |
-| `translate-patient-content` | 5 Long tail | — | — | 10 | quality-pod |
-| `trial-lifecycle-cron` | 5 Long tail | — | — | 10 | quality-pod |
+| `translate-patient-content` | 5 Long tail | — | yes | 10 | quality-pod |
+| `trial-lifecycle-cron` | 5 Long tail | — | yes | 10 | quality-pod |
 | `update-oauth-providers` | 5 Long tail | — | — | 10 | quality-pod |
 | `update-patient-ai-context` | 1 PHI | — | yes | 6 | security-pod |
 | `upsert-patient-phi` | 1 PHI | — | yes | 6 | security-pod |
@@ -385,15 +388,13 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 
 ---
 
-## Database tables — generated types (568)
+## Database tables — generated types (573)
 
 Source: [src/integrations/supabase/types.ts](../../src/integrations/supabase/types.ts). The
 five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in Phase 4.
 
 | Table | Hub | Phase | Owner |
 |---|---|---|---|
-| `_retired_asset_register` | — | 4 | data-pod |
-| `_retired_depreciation_ledger` | — | 4 | data-pod |
 | `abdm_audit_log` | — | 4 | data-pod |
 | `abdm_care_contexts` | — | 4 | data-pod |
 | `abdm_consent_logs` | — | 4 | data-pod |
@@ -456,6 +457,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `bed_transfers` | — | 4 | data-pod |
 | `beds` | — | 4 | data-pod |
 | `bill_amendments` | — | 4 | data-pod |
+| `bill_claim_reconciliation_flags` | — | 4 | data-pod |
 | `bill_discount_approvals` | — | 4 | data-pod |
 | `bill_line_items` | **hub** | 5 | data-pod |
 | `bill_payments` | — | 4 | data-pod |
@@ -769,6 +771,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `patient_acquisition` | — | 4 | data-pod |
 | `patient_ai_context` | — | 4 | data-pod |
 | `patient_consents` | — | 4 | data-pod |
+| `patient_credit_grants` | — | 4 | data-pod |
 | `patient_documents` | — | 4 | data-pod |
 | `patient_encounter_templates` | — | 4 | data-pod |
 | `patient_feedback` | — | 4 | data-pod |
@@ -806,6 +809,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `physio_referrals` | — | 4 | data-pod |
 | `physio_sessions` | — | 4 | data-pod |
 | `plan_features` | — | 4 | data-pod |
+| `platform_admin_quick_access` | — | 4 | data-pod |
 | `platform_ai_keys` | — | 4 | data-pod |
 | `platform_ai_provider_config` | — | 4 | data-pod |
 | `platform_billing_settings` | — | 4 | data-pod |
@@ -814,6 +818,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `platform_incident_updates` | — | 4 | data-pod |
 | `platform_incidents` | — | 4 | data-pod |
 | `platform_metrics_registry` | — | 4 | data-pod |
+| `platform_module_tags` | — | 4 | data-pod |
 | `platform_onboarding_tours` | — | 4 | data-pod |
 | `platform_settings` | — | 4 | data-pod |
 | `platform_support_tickets` | — | 4 | data-pod |
@@ -846,6 +851,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `quality_indicator_overrides` | — | 4 | data-pod |
 | `quality_indicators` | — | 4 | data-pod |
 | `queue_state` | — | 4 | data-pod |
+| `quick_scribe_notes` | — | 4 | data-pod |
 | `quotation_items` | — | 4 | data-pod |
 | `radiology_modalities` | — | 4 | data-pod |
 | `radiology_orders` | — | 4 | data-pod |
@@ -933,7 +939,9 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 | `transfusion_reactions` | — | 4 | data-pod |
 | `translate_pricing` | — | 4 | data-pod |
 | `tv_display_settings` | — | 4 | data-pod |
+| `user_page_preferences` | — | 4 | data-pod |
 | `user_permission_overrides` | — | 4 | data-pod |
+| `user_quick_access` | — | 4 | data-pod |
 | `user_tour_progress` | — | 4 | data-pod |
 | `user_trusted_devices` | — | 4 | data-pod |
 | `users` | — | 4 | data-pod |
@@ -963,7 +971,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 
 ---
 
-## Business logic — `src/lib/**` (190)
+## Business logic — `src/lib/**` (200)
 
 Source: filesystem. This is what `vitest.config.ts` `coverage.include` targets and what the
 R3 ratchet moves.
@@ -999,7 +1007,7 @@ R3 ratchet moves.
 | [billAmendmentLogger.ts](../../src/lib/billAmendmentLogger.ts) | — | 10 | quality-pod |
 | [billMoney.ts](../../src/lib/billMoney.ts) | — | 2 | revenue-pod |
 | [billPayments.ts](../../src/lib/billPayments.ts) | — | 10 | quality-pod |
-| [billPrint.ts](../../src/lib/billPrint.ts) | — | 10 | quality-pod |
+| [billPrint.ts](../../src/lib/billPrint.ts) | yes | 10 | quality-pod |
 | [billStatus.ts](../../src/lib/billStatus.ts) | yes | 1 | quality-pod |
 | [billTotals.ts](../../src/lib/billTotals.ts) | yes | 1 | quality-pod |
 | [billedServiceCheck.ts](../../src/lib/billedServiceCheck.ts) | yes | 2 | revenue-pod |
@@ -1055,6 +1063,8 @@ R3 ratchet moves.
 | [historyDigest.ts](../../src/lib/historyDigest.ts) | — | 10 | quality-pod |
 | [homeCareAlerts.ts](../../src/lib/homeCareAlerts.ts) | — | 10 | quality-pod |
 | [homeCarePlans.ts](../../src/lib/homeCarePlans.ts) | — | 10 | quality-pod |
+| [hospitalTypes.ts](../../src/lib/hospitalTypes.ts) | — | 10 | quality-pod |
+| [hospitalUpi.ts](../../src/lib/hospitalUpi.ts) | — | 10 | quality-pod |
 | [icd10Data.ts](../../src/lib/icd10Data.ts) | — | 10 | quality-pod |
 | [icdSearch.ts](../../src/lib/icdSearch.ts) | yes | 10 | quality-pod |
 | [impersonation.ts](../../src/lib/impersonation.ts) | — | 10 | quality-pod |
@@ -1078,6 +1088,7 @@ R3 ratchet moves.
 | [key-rotation.ts](../../src/lib/key-rotation.ts) | — | 10 | quality-pod |
 | [labAST.ts](../../src/lib/labAST.ts) | — | 10 | quality-pod |
 | [labAutoVerify.ts](../../src/lib/labAutoVerify.ts) | — | 10 | quality-pod |
+| [labPanelExpansion.ts](../../src/lib/labPanelExpansion.ts) | yes | 10 | quality-pod |
 | [labQc.ts](../../src/lib/labQc.ts) | — | 10 | quality-pod |
 | [labReferenceRange.ts](../../src/lib/labReferenceRange.ts) | yes | 10 | quality-pod |
 | [labReflexTests.ts](../../src/lib/labReflexTests.ts) | — | 10 | quality-pod |
@@ -1099,7 +1110,7 @@ R3 ratchet moves.
 | [news2.ts](../../src/lib/news2.ts) | — | 10 | quality-pod |
 | [offlineQueue.ts](../../src/lib/offlineQueue.ts) | — | 10 | quality-pod |
 | [orderAliases.ts](../../src/lib/orderAliases.ts) | — | 10 | quality-pod |
-| [orderCatalogue.ts](../../src/lib/orderCatalogue.ts) | — | 10 | quality-pod |
+| [orderCatalogue.ts](../../src/lib/orderCatalogue.ts) | yes | 10 | quality-pod |
 | [orderCatalogueAI.ts](../../src/lib/orderCatalogueAI.ts) | — | 10 | quality-pod |
 | [otDates.ts](../../src/lib/otDates.ts) | — | 10 | quality-pod |
 | [outstandingBalance.ts](../../src/lib/outstandingBalance.ts) | — | 10 | quality-pod |
@@ -1107,6 +1118,8 @@ R3 ratchet moves.
 | [packageGuard.ts](../../src/lib/packageGuard.ts) | — | 10 | quality-pod |
 | [packageOrders.ts](../../src/lib/packageOrders.ts) | — | 10 | quality-pod |
 | [patient-records.ts](../../src/lib/patient-records.ts) | — | 10 | quality-pod |
+| [patientCreditGate.ts](../../src/lib/patientCreditGate.ts) | yes | 10 | quality-pod |
+| [patientCreditSlipPrint.ts](../../src/lib/patientCreditSlipPrint.ts) | — | 10 | quality-pod |
 | [payerTypes.ts](../../src/lib/payerTypes.ts) | yes | 1 | quality-pod |
 | [paymentLinks.ts](../../src/lib/paymentLinks.ts) | — | 10 | quality-pod |
 | [paymentModes.ts](../../src/lib/paymentModes.ts) | — | 10 | quality-pod |
@@ -1114,20 +1127,25 @@ R3 ratchet moves.
 | [payrollExports.ts](../../src/lib/payrollExports.ts) | — | 10 | quality-pod |
 | [payslipPrint.ts](../../src/lib/payslipPrint.ts) | — | 10 | quality-pod |
 | [pcpndt.ts](../../src/lib/pcpndt.ts) | yes | 10 | quality-pod |
-| [pendingInvestigations.ts](../../src/lib/pendingInvestigations.ts) | — | 10 | quality-pod |
+| [pendingInvestigations.ts](../../src/lib/pendingInvestigations.ts) | yes | 10 | quality-pod |
 | [pharmacyReturnCredit.ts](../../src/lib/pharmacyReturnCredit.ts) | — | 10 | quality-pod |
 | [pharmacyReturns.ts](../../src/lib/pharmacyReturns.ts) | — | 10 | quality-pod |
 | [phi-crypto.ts](../../src/lib/phi-crypto.ts) | — | 10 | quality-pod |
 | [pickDefaultAdmission.ts](../../src/lib/pickDefaultAdmission.ts) | — | 10 | quality-pod |
 | [platform-utils.ts](../../src/lib/platform-utils.ts) | — | 10 | quality-pod |
 | [platformBilling.ts](../../src/lib/platformBilling.ts) | — | 10 | quality-pod |
+| [platformModules.ts](../../src/lib/platformModules.ts) | — | 10 | quality-pod |
 | [portalLanguages.ts](../../src/lib/portalLanguages.ts) | — | 10 | quality-pod |
 | [postAuthRoute.ts](../../src/lib/postAuthRoute.ts) | — | 10 | quality-pod |
 | [prescribedPending.ts](../../src/lib/prescribedPending.ts) | — | 10 | quality-pod |
+| [prescriptionQuantity.ts](../../src/lib/prescriptionQuantity.ts) | — | 10 | quality-pod |
 | [printUtils.ts](../../src/lib/printUtils.ts) | yes | 10 | quality-pod |
 | [qualityIndicators.ts](../../src/lib/qualityIndicators.ts) | — | 10 | quality-pod |
+| [quickAccessDefaults.ts](../../src/lib/quickAccessDefaults.ts) | — | 10 | quality-pod |
 | [quickPickDefaults.ts](../../src/lib/quickPickDefaults.ts) | — | 10 | quality-pod |
-| [receiptPrint.ts](../../src/lib/receiptPrint.ts) | — | 10 | quality-pod |
+| [quickScribePrint.ts](../../src/lib/quickScribePrint.ts) | yes | 10 | quality-pod |
+| [quickScribeSafety.ts](../../src/lib/quickScribeSafety.ts) | yes | 10 | quality-pod |
+| [receiptPrint.ts](../../src/lib/receiptPrint.ts) | yes | 10 | quality-pod |
 | [refundRequests.ts](../../src/lib/refundRequests.ts) | — | 10 | quality-pod |
 | [registrationBill.ts](../../src/lib/registrationBill.ts) | — | 10 | quality-pod |
 | [resultNotifications.ts](../../src/lib/resultNotifications.ts) | — | 10 | quality-pod |
