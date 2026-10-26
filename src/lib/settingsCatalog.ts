@@ -172,6 +172,20 @@ export const SETTINGS_CATALOG: SettingsEntry[] = [
     route: "/settings/ai-features", group: "Plan & Modules", modules: ["ai_clinical"], crossCutting: true,
     keywords: ["artificial intelligence", "ai", "copilot", "scribe", "attestation", "dpa", "llm"],
   },
+  {
+    // Keywords deliberately include the phrases a hospital uses when it is really asking
+    // this question but thinks it is asking for key custody — "own api key", "byok",
+    // "sub-processor". Those searches must land here, not on Integration Keys.
+    icon: ShieldCheck, title: "AI Usage & Data Processing",
+    desc: "What your AI used this month, and where that data is processed",
+    route: "/settings/ai-usage", group: "Plan & Modules", modules: ["ai_clinical"], crossCutting: true,
+    keywords: [
+      "ai usage", "ai cost", "ai spend", "tokens", "consumption",
+      "data residency", "residency", "sub-processor", "subprocessor", "processor",
+      "dpdp", "dpa", "privacy", "where is my data", "retention", "training",
+      "own api key", "byok", "bring your own key", "api hub", "transparency",
+    ],
+  },
 
   // ── Structure ───────────────────────────────────────────────────────────────
   {

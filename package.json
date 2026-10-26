@@ -28,6 +28,7 @@
     "check:openapi": "node scripts/generate-openapi.mjs --check",
     "check:lab-catalog": "node scripts/generate-lab-catalog.mjs --check",
     "check:no-phi-logs": "node scripts/check-no-phi-logs.mjs",
+    "check:ai-key-choke": "node scripts/check-ai-key-choke.mjs",
     "lab:catalog": "node scripts/generate-lab-catalog.mjs",
     "api:openapi": "node scripts/generate-openapi.mjs",
     "supabase:push": "dotenv --override -e .env.local -- npx supabase db push",

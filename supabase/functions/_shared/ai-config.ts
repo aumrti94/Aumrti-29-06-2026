@@ -2,6 +2,17 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { checkAIAllowed } from "./ai-entitlement.ts";
 import { getUsdToInr } from "./platform-rate.ts";
+import {
+  aiConfigCacheKey,
+  classifyAiFeature,
+  decideKeySource,
+  mayHospitalChooseModel,
+  type ByokState,
+  type KeyOwner,
+} from "./byokPolicy.ts";
+
+const isSafetyFeature = (featureKey: string): boolean =>
+  classifyAiFeature(featureKey) === "safety";
 
 // Thrown by resolveAiConfig when a hospital's "AI Features" master switch (or the
 // per-feature toggle) withholds this call. Distinct from the "no config → null →
@@ -11,6 +22,30 @@ export class AIDisabledError extends Error {
   constructor(message = "AI features are disabled for this hospital.") {
     super(message);
     this.name = "AIDisabledError";
+  }
+}
+
+/**
+ * Thrown when a hospital has BYOK switched on but the call cannot run on their
+ * own key — no active key row, or the BYOK state could not be read at all.
+ *
+ * A SIBLING OF AIDisabledError, FOR THE SAME REASON. Returning null here would
+ * let callers fall through to `?? resolveAiConfigFromEnv()` and spend a platform
+ * key on behalf of a hospital that contracted its own provider — sending patient
+ * data to a vendor under a contract the hospital never signed, while the
+ * hospital believes the opposite is happening. Throwing makes the failure
+ * reach the clinician as "AI unavailable" instead, which is the correct and
+ * visible outcome.
+ *
+ * Callers must surface this as a configuration problem the hospital's
+ * administrator can fix — never as a clinical warning, and never by silently
+ * returning an empty result (a clinician can read an empty AI panel as a
+ * clinical finding rather than a system failure).
+ */
+export class BYOKUnavailableError extends Error {
+  constructor(message = "This hospital's own AI provider key is unavailable.") {
+    super(message);
+    this.name = "BYOKUnavailableError";
   }
 }
 
@@ -85,7 +120,25 @@ export interface AiConfig {
    * config WITHOUT a meter and attaches a fresh one per call, so mutating what you get
    * back touches a per-call spread, never the shared cache.
    */
-  meter?: { hospitalId: string; featureKey: string; patientId?: string; encounterId?: string };
+  meter?: {
+    hospitalId: string;
+    featureKey: string;
+    patientId?: string;
+    encounterId?: string;
+    /**
+     * Whose credential actually served the call.
+     *
+     * An OBSERVATION taken from the resolved config, never re-derived from
+     * `byok_enabled && entitled` at the logging site. If it restated config
+     * INTENT instead, the alert meant to catch a BYOK hospital silently running
+     * on a platform key would be structurally incapable of firing: it would
+     * report `hospital` for a call that ran on `platform`.
+     *
+     * Drives two things in recordAiUsage: the row's provenance, and whether the
+     * Aumrti wallet is debited at all.
+     */
+    keyOwner?: KeyOwner;
+  };
 }
 
 // Azure AI Foundry serves different model families through different API surfaces:
@@ -226,6 +279,207 @@ export function invalidateAiConfigCache(): void {
   aiConfigCache.clear();
 }
 
+/**
+ * Read the hospital's BYOK state.
+ *
+ * Returns `null` — meaning UNDETERMINED, never "not BYOK" — on any error. That
+ * distinction is the whole point: decideKeySource fails closed on null, so a
+ * transient DB error degrades AI rather than silently spending a platform key
+ * for a hospital that contracted its own provider.
+ *
+ * A hospital with no row is a KNOWN state, not an unreadable one: no row means
+ * never granted, which resolves to the platform key correctly.
+ *
+ * NOT CACHED. The 5-minute config TTL would mean that for 300 seconds after a
+ * hospital flips BYOK on, their calls still run on the platform key — the rule
+ * violated for five minutes, every time, by design. One indexed point-select
+ * (~2-5ms) against a 10-20s LLM call is the right trade.
+ */
+async function loadByokState(
+  sb: ReturnType<typeof createClient>,
+  hospitalId: string,
+): Promise<ByokState | null> {
+  try {
+    const { data, error } = await sb
+      .from("hospital_ai_provider_config")
+      .select("byok_enabled, provider, model_name")
+      .eq("hospital_id", hospitalId)
+      .maybeSingle();
+
+    // Supabase returns errors as VALUES. Without this check an error object
+    // would leave `data` null and read as "no row" → "not BYOK" → platform key.
+    if (error) {
+      // Code 42P01 = relation does not exist. Before the BYOK migration is
+      // applied there is no table, and every hospital is legitimately
+      // non-BYOK — that is a KNOWN state, not an unreadable one, so it must
+      // not block every AI call on the platform.
+      if ((error as { code?: string }).code === "42P01") {
+        return { entitled: false, enabled: false, hasActiveKey: false };
+      }
+      return null;
+    }
+
+    if (!data) return { entitled: false, enabled: false, hasActiveKey: false };
+
+    const row = data as Record<string, unknown>;
+    const enabled = row.byok_enabled === true;
+
+    // The `api_hub` entitlement is the grant. Resolved through the same
+    // plan → add-on → override path as every other module, rather than a
+    // second boolean on this row that RLS cannot protect.
+    const entitled = enabled ? await isApiHubEntitled(sb, hospitalId) : false;
+    if (entitled === null) return null;
+
+    // Only look for a key when it can matter. An active key row for the
+    // hospital's chosen provider is what makes BYOK usable.
+    let hasActiveKey = false;
+    if (entitled && enabled) {
+      const provider = normalizeProviderKey(row.provider as string);
+      const serviceKey = PROVIDER_SERVICE_KEYS[provider];
+      if (!serviceKey) return { entitled, enabled, hasActiveKey: false };
+
+      const { data: keyRow, error: keyErr } = await sb
+        .from("hospital_ai_keys")
+        .select("id")
+        .eq("hospital_id", hospitalId)
+        .eq("service_key", serviceKey)
+        .eq("is_active", true)
+        .maybeSingle();
+      if (keyErr) return null;
+      hasActiveKey = Boolean(keyRow);
+    }
+
+    return { entitled, enabled, hasActiveKey };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build an AiConfig from the HOSPITAL's own provider row and key.
+ *
+ * Never cached, and never falls back: every failure path here throws
+ * BYOKUnavailableError rather than returning null, because null would let the
+ * caller's `?? resolveAiConfigFromEnv()` tail spend a platform key.
+ *
+ * MODEL SELECTION IS NOT THE HOSPITAL'S, EXCEPT ON NON-CLINICAL FEATURES.
+ * Key ownership and model choice are separate freedoms. The hospital's reasons
+ * for BYOK — own contract, own bill, own DPA — need the first and none of the
+ * second, while the second changes clinical correctness in ways this very file
+ * documents: supportsPdfDocuments() exists because one provider silently
+ * accepts a PDF it cannot read, answers from the text prompt alone, and bills
+ * for it — producing confident, invented patient history on an extraction task.
+ *
+ * Until a validated per-feature-class model allow-list exists, the interim
+ * allow-list is "the default model this provider is already run on in
+ * production" — DEFAULT_MODELS. A hospital may still pick the PROVIDER (their
+ * key only works with their own), but on a clinical or safety feature the model
+ * within it is ours.
+ */
+async function resolveHospitalAiConfig(
+  sb: ReturnType<typeof createClient>,
+  hospitalId: string,
+  featureKey: string,
+  defaultMaxTokens: number,
+): Promise<AiConfig> {
+  const { data: cfgRow, error: cfgErr } = await sb
+    .from("hospital_ai_provider_config")
+    .select("provider, model_name, temperature, max_tokens")
+    .eq("hospital_id", hospitalId)
+    .maybeSingle();
+  if (cfgErr || !cfgRow) {
+    throw new BYOKUnavailableError(
+      "This hospital's AI provider configuration could not be read.",
+    );
+  }
+
+  const cfg = cfgRow as Record<string, unknown>;
+  const provider = normalizeProviderKey(cfg.provider as string);
+  const serviceKey = PROVIDER_SERVICE_KEYS[provider];
+  if (!serviceKey) {
+    throw new BYOKUnavailableError(
+      `This hospital's configured AI provider (${String(cfg.provider ?? "none")}) is not supported.`,
+    );
+  }
+
+  const { data: keyRow, error: keyErr } = await sb
+    .from("hospital_ai_keys")
+    .select("config")
+    .eq("hospital_id", hospitalId)
+    .eq("service_key", serviceKey)
+    .eq("is_active", true)
+    .maybeSingle();
+  if (keyErr || !keyRow) {
+    throw new BYOKUnavailableError(
+      "This hospital's AI provider key is missing or inactive.",
+    );
+  }
+
+  const keyCfg = (keyRow as { config?: Record<string, string> }).config ?? {};
+  const apiKey = keyCfg.api_key;
+  // Deliberately NO env-var fallback on this path. The platform env keys exist
+  // for platform-operated hospitals; reaching for one here is exactly the
+  // silent fallback the whole feature forbids.
+  if (!apiKey) {
+    throw new BYOKUnavailableError("This hospital's AI provider key is not set.");
+  }
+
+  const model = mayHospitalChooseModel(featureKey)
+    ? ((cfg.model_name as string) || DEFAULT_MODELS[provider] || "gpt-4o")
+    : (DEFAULT_MODELS[provider] || "gpt-4o");
+
+  const base = {
+    provider,
+    model,
+    apiKey,
+    temperature: Number(cfg.temperature) || 0.3,
+    maxTokens: Number(cfg.max_tokens) || defaultMaxTokens,
+    meter: { hospitalId, featureKey, keyOwner: "hospital" as KeyOwner },
+  } as AiConfig;
+
+  if (provider === "azure") {
+    return {
+      ...base,
+      endpoint: keyCfg.endpoint,
+      apiVersion: keyCfg.api_version,
+      apiStyle: keyCfg.api_style as AiConfig["apiStyle"],
+      azureSurface: keyCfg.azure_surface,
+    };
+  }
+  return base;
+}
+
+/**
+ * Is the `api_hub` module entitled for this hospital?
+ *
+ * Returns null on an unreadable result so the caller can fail closed.
+ * Mirrors the module-entitlement resolution used elsewhere: an explicit
+ * per-hospital override wins over the plan default.
+ */
+async function isApiHubEntitled(
+  sb: ReturnType<typeof createClient>,
+  hospitalId: string,
+): Promise<boolean | null> {
+  try {
+    const { data, error } = await sb
+      .from("hospital_feature_overrides")
+      .select("enabled")
+      .eq("hospital_id", hospitalId)
+      .eq("module_key", "api_hub")
+      .maybeSingle();
+    if (error) {
+      if ((error as { code?: string }).code === "42P01") return false;
+      return null;
+    }
+    // No override row means the grant was never made. api_hub is deliberately
+    // NOT on by default on any plan — moving a hospital's AI spend off Aumrti's
+    // contract is a commercial decision, never a self-serve setting.
+    return data ? (data as { enabled?: boolean }).enabled === true : false;
+  } catch {
+    return null;
+  }
+}
+
 export async function resolveAiConfig(
   hospitalId: string,
   featureKey: string,
@@ -245,12 +499,38 @@ export async function resolveAiConfig(
   const gate = options.entitlement ?? await checkAIAllowed(sb, hospitalId, featureKey);
   if (!gate.allowed) throw new AIDisabledError(gate.reason);
 
-  const cacheKey = `${featureKey}:${defaultMaxTokens}`;
+  // ── Which key pays for this call ──────────────────────────────────────────
+  // Decided BEFORE any config read, because the answer determines which tables
+  // are even consulted. Safety-class features short-circuit without a BYOK
+  // lookup at all, so a DB blip cannot touch deterioration or interaction
+  // checking. See _shared/byokPolicy.ts for the full rule and its state walk.
+  const byokState: ByokState | null = isSafetyFeature(featureKey)
+    ? null // never consulted for safety class; decideKeySource ignores it
+    : await loadByokState(sb, hospitalId);
+
+  const decision = decideKeySource({ featureKey, byok: byokState });
+  if (decision.blocked) throw new BYOKUnavailableError(decision.reason);
+  const keyOwner: KeyOwner = decision.owner;
+
+  if (keyOwner === "hospital") {
+    // Deliberately NOT cached and deliberately not sharing the platform path:
+    // the hospital's credential is read fresh on every call. The exposure this
+    // avoids is residency, not staleness — a cached credential can be served to
+    // whichever tenant next warms the isolate, and no TTL makes that safe.
+    return await resolveHospitalAiConfig(sb, hospitalId, featureKey, defaultMaxTokens);
+  }
+
+  // Hospital-dimensioned AND owner-dimensioned. The previous key was
+  // `${featureKey}:${defaultMaxTokens}` — no tenant component — so two
+  // hospitals calling the same feature at the same token count shared one
+  // entry, and whichever warmed the isolate first donated its API key to the
+  // other. Logged correctly against each hospital, with nothing to detect it by.
+  const cacheKey = aiConfigCacheKey(hospitalId, featureKey, defaultMaxTokens, keyOwner);
   const cached = aiConfigCache.get(cacheKey);
   if (cached && Date.now() - cached.loadedAt < AI_CONFIG_TTL_MS) {
     // Re-attach the meter for THIS caller. The cached copy deliberately has none — see
     // finalize() below. Returning it bare would leave the call unmetered and unbilled.
-    return cached.config ? { ...cached.config, meter: { hospitalId, featureKey } } : null;
+    return cached.config ? { ...cached.config, meter: { hospitalId, featureKey, keyOwner } } : null;
   }
 
   // Feature-specific config first, then global_default — global tables, no hospital_id.
@@ -297,7 +577,7 @@ export async function resolveAiConfig(
   // hospital happened to warm the isolate first.
   const finalize = (resolved: Omit<AiConfig, "meter">): AiConfig => {
     aiConfigCache.set(cacheKey, { config: resolved as AiConfig, loadedAt: Date.now() });
-    return { ...resolved, meter: { hospitalId, featureKey } } as AiConfig;
+    return { ...resolved, meter: { hospitalId, featureKey, keyOwner } } as AiConfig;
   };
 
   // Azure OpenAI requires endpoint + deployment in addition to API key
@@ -428,7 +708,13 @@ export function estimateAiCostUsd(model: string, usage: ChatUsage): number {
 // Exported so the streaming path can meter a streamed call exactly like a buffered one —
 // callAiChatStream deliberately does not meter itself, since the caller owns the timing.
 export async function recordAiUsage(
-  meter: { hospitalId: string; featureKey: string; patientId?: string; encounterId?: string },
+  meter: {
+    hospitalId: string;
+    featureKey: string;
+    patientId?: string;
+    encounterId?: string;
+    keyOwner?: KeyOwner;
+  },
   provider: string,
   model: string,
   usage: ChatUsage,
@@ -443,6 +729,13 @@ export async function recordAiUsage(
     // in USD and kept for invoice reconciliation. The rupee figure is frozen
     // alongside it at the rate in force now — everything a human sees, and
     // every budget comparison, uses the INR value.
+    // BYOK: the hospital pays its own provider directly, so Aumrti has no cost
+    // to record and — critically — no wallet to debit. Before this branch,
+    // recordAiUsage called upsert_ai_cost_daily and debit_ai_wallet_for_usage
+    // UNCONDITIONALLY, so a BYOK hospital would have paid its provider AND had
+    // its Aumrti prepaid wallet drawn down for the same call.
+    const byok = meter.keyOwner === "hospital";
+
     const costUsd = estimateAiCostUsd(model, usage);
     const costInr = costUsd * (await getUsdToInr(sb));
     const cacheHit = usage.cacheReadTokens > 0;
@@ -457,8 +750,13 @@ export async function recordAiUsage(
       cache_creation_tokens: usage.cacheCreationTokens,
       cache_read_tokens: usage.cacheReadTokens,
       cache_hit: cacheHit,
-      estimated_cost_usd: costUsd,
-      estimated_cost_inr: costInr,
+      // NULL, not 0, on BYOK. Aumrti does not know the hospital's negotiated
+      // rate, and a 0 would be indistinguishable from a free safety-class call
+      // while quietly deflating Aumrti's own cost dashboards.
+      estimated_cost_usd: byok ? null : costUsd,
+      estimated_cost_inr: byok ? null : costInr,
+      // Provenance of the credential that actually served the call.
+      key_owner: meter.keyOwner ?? "platform",
       latency_ms: latencyMs ?? null,
       success: true,
       // Null for the callers that don't know them — matches ai-proxy, which has always
@@ -466,6 +764,12 @@ export async function recordAiUsage(
       patient_id: meter.patientId ?? null,
       encounter_id: meter.encounterId ?? null,
     });
+
+    // Both aggregates answer "what does Aumrti meter and bill". A call the
+    // hospital paid their own provider for is neither, so BYOK stops here —
+    // the raw ai_usage_logs row above is still written, so consumption stays
+    // visible to both parties and to the hospital's own transparency screen.
+    if (byok) return;
 
     await sb.rpc("upsert_ai_cost_daily", {
       p_hospital_id:       meter.hospitalId,

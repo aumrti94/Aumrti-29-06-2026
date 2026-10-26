@@ -1,0 +1,217 @@
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Hospital-managed AI provider keys (BYOK)
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration 20261006000000_global_ai_config.sql moved AI configuration from
+-- per-hospital to a single platform-controlled global config. That remains the
+-- DEFAULT and is unchanged. This migration adds an OPT-IN fork on top of it, for
+-- hospitals that insist on holding their own provider contract and keys.
+--
+-- TWO booleans, deliberately separate, because they belong to different parties:
+--   byok_allowed  — granted by an Aumrti platform admin. Moving AI spend off
+--                   Aumrti's keys is a commercial decision, not a hospital
+--                   setting. Hospital users CANNOT change this (trigger below).
+--   byok_enabled  — the hospital's own switch, meaningful only once allowed.
+--
+-- Own-keys is ACTIVE for a call only when allowed AND enabled AND a key row
+-- exists. Anything less falls back to the platform global config.
+--
+-- SAFETY CARVE-OUT: safety-class AI (drug interaction / ADR, sepsis early
+-- warning, critical incidental findings) NEVER runs on a hospital key, even
+-- when BYOK is fully active. Those features exist to catch harm, they are never
+-- billed to the hospital anyway, and an expired hospital key must not be able to
+-- silence a deterioration alert. Enforced in _shared/ai-config.ts, mirroring
+-- SAFETY_AI_FEATURE_KEYS in src/lib/aiFeatures.ts.
+--
+-- Idempotent — safe to re-run against the live DB.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ── hospital_ai_provider_config (non-secret: provider / model / BYOK state) ───
+-- Readable by the hospital's own users; the API key itself lives in the separate
+-- secret table below and is never exposed here. `key_last4` exists so the
+-- Settings screen can show "sk-…4f2a · set on 20/10/2026" without the secret.
+CREATE TABLE IF NOT EXISTS public.hospital_ai_provider_config (
+  id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  hospital_id    uuid NOT NULL REFERENCES public.hospitals(id) ON DELETE CASCADE,
+
+  -- Platform grant (admin-only; see enforce_byok_allowed_platform_only below)
+  byok_allowed   boolean NOT NULL DEFAULT false,
+  -- Hospital's own switch
+  byok_enabled   boolean NOT NULL DEFAULT false,
+
+  provider       text,
+  model_name     text,
+  temperature    numeric DEFAULT 0.3,
+  max_tokens     integer,
+
+  -- Non-secret key metadata, so the hospital can see a key is set without reading it
+  key_last4      text,
+  key_set_at     timestamptz,
+  last_tested_at timestamptz,
+  test_status    text,
+  test_message   text,
+
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  updated_at     timestamptz NOT NULL DEFAULT now(),
+  -- *_by columns FK public.users, NEVER auth.users — the two diverge for every
+  -- account created after 20260322111223 (npm run check:user-fk).
+  updated_by     uuid REFERENCES public.users(id)
+);
+
+-- Exactly one config row per hospital.
+CREATE UNIQUE INDEX IF NOT EXISTS hospital_ai_provider_config_hospital_idx
+  ON public.hospital_ai_provider_config (hospital_id);
+
+-- ── hospital_ai_keys (SECRET: the hospital's own provider API key) ────────────
+-- Mirrors platform_ai_keys: no hospital-facing policy of ANY kind. Written only
+-- by the `hospital-ai-key` edge function on the service-role key, which verifies
+-- the caller is a hospital_admin of that hospital and that byok_allowed is true.
+-- Read only by edge functions resolving a call. A hospital admin can set a key
+-- and replace it; they can never read one back.
+CREATE TABLE IF NOT EXISTS public.hospital_ai_keys (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  hospital_id uuid NOT NULL REFERENCES public.hospitals(id) ON DELETE CASCADE,
+  service_key text NOT NULL,
+  config      jsonb NOT NULL DEFAULT '{}'::jsonb,
+  is_active   boolean NOT NULL DEFAULT true,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz NOT NULL DEFAULT now(),
+  updated_by  uuid REFERENCES public.users(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS hospital_ai_keys_hospital_service_idx
+  ON public.hospital_ai_keys (hospital_id, service_key);
+
+-- ── Platform grant is platform-only ──────────────────────────────────────────
+-- RLS is row-level, not column-level: the hospital's own admin legitimately
+-- needs UPDATE on their config row (to set provider/model/byok_enabled), and
+-- without this guard the same UPDATE could flip byok_allowed and self-grant.
+-- service_role (the edge functions) and Aumrti admins are exempt.
+CREATE OR REPLACE FUNCTION public.enforce_byok_allowed_platform_only()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.byok_allowed IS DISTINCT FROM OLD.byok_allowed THEN
+    IF auth.uid() IS NOT NULL AND NOT public.is_aumrti_admin() THEN
+      RAISE EXCEPTION 'byok_allowed may only be changed by an Aumrti platform admin';
+    END IF;
+  END IF;
+
+  IF TG_OP = 'INSERT' AND NEW.byok_allowed = true THEN
+    IF auth.uid() IS NOT NULL AND NOT public.is_aumrti_admin() THEN
+      RAISE EXCEPTION 'byok_allowed may only be set by an Aumrti platform admin';
+    END IF;
+  END IF;
+
+  -- A hospital cannot leave byok_enabled on after the grant is withdrawn.
+  IF NEW.byok_allowed = false THEN
+    NEW.byok_enabled := false;
+  END IF;
+
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_byok_allowed_platform_only ON public.hospital_ai_provider_config;
+CREATE TRIGGER trg_byok_allowed_platform_only
+  BEFORE INSERT OR UPDATE ON public.hospital_ai_provider_config
+  FOR EACH ROW EXECUTE FUNCTION public.enforce_byok_allowed_platform_only();
+
+-- ── RLS ──────────────────────────────────────────────────────────────────────
+ALTER TABLE public.hospital_ai_provider_config ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.hospital_ai_keys            ENABLE ROW LEVEL SECURITY;
+
+-- hospital_ai_provider_config: tenant-isolated read; writes restricted to the
+-- hospital's OWN admins (plus Aumrti admins). A nurse must not be able to
+-- repoint the hospital's AI provider.
+DROP POLICY IF EXISTS "hospital_ai_provider_config_select" ON public.hospital_ai_provider_config;
+DROP POLICY IF EXISTS "hospital_ai_provider_config_insert" ON public.hospital_ai_provider_config;
+DROP POLICY IF EXISTS "hospital_ai_provider_config_update" ON public.hospital_ai_provider_config;
+DROP POLICY IF EXISTS "hospital_ai_provider_config_delete" ON public.hospital_ai_provider_config;
+DROP POLICY IF EXISTS "hospital_ai_provider_config_service" ON public.hospital_ai_provider_config;
+
+CREATE POLICY "hospital_ai_provider_config_select"
+  ON public.hospital_ai_provider_config FOR SELECT TO authenticated
+  USING (hospital_id = public.get_user_hospital_id() OR public.is_aumrti_admin());
+
+CREATE POLICY "hospital_ai_provider_config_insert"
+  ON public.hospital_ai_provider_config FOR INSERT TO authenticated
+  WITH CHECK (
+    public.is_aumrti_admin()
+    -- hospital_admin OR super_admin — the same pair the hospital-ai-key edge
+    -- function accepts (ADMIN_ROLES). Keep the two in step: a role the function
+    -- lets write a KEY but RLS blocks from writing the CONFIG produces a stored
+    -- key the hospital can never switch on.
+    OR (hospital_id = public.get_user_hospital_id()
+        AND (public.has_role(auth.uid(), 'hospital_admin'::public.app_role)
+             OR public.has_role(auth.uid(), 'super_admin'::public.app_role)))
+  );
+
+CREATE POLICY "hospital_ai_provider_config_update"
+  ON public.hospital_ai_provider_config FOR UPDATE TO authenticated
+  USING (
+    public.is_aumrti_admin()
+    -- hospital_admin OR super_admin — the same pair the hospital-ai-key edge
+    -- function accepts (ADMIN_ROLES). Keep the two in step: a role the function
+    -- lets write a KEY but RLS blocks from writing the CONFIG produces a stored
+    -- key the hospital can never switch on.
+    OR (hospital_id = public.get_user_hospital_id()
+        AND (public.has_role(auth.uid(), 'hospital_admin'::public.app_role)
+             OR public.has_role(auth.uid(), 'super_admin'::public.app_role)))
+  )
+  WITH CHECK (
+    public.is_aumrti_admin()
+    -- hospital_admin OR super_admin — the same pair the hospital-ai-key edge
+    -- function accepts (ADMIN_ROLES). Keep the two in step: a role the function
+    -- lets write a KEY but RLS blocks from writing the CONFIG produces a stored
+    -- key the hospital can never switch on.
+    OR (hospital_id = public.get_user_hospital_id()
+        AND (public.has_role(auth.uid(), 'hospital_admin'::public.app_role)
+             OR public.has_role(auth.uid(), 'super_admin'::public.app_role)))
+  );
+
+CREATE POLICY "hospital_ai_provider_config_delete"
+  ON public.hospital_ai_provider_config FOR DELETE TO authenticated
+  USING (public.is_aumrti_admin());
+
+CREATE POLICY "hospital_ai_provider_config_service"
+  ON public.hospital_ai_provider_config FOR ALL TO service_role
+  USING (true) WITH CHECK (true);
+
+-- hospital_ai_keys: holds a live third-party API key. Aumrti platform admins and
+-- the service role ONLY. Hospital users get NOTHING — not even their own row —
+-- so a stored key can never be read back out through PostgREST. Same stance as
+-- platform_ai_keys.
+DROP POLICY IF EXISTS "hospital_ai_keys_admin_all" ON public.hospital_ai_keys;
+DROP POLICY IF EXISTS "hospital_ai_keys_service"   ON public.hospital_ai_keys;
+
+CREATE POLICY "hospital_ai_keys_admin_all"
+  ON public.hospital_ai_keys FOR ALL TO authenticated
+  USING (public.is_aumrti_admin())
+  WITH CHECK (public.is_aumrti_admin());
+
+CREATE POLICY "hospital_ai_keys_service"
+  ON public.hospital_ai_keys FOR ALL TO service_role
+  USING (true) WITH CHECK (true);
+
+-- Table privileges (RLS still applies on top of these)
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.hospital_ai_provider_config TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.hospital_ai_keys            TO authenticated;
+
+-- ── Metering: mark calls that ran on the hospital's own key ──────────────────
+-- BYOK spend is NOT Aumrti's spend. It is still logged to ai_usage_logs so both
+-- sides can see consumption, but it is deliberately kept OUT of ai_cost_daily
+-- (and therefore out of hospital_ai_budget_status and the wallet draw-down) —
+-- that aggregate answers "what does Aumrti meter and bill", and a call the
+-- hospital paid their provider for directly is not that. Skipping the aggregate
+-- rather than adding a dimension to it keeps the budget/wallet maths, the
+-- conflict key and the view untouched. See recordAiUsage in
+-- supabase/functions/_shared/ai-config.ts.
+ALTER TABLE public.ai_usage_logs
+  ADD COLUMN IF NOT EXISTS byok boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_ai_usage_logs_hospital_byok
+  ON public.ai_usage_logs (hospital_id, byok, created_at DESC);

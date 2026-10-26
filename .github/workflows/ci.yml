@@ -35,6 +35,13 @@ jobs:
       - name: RLS coverage check
         run: npm run check:rls-coverage
 
+      # Exactly one module may resolve an AI provider credential. A BYOK hospital whose call
+      # reaches a platform key instead does not throw and does not look wrong — patient data
+      # simply goes to a vendor they never contracted. This guard fails on the NEXT AI edge
+      # function that reaches for an env key, which is the one a test cannot cover.
+      - name: AI provider key choke point
+        run: npm run check:ai-key-choke
+
       # Staff-attribution columns (*_by) must FK public.users(id), not auth.users(id) — those
       # are different values since 20260322111223, so an auth.users FK rejects every write from
       # an account created after it. This broke the entire ICU Workspace and the MAR silently.

@@ -79,6 +79,29 @@ export default defineConfig({
         // incremented before the map is built, so it is never zero there.
         "src/lib/claimKpis.ts": { lines: 100, statements: 100, functions: 100, branches: 98 },
         "supabase/functions/_shared/leakageScan.ts": { lines: 100, statements: 100, functions: 100, branches: 100 },
+
+        // AI transparency (Step 1 of the API Hub programme). Gated at 100 because the
+        // whole point of the screen it feeds is that a hospital's DPDP officer and
+        // procurement team can believe the numbers: a safety-class rupee leaking into
+        // the metered figure, or a retired feature_key being dropped, would be invisible
+        // on screen and would silently contradict /settings/plan.
+        "src/lib/aiUsageSummary.ts": { lines: 100, statements: 100, functions: 100, branches: 100 },
+
+        // Quick Scribe DPDP consent wording. Gated at 100 because this is the text a doctor
+        // reads aloud to a patient before a microphone opens, and the retention periods it
+        // quotes have to match what quick_scribe_purge_after() actually enforces
+        // (20261111000001). A notice that under-discloses reads perfectly well and is worthless,
+        // so the only thing standing between a well-meaning edit and an invalid consent is
+        // this file's tests.
+        "src/lib/quickScribeConsent.ts": { lines: 100, statements: 100, functions: 100, branches: 100 },
+
+        // Pure prescription-quantity arithmetic, extracted after the SAME dose-strength-instead-
+        // of-dose-count bug existed independently in two other copies (650mg × TDS × 5 days =
+        // 9750 instead of 15 — see the file's own header). It had no test at all until now.
+        "src/lib/prescriptionQuantity.ts": { lines: 100, statements: 100, functions: 100, branches: 100 },
+        // Quick Scribe follow-up date parsing. Gated at 100 for the same reason calcQuantity is:
+        // a silently wrong date is worse than a blank box, because a blank box gets noticed.
+        "src/lib/followUpInterval.ts": { lines: 100, statements: 100, functions: 100, branches: 100 },
       },
     },
   },

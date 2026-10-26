@@ -12,17 +12,30 @@
 
 import { supabase } from "@/integrations/supabase/client";
 
-/** Returns null (never a fake value) when the hospital hasn't configured one. */
-export async function fetchHospitalUpiId(hospitalId: string): Promise<string | null> {
-  const { data } = await (supabase as any)
-    .from("api_configurations")
-    .select("config")
-    .eq("hospital_id", hospitalId)
-    .eq("service_key", "razorpay")
-    .eq("is_active", true)
-    .maybeSingle();
-  const upi = (data?.config as Record<string, any> | undefined)?.upi_id;
-  return typeof upi === "string" && upi.trim() ? upi.trim() : null;
+/**
+ * Returns null (never a fake value) when the hospital hasn't configured one.
+ *
+ * Goes through the `get_hospital_upi_id` RPC rather than reading
+ * api_configurations directly. That table holds live Razorpay/WATI/ABDM
+ * credentials and is administrator-only as of 20261110000001 — but the people
+ * who print receipts are cashiers, not admins, so a direct read here would
+ * return null for exactly the users who need it and put a QR with no payee on
+ * a patient's invoice. The RPC returns ONLY the VPA (a payee address, printed
+ * on every slip — not a secret) and derives the hospital from the session, so
+ * there is no hospital_id to spoof.
+ *
+ * `hospitalId` is retained in the signature for call-site clarity and is
+ * deliberately unused: the RPC resolves the tenant itself, and accepting one
+ * here would imply a caller could ask for another hospital's value.
+ */
+export async function fetchHospitalUpiId(_hospitalId: string): Promise<string | null> {
+  const { data, error } = await (supabase as any).rpc("get_hospital_upi_id");
+  // Supabase returns errors as values. An unchecked error would fall through to
+  // `data === null` and render as "no UPI configured", which is indistinguishable
+  // from the real thing and would silently drop the QR off every receipt.
+  if (error) return null;
+  const upi = typeof data === "string" ? data.trim() : "";
+  return upi || null;
 }
 
 /** Builds a upi://pay deep-link string, or null when no VPA is configured. */

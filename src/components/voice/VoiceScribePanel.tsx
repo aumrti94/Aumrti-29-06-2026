@@ -298,13 +298,19 @@ Interventions: ${editableData.interventions || ""}
 Patient Response: ${editableData.patient_response || ""}
 Handover: ${editableData.handover_note || ""}`;
     } else if (currentSessionType === "quick_scribe") {
-      text = `Summary: ${editableData.summary || ""}
+      // editableData mirrors the AI's raw snake_case output, not the page's QuickScribeNote —
+      // diagnosis and reports_reviewed are deliberately absent: they are typed-only fields the
+      // AI never sees or returns, so there is nothing here to copy for either.
+      text = `Chief Complaint: ${editableData.chief_complaint || ""}
+Summary: ${editableData.summary || ""}
 Medicines:
 ${(((editableData.medicines as DrugItem[]) || []).map(d =>
   `- ${d.drug_name}${d.dose ? ` ${d.dose}` : ""}${d.frequency ? ` ${d.frequency}` : ""}${d.duration ? ` × ${d.duration} days` : ""}`
 ).join("\n")) || "None"}
 Lab Tests: ${((editableData.lab_tests as string[]) || []).join(", ") || "None"}
-Radiology Tests: ${((editableData.radiology_tests as string[]) || []).join(", ") || "None"}`;
+Radiology Tests: ${((editableData.radiology_tests as string[]) || []).join(", ") || "None"}
+Advice: ${editableData.advice || ""}
+Follow-up: ${editableData.follow_up_interval || ""}`;
     } else {
       text = JSON.stringify(editableData, null, 2);
     }

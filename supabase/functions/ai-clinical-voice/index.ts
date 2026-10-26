@@ -240,14 +240,23 @@ Return ONLY a JSON object:
 
 Extract clinical facts EXPLICITLY stated by either speaker — never invent, infer, or add anything that was not actually said.
 
+Your output schema below has NO diagnosis field, and that is deliberate — the printed note does
+carry a Diagnosis line, but a clinician types it by hand. It is never sent to you, and you must
+never attempt to supply it, including inside "summary", "chief_complaint" or "advice". Those fields
+record ONLY what was actually said. If the doctor stated a diagnosis aloud, you may record that
+statement as part of what was said; never add, refine, or complete one of your own.
+
 Return ONLY a JSON object with this exact structure:
 {
+  "chief_complaint": "the presenting complaint in the patient's or doctor's own words, as a short BULLET LIST — one point per line, beginning with '• ', or empty string if not clearly separable from summary",
   "summary": "the presenting complaint and relevant findings, as a short BULLET LIST — one point per line, beginning with '• '",
   "medicines": [
     { "drug_name": "drug name with strength", "dose": "strength/formulation ONLY if stated separately from drug name, else empty string — an administration amount like '1 tablet' or 'half tablet' is NOT a dose, it belongs in the frequency pattern, see FREQUENCY RULE below", "frequency": "Morning-Afternoon-Evening tablet pattern — see FREQUENCY RULE below", "duration": "BARE number of days only, e.g. '15' — never '15 days' or any other unit word, the field is already labelled Days", "instructions": "special instructions if any" }
   ],
   "lab_tests": ["exact test name, e.g. CBC, LFT, KFT, HbA1c, Urine R/M"],
   "radiology_tests": ["exact study name, e.g. Chest X-ray, USG Abdomen, CT Brain"],
+  "advice": "general instructions and return precautions actually given to the patient, as a short BULLET LIST — one point per line, beginning with '• ', e.g. '• Return if fever crosses 102°F'. Empty string if none were given.",
+  "follow_up_interval": "ONLY if the doctor stated when the patient should return, in the doctor's own words normalised to a short phrase like '1 week', '10 days', '2 weeks', '1 month' — empty string if no follow-up was mentioned. Never a date — the app computes the date from this interval.",
   "confidence": 0.85,
   "reasoning": "One sentence explaining the confidence level and key structuring decisions made"
 }
@@ -647,29 +656,57 @@ Merge rules:
         : `\n\nIMPORTANT: The conversation may be in English or any Indian regional language. Detect the language, then TRANSLATE and return ALL text field VALUES in clear, professional English. Keep JSON keys in English. Preserve medical drug names and ICD codes exactly.`;
     }
 
-    // Quick Scribe's schema has NO suggested_diagnosis/suggested_icd/diagnosis_basis fields.
-    // The shared guard below tells the model those fields are "where your OWN clinical
-    // inference belongs" — with nowhere to put it, the model's only outlet is "summary",
-    // which prints on hospital letterhead with nothing marking it as AI inference. That is
-    // how an extract-only feature silently becomes a diagnostic one (and, per MDR 2017,
-    // how it would reclassify). For this context the inference licence is withdrawn
-    // outright rather than redirected.
-    const inferenceRule = context_type === "quick_scribe"
-      ? `- This note has NO diagnosis field of any kind. Do NOT infer, suggest, or name a diagnosis anywhere, including inside "summary". "summary" records ONLY what was actually said. If the doctor stated a diagnosis aloud, you may record that statement; never add one of your own.`
+    // Quick Scribe's schema has NO suggested_diagnosis/suggested_icd/diagnosis_basis fields, and
+    // now carries no "diagnosis" extraction field either — see the schema comment in
+    // CONTEXT_PROMPTS.quick_scribe. The shared guard below tells the model those fields are
+    // "where your OWN clinical inference belongs" — with nowhere to put it, the model's only
+    // outlet is "summary" or "chief_complaint", which print on hospital letterhead with nothing
+    // marking it as AI inference. That is how an extract-only feature silently becomes a
+    // diagnostic one (and, per MDR 2017, how it would reclassify). For this context the
+    // inference licence is withdrawn outright rather than redirected, and the EXTRACT-ONLY
+    // diagnosis bullet below (which names a "diagnosis" key quick_scribe does not have) is
+    // omitted for it entirely, not merely reworded — leaving it in would hand the model licence
+    // to extract into a field this context's schema never offered it in the first place.
+    const isQuickScribe = context_type === "quick_scribe";
+    const inferenceRule = isQuickScribe
+      ? `- Your output schema above contains NO diagnosis field, and that is deliberate. Do NOT infer, suggest, or name a diagnosis anywhere in your output — including inside "summary", "chief_complaint" or "advice". Those fields record ONLY what was actually said. If the doctor stated a diagnosis aloud, you may record that statement as part of what was said; never add, refine, or complete one of your own. The printed note does carry a Diagnosis line, but a clinician types it by hand — it is never sent to you, and you must never attempt to supply it.`
       : `- For "suggested_diagnosis" / "suggested_icd" / "diagnosis_basis": this is where your OWN clinical inference belongs, and ONLY here. Offer one when the described findings genuinely support a most-likely working diagnosis and the doctor did not state one. It is presented to the doctor as an unconfirmed suggestion, so it must be defensible from the findings you cite in "diagnosis_basis" — leave all three empty rather than guessing from thin or non-specific symptoms. Never repeat a diagnosis that was actually spoken (that belongs in "diagnosis").`;
+
+    // Three more bullets in the shared guard name fields that only exist on the OPD schema
+    // (chief_complaint/history_of_present_illness/examination_findings/systemic_examination,
+    // plus the diagnosis/icd_suggestion EXTRACT-ONLY licence inferenceRule already closes above).
+    // Sending them unconditionally to quick_scribe was dead weight at best and, for the
+    // diagnosis bullet, directly contradicted inferenceRule two lines later. Branched rather
+    // than reworded so each context only ever sees instructions about fields it actually has.
+    const explicitFactsRule = isQuickScribe
+      ? `- For chief_complaint and summary: record ONLY symptoms/findings/values a speaker EXPLICITLY states. A clinical fact stated inside a question or an answer STILL counts — capture it (e.g. doctor "since when the fever?" + patient "3 days" → fever × 3 days). Only ignore PURE social pleasantries, filler, and unclear/garbled audio — never turn those into clinical findings. Preserve the EXACT anatomical location (e.g. lower back / waist must NOT become "abdomen"). If a symptom is genuinely ambiguous, leave it out.`
+      : `- For chief_complaint, history_of_present_illness and examination_findings: record ONLY symptoms/findings/values a speaker EXPLICITLY states. A clinical fact stated inside a question or an answer STILL counts — capture it (e.g. doctor "since when the fever?" + patient "3 days" → fever × 3 days). Only ignore PURE social pleasantries, filler, and unclear/garbled audio — never turn those into clinical findings. Preserve the EXACT anatomical location (e.g. lower back / waist must NOT become "abdomen"). If a symptom is genuinely ambiguous, leave it out.`;
+    const examinationRule = isQuickScribe
+      ? ""
+      : `\n- For "examination_findings" vs "systemic_examination": general whole-patient survey goes in the first, findings for a NAMED system or site go in the second. Never put the same finding in both. If the doctor examined nothing, leave both empty rather than inventing a normal examination.`;
+    const diagnosisExtractRule = isQuickScribe
+      ? ""
+      : `\n- For "diagnosis" and "icd_suggestion": EXTRACT-ONLY. Fill these ONLY if a diagnosis is explicitly spoken in the conversation (by the doctor or patient). If no diagnosis is stated, leave BOTH empty ("" and ""). Do NOT put your own inference here — this pair records what was actually SAID.`;
+
+    // field_confidence's key list is the OPD section vocabulary (SCRIBE_SECTIONS in
+    // src/lib/scribeConfidence.ts). quick_scribe does not have those fields, but reusing the SAME
+    // nine names — rather than inventing quick_scribe-shaped ones — means populatedSections()
+    // there needs no change and no new section goes unscored. The mapping below is spelled out so
+    // the model knows which of ITS OWN fields corresponds to which borrowed key.
+    const fieldConfidenceRule = isQuickScribe
+      ? `- ALSO return "field_confidence": an object scoring how confident you are in EACH field you filled. Map your OWN fields onto these keys: "chief_complaint" for chief_complaint, "history_of_present_illness" for summary, "prescription" for medicines, "investigations" for lab_tests and radiology_tests combined, "plan" for advice, "follow_up" for follow_up_interval. Values 0-1. Use null for any key whose field the dictation never covered. A field left empty because NOTHING WAS SAID about it must be null, NOT a low number — "not dictated" and "misheard" are different things and are shown differently to the doctor.`
+      : `- ALSO return "field_confidence": an object scoring how confident you are in EACH field you filled — keys "chief_complaint", "history_of_present_illness", "examination_findings", "systemic_examination", "diagnosis", "plan", "follow_up", "prescription", "investigations", values 0-1. Use null for any field the dictation never covered. A field left empty because NOTHING WAS SAID about it must be null, NOT a low number — "not dictated" and "misheard" are different things and are shown differently to the doctor.`;
 
     // Accuracy guardrails — applied to EVERY session type. Symptoms must be strict
     // (no fabrication); only the diagnosis fields may carry a working diagnosis,
     // derived from the described symptoms and NOT from any mis-heard disease word.
     const guardNote = `\n\nACCURACY RULES (most important):
 - Use ONLY the doctor↔patient conversation as your source. NEVER invent, infer, assume, exaggerate, add, or "recommend" anything that was not actually spoken.
-- For chief_complaint, history_of_present_illness and examination_findings: record ONLY symptoms/findings/values a speaker EXPLICITLY states. A clinical fact stated inside a question or an answer STILL counts — capture it (e.g. doctor "since when the fever?" + patient "3 days" → fever × 3 days). Only ignore PURE social pleasantries, filler, and unclear/garbled audio — never turn those into clinical findings. Preserve the EXACT anatomical location (e.g. lower back / waist must NOT become "abdomen"). If a symptom is genuinely ambiguous, leave it out.
-- A consulting room may have OTHER PEOPLE talking nearby, and their words can leak into the recording. If a passage is plainly an unrelated conversation — different topic, no connection to this patient's problem, addressed to somebody else — ignore it. This does NOT apply to the patient or their attendant: the doctor↔patient exchange IS the source of the note and every clinical fact in it must be captured, however briefly stated. When you cannot tell whether a passage belongs to this consultation, KEEP it — losing something the patient said is worse than including a stray sentence.
-- For "examination_findings" vs "systemic_examination": general whole-patient survey goes in the first, findings for a NAMED system or site go in the second. Never put the same finding in both. If the doctor examined nothing, leave both empty rather than inventing a normal examination.
-- For "diagnosis" and "icd_suggestion": EXTRACT-ONLY. Fill these ONLY if a diagnosis is explicitly spoken in the conversation (by the doctor or patient). If no diagnosis is stated, leave BOTH empty ("" and ""). Do NOT put your own inference here — this pair records what was actually SAID.
+${explicitFactsRule}
+- A consulting room may have OTHER PEOPLE talking nearby, and their words can leak into the recording. If a passage is plainly an unrelated conversation — different topic, no connection to this patient's problem, addressed to somebody else — ignore it. This does NOT apply to the patient or their attendant: the doctor↔patient exchange IS the source of the note and every clinical fact in it must be captured, however briefly stated. When you cannot tell whether a passage belongs to this consultation, KEEP it — losing something the patient said is worse than including a stray sentence.${examinationRule}${diagnosisExtractRule}
 ${inferenceRule}
 - confidence: base it on how much was actually extractable. If few or no clinical facts could be captured, set confidence to 0.3 or lower and explain in "reasoning" what was missing or unclear. Do NOT report high confidence for an empty or near-empty result.
-- ALSO return "field_confidence": an object scoring how confident you are in EACH field you filled — keys "chief_complaint", "history_of_present_illness", "examination_findings", "systemic_examination", "diagnosis", "plan", "follow_up", "prescription", "investigations", values 0-1. Use null for any field the dictation never covered. A field left empty because NOTHING WAS SAID about it must be null, NOT a low number — "not dictated" and "misheard" are different things and are shown differently to the doctor.`;
+${fieldConfidenceRule}`;
 
     // Terms the deterministic pass matched but was not confident enough to rewrite.
     // Offered as context, never as an instruction — the model may use clinical

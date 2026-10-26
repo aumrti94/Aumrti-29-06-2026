@@ -430,8 +430,10 @@ export const MODULE_ACTIONS: Record<string, ActionDef[]> = {
     { key: "header_theme", label: "Header: Theme Toggle", description: "Dark / light mode toggle" },
   ],
   quick_scribe: [
+    { key: "consent", label: "Take Recording Consent", description: "Record the patient's DPDP consent before voice capture begins" },
     { key: "record", label: "Record Conversation", description: "Start/stop voice capture of the doctor-patient conversation" },
     { key: "print", label: "Print Note", description: "Print the structured quick-scribe note" },
+    { key: "find_previous_visit", label: "Find Previous Visit", description: "Look up a stored Quick Scribe note by visit code or from the doctor's recent list" },
   ],
   opd: [
     { key: "register_walkin", label: "Register Walk-in", description: "Add a new walk-in patient to the OPD queue" },

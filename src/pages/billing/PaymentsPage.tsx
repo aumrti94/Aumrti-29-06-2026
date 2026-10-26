@@ -164,9 +164,12 @@ const PaymentsPage: React.FC = () => {
         const { data: hosp } = await (supabase as any).from("hospitals")
           .select("name, registration_80g, trust_pan").eq("id", data.hospital_id).maybeSingle();
         if (hosp) setHospital80G(hosp);
-        const { data: rzp } = await (supabase as any).from("api_configurations")
-          .select("id").eq("hospital_id", data.hospital_id).eq("service_key", "razorpay").eq("is_active", true).maybeSingle();
-        setRazorpayConfigured(!!rzp);
+        // Via RPC, not a direct read: api_configurations holds live payment
+        // credentials and is administrator-only as of 20261110000001, while this
+        // page is used by cashiers. The RPC answers only "configured or not".
+        const { data: rzp } = await (supabase as any)
+          .rpc("is_hospital_service_configured", { p_service_key: "razorpay" });
+        setRazorpayConfigured(rzp === true);
       }
     })();
   }, []);

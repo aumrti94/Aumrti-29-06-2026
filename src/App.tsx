@@ -143,6 +143,7 @@ const PublicStatusPage = lazy(() => import("./pages/public/PublicStatusPage"));
 const SettingsHMISPage = lazy(() => import("./pages/settings/SettingsHMISPage"));
 const SettingsAIFeaturesPage = lazy(() => import("./pages/settings/SettingsAIFeaturesPage"));
 const SettingsAILanguagePage = lazy(() => import("./pages/settings/SettingsAILanguagePage"));
+const SettingsAIUsagePage = lazy(() => import("./pages/settings/SettingsAIUsagePage"));
 const SettingsInventoryPage = lazy(() => import("./pages/settings/SettingsInventoryPage"));
 const SettingsConfigValuesPage = lazy(() => import("./pages/settings/SettingsConfigValuesPage"));
 const IntegrationsHubPage = lazy(() => import("./pages/settings/IntegrationsHubPage"));
@@ -389,6 +390,7 @@ const App = () => (
             <Route path="/settings/hmis-portal" element={<RG path="/settings"><SM name="HMIS Portal"><SettingsHMISPage /></SM></RG>} />
             <Route path="/settings/ai-features" element={<RG path="/settings"><SM name="AI Features"><SettingsAIFeaturesPage /></SM></RG>} />
             <Route path="/settings/ai-languages" element={<RG path="/settings"><SM name="AI Language Packs"><SettingsAILanguagePage /></SM></RG>} />
+            <Route path="/settings/ai-usage" element={<RG path="/settings"><SM name="AI Usage & Data Processing"><SettingsAIUsagePage /></SM></RG>} />
             <Route path="/settings/inventory" element={<RG path="/settings"><SM name="Inventory Settings"><SettingsInventoryPage /></SM></RG>} />
             <Route path="/settings/config-values" element={<RG path="/settings"><SM name="Configurable Dropdowns"><SettingsConfigValuesPage /></SM></RG>} />
             <Route path="/settings/gst" element={<RG path="/settings"><SM name="GST"><SettingsGSTPage /></SM></RG>} />

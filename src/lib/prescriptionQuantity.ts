@@ -59,7 +59,9 @@ const LEGACY_PER_DAY: Record<string, number> = {
 };
 
 function perDayDoseLegacy(frequency: string): number | null {
-  const key = (frequency ?? "").trim().toUpperCase();
+  // No `?? ""` here: this is unexported, and its one caller (perDayDose, below) always passes
+  // `frequency ?? ""` already — a value that has never, at this point, been undefined.
+  const key = frequency.trim().toUpperCase();
   if (!key) return null;
   return LEGACY_PER_DAY[key] ?? null;
 }

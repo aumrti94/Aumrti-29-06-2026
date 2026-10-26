@@ -54,12 +54,49 @@ export interface QuickScribeNoteInput {
   patientSex?: string | null;
   /** Rule 65(10)(b) requires the address too. */
   patientAddress?: string | null;
+  /**
+   * Short per-hospital code (QS-7K3M9) the patient brings back on the paper. Printed, never
+   * required: a note printed before 20261111000005 applied, or one printed while the insert
+   * failed, still has to produce a lawful prescription.
+   */
+  visitCode?: string | null;
+  /**
+   * Set when this note was opened via "Continue this visit" from PreviousVisitDrawer — the
+   * visit code of the EARLIER note this one follows up on, never this note's own code (that's
+   * visitCode above). Printed as a delta line near the top so the second printout connects to
+   * the first on paper, not only in the doctor's head.
+   */
+  previousVisitCode?: string | null;
+  /** The earlier visit's date, paired with previousVisitCode. Both or neither. */
+  previousVisitDate?: string | null;
   createdAt: string;
+  /** AI-filled or typed. What the patient came in with, in their own or the doctor's words. */
+  chiefComplaint?: string;
   summary: string;
+  /**
+   * Typed only, follow-up visits only — see 20261111000006. Rendered only when non-empty: a
+   * first-visit note has nothing to review yet, and an empty heading on a prescription is noise.
+   */
+  reportsReviewed?: string;
+  /**
+   * Typed only. No AI path ever writes this — see 20261111000006. Printed between Reports
+   * Reviewed and Medicines, matching the house Clinical-Notes-then-Rx order in ConsultationWorkspace.
+   */
+  diagnosis?: string;
   medicines: QuickScribeMedicine[];
   labTests: string[];
   radiologyTests: string[];
-  /** Honest one-line record of what screening ran. See quickScribeSafety.describeScreening. */
+  /** AI-filled or typed. Printed below Investigations, matching the house Rx-then-Advice order. */
+  advice?: string;
+  /** App-computed from an AI-returned interval; see followUpInterval.ts. ISO yyyy-mm-dd or empty. */
+  followUpDate?: string;
+  /**
+   * What screening ran, computed by quickScribeSafety.describeScreening — kept on the type and
+   * still passed by the caller, but deliberately NOT rendered on the printout (removed on
+   * product decision: the printed page no longer carries a screening record or the NDPS/
+   * Schedule X limitation notice). The on-screen amber safety alert is unaffected — this field
+   * only ever fed the print copy of that information, never the live check itself.
+   */
   screeningNote: string;
 }
 
@@ -109,7 +146,10 @@ function listToHtml(items: string[] | undefined): string {
 function medicinesToHtml(medicines: QuickScribeMedicine[] | undefined): string {
   const rows = (medicines || []).filter(m => (m.drug_name || "").trim());
   if (rows.length === 0) return `<div class="qs-empty">—</div>`;
-  return `<table>
+  // class on <table> only, styled via the descendant selector .qs-table th / .qs-table td below
+  // — matching billPrint.ts's .bp-table pattern. The <th> tags themselves stay bare, which is
+  // deliberate: it is what lets the existing toContain("<th>Qty</th>") assertion survive.
+  return `<table class="qs-table">
     <thead><tr>
       <th>Medicine</th><th>Dose</th><th>Frequency</th><th>Duration</th><th>Qty</th><th>Instructions</th>
     </tr></thead>
@@ -124,6 +164,14 @@ function medicinesToHtml(medicines: QuickScribeMedicine[] | undefined): string {
       </tr>`).join("")}
     </tbody>
   </table>`;
+}
+
+/** DD/MM/YYYY, matching every other date in the product. Empty input renders nothing. */
+function formatFollowUpDate(iso: string | undefined): string {
+  if (!iso) return "";
+  const d = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" });
 }
 
 export function renderQuickScribeHtml(input: QuickScribeNoteInput): string {
@@ -145,21 +193,35 @@ export function renderQuickScribeHtml(input: QuickScribeNoteInput): string {
   .qs-patient .full { grid-column: 1 / -1; }
   .qs-patient label { color: #64748b; font-size: 14px; margin-right: 6px; }
   .qs-meta { display: flex; justify-content: space-between; font-size: 14px; color: #475569; margin-bottom: 12px; }
+  .qs-followup-of { text-align: center; font-size: 14px; font-weight: 600; color: #1d4ed8;
+    margin: -4px 0 10px; }
   .qs-section { margin-bottom: 14px; }
   .qs-section h4 { font-size: 14px; text-transform: uppercase; color: #475569; margin: 0 0 6px; letter-spacing: 0.04em; }
   .qs-bullet { font-size: 14px; margin-bottom: 2px; }
   .qs-empty { font-size: 14px; color: #64748b; }
   .qs-generic { font-size: 14px; color: #475569; margin-top: 4px; font-style: italic; }
-  .qs-screening { border: 1px solid #94a3b8; background: #f8fafc; color: #334155;
-    padding: 8px 10px; margin: 12px 0; font-size: 14px; border-radius: 4px; }
-  .qs-scheduled { border: 2px solid #b45309; background: #fffbeb; color: #78350f;
-    padding: 8px 10px; margin: 12px 0; font-size: 14px; font-weight: 600; border-radius: 4px; }
   .qs-sign { margin-top: 28px; text-align: right; font-size: 14px; }
   .qs-signline { display: inline-block; border-top: 1px solid #334155; padding-top: 4px;
     min-width: 200px; margin-top: 34px; }
+  /* Fixes printUtils.ts's global th (hard-coded 11px) and td (brand fontSize, default 13px)
+     leaking into the drug table — otherwise the only sub-14px text on the prescription, and the
+     most safety-critical text on the page. Specificity (0,1,1) beats the bare global th at
+     (0,0,1), so no !important is needed — same construction as billPrint.ts's .bp-table. */
+  .qs-table { width: 100%; border-collapse: collapse; margin: 4px 0 8px; }
+  .qs-table th { background: #f1f5f9; padding: 5px 8px; text-align: left; font-size: 14px;
+    text-transform: uppercase; color: #475569; border-bottom: 1.5px solid #cbd5e1; }
+  .qs-table td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; font-size: 14px;
+    vertical-align: top; }
+  .qs-followup { border: 1px dashed #94a3b8; background: #f8fafc; color: #334155;
+    padding: 8px 10px; margin: 12px 0; font-size: 14px; border-radius: 4px; }
 </style>
 
 <div class="qs-title">Consultation Advice</div>
+
+${input.previousVisitCode && input.previousVisitDate ? `<div class="qs-followup-of">
+  Follow-up of visit dated ${escapeHtml(new Date(input.previousVisitDate).toLocaleDateString("en-IN", { day: "2-digit", month: "2-digit", year: "numeric" }))}
+  (${escapeHtml(input.previousVisitCode)})
+</div>` : ""}
 
 <div class="qs-patient">
   <div><label>Patient:</label><strong>${escapeHtml(input.patientName || "")}</strong></div>
@@ -169,12 +231,30 @@ export function renderQuickScribeHtml(input: QuickScribeNoteInput): string {
 
 <div class="qs-meta">
   <span>Date: ${dateStr}</span>
+  ${input.visitCode
+    ? `<span>Visit Code: <strong>${escapeHtml(input.visitCode)}</strong></span>`
+    : ""}
 </div>
+
+${input.chiefComplaint && input.chiefComplaint.trim() ? `<div class="qs-section">
+  <h4>Chief Complaint</h4>
+  ${bulletsToHtml(input.chiefComplaint)}
+</div>` : ""}
 
 <div class="qs-section">
   <h4>Summary</h4>
   ${bulletsToHtml(input.summary)}
 </div>
+
+${input.reportsReviewed && input.reportsReviewed.trim() ? `<div class="qs-section">
+  <h4>Reports Reviewed</h4>
+  ${bulletsToHtml(input.reportsReviewed)}
+</div>` : ""}
+
+${input.diagnosis && input.diagnosis.trim() ? `<div class="qs-section">
+  <h4>Diagnosis</h4>
+  ${bulletsToHtml(input.diagnosis)}
+</div>` : ""}
 
 <div class="qs-section">
   <h4>Medicines</h4>
@@ -192,12 +272,14 @@ export function renderQuickScribeHtml(input: QuickScribeNoteInput): string {
   ${listToHtml(input.radiologyTests)}
 </div>
 
-${hasMedicines ? `<div class="qs-scheduled">
-  Not valid for Schedule X or NDPS (narcotic / psychotropic) drugs. Those require a separate
-  prescription in the statutory format, issued in duplicate.
+${input.advice && input.advice.trim() ? `<div class="qs-section">
+  <h4>Advice &amp; Instructions</h4>
+  ${bulletsToHtml(input.advice)}
 </div>` : ""}
 
-<div class="qs-screening">${escapeHtml(input.screeningNote)}</div>
+${formatFollowUpDate(input.followUpDate) ? `<div class="qs-followup">
+  <strong>Follow-up:</strong> ${escapeHtml(formatFollowUpDate(input.followUpDate))}
+</div>` : ""}
 
 <div class="qs-sign">
   <div class="qs-signline">

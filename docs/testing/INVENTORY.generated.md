@@ -13,11 +13,11 @@ that does not match a rule lands in Phase 10 explicitly rather than falling off 
 | Layer | Source registry | Rows | Unit-tested |
 |---|---|---:|---:|
 | Modules | `ALL_MODULES` | 69 | — |
-| Settings screens | `SETTINGS_CATALOG` | 55 | — |
+| Settings screens | `SETTINGS_CATALOG` | 56 | — |
 | Routes | `ROUTE_ROLES` | 89 | — |
-| Edge functions | `supabase/functions/` | 108 | 0 |
+| Edge functions | `supabase/functions/` | 109 | 0 |
 | Database tables | generated `types.ts` | 573 | — |
-| Business logic | `src/lib/**` | 200 | 43 |
+| Business logic | `src/lib/**` | 203 | 47 |
 
 **E2E column** is computed by searching the `e2e/` sources for the route or function name,
 so it starts reporting on its own as specs land — no edit to the generator needed.
@@ -104,7 +104,7 @@ Category split: Operations 15, Clinical 14, Specialized 14, Finance 9, Analytics
 
 ---
 
-## Settings screens — `SETTINGS_CATALOG` (55)
+## Settings screens — `SETTINGS_CATALOG` (56)
 
 Source: [src/lib/settingsCatalog.ts](../../src/lib/settingsCatalog.ts). Phase 5 requires each
 to be behaviour-tested (seed two values, assert the configured module's runtime decision
@@ -120,6 +120,7 @@ differs) or explicitly listed as having no verified consumer.
 | Training Videos | `/settings/training` | — | 5 | quality-pod |
 | Plan & Billing | `/settings/plan` | — | 5 | quality-pod |
 | AI Features & Attestation | `/settings/ai-features` | — | 5 | quality-pod |
+| AI Usage & Data Processing | `/settings/ai-usage` | — | 5 | quality-pod |
 | Departments | `/settings/departments` | — | 5 | quality-pod |
 | Wards & Beds | `/settings/wards` | — | 5 | quality-pod |
 | Shifts | `/settings/shifts` | — | 5 | quality-pod |
@@ -178,7 +179,7 @@ refused for a non-entitled one.
 
 | Route | Source | E2E | Phase | Owner |
 |---|---|---|---|---|
-| `/abdm` | explicit override | yes | 5.5 | quality-pod |
+| `/abdm` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/accounts` | explicit override | yes | 5.5 | quality-pod |
 | `/accounts/budget` | explicit override | — | 5.5 | quality-pod |
 | `/accounts/financial-statements` | explicit override | — | 5.5 | quality-pod |
@@ -206,7 +207,7 @@ refused for a non-entitled one.
 | `/dietetics` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/emergency` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/emergency/mci` | explicit override | yes | 5.5 | quality-pod |
-| `/fms/dashboard` | explicit override | — | 5.5 | quality-pod |
+| `/fms/dashboard` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/hmis` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/hod-dashboard` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/home-care` | from ALL_MODULES | yes | 5.5 | quality-pod |
@@ -215,7 +216,7 @@ refused for a non-entitled one.
 | `/inbox` | explicit override | — | 5.5 | quality-pod |
 | `/insurance` | explicit override | yes | 5.5 | quality-pod |
 | `/inventory` | from ALL_MODULES | — | 5.5 | quality-pod |
-| `/ipc/dashboard` | explicit override | — | 5.5 | quality-pod |
+| `/ipc/dashboard` | from ALL_MODULES | — | 5.5 | quality-pod |
 | `/ipd` | from ALL_MODULES | yes | 5.5 | quality-pod |
 | `/ipd/day-care` | explicit override | — | 5.5 | quality-pod |
 | `/ivf` | from ALL_MODULES | yes | 5.5 | quality-pod |
@@ -270,7 +271,7 @@ refused for a non-entitled one.
 
 ---
 
-## Edge functions — `supabase/functions/` (108)
+## Edge functions — `supabase/functions/` (109)
 
 Priority bands from D8. Four assertions each: authenticated request succeeds, missing/invalid
 auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs.
@@ -351,6 +352,7 @@ auth rejected, malformed payload does not 500 with a stack trace, no PHI in logs
 | `pmjay-claim-submit` | 3 Statutory | — | yes | 6 | security-pod |
 | `pmjay-eligibility` | 3 Statutory | — | yes | 6 | security-pod |
 | `purge-orphaned-users` | 4 Tenant lifecycle | — | yes | 6 | platform-pod |
+| `quick-scribe-retention` | 5 Long tail | — | — | 10 | quality-pod |
 | `razorpay-lookup` | 5 Long tail | — | yes | 10 | quality-pod |
 | `razorpay-settlement-reconcile` | 2 Money | — | yes | 6 | revenue-pod |
 | `razorpay-subscription-webhook` | 2 Money | — | yes | 6 | revenue-pod |
@@ -971,7 +973,7 @@ five hubs carry Phase 5 reconciliation tests; every table is isolation-tested in
 
 ---
 
-## Business logic — `src/lib/**` (200)
+## Business logic — `src/lib/**` (203)
 
 Source: filesystem. This is what `vitest.config.ts` `coverage.include` targets and what the
 R3 ratchet moves.
@@ -992,6 +994,7 @@ R3 ratchet moves.
 | [aiEntitlement.ts](../../src/lib/aiEntitlement.ts) | — | 10 | quality-pod |
 | [aiFeatures.ts](../../src/lib/aiFeatures.ts) | — | 10 | quality-pod |
 | [aiProvider.ts](../../src/lib/aiProvider.ts) | — | 10 | quality-pod |
+| [aiUsageSummary.ts](../../src/lib/aiUsageSummary.ts) | yes | 10 | quality-pod |
 | [alertEscalationRules.ts](../../src/lib/alertEscalationRules.ts) | yes | 0 | data-pod |
 | [ancillaryCharges.ts](../../src/lib/ancillaryCharges.ts) | — | 10 | quality-pod |
 | [ancillaryGateChecks.ts](../../src/lib/ancillaryGateChecks.ts) | — | 10 | quality-pod |
@@ -1055,6 +1058,7 @@ R3 ratchet moves.
 | [errorMessage.ts](../../src/lib/errorMessage.ts) | — | 10 | quality-pod |
 | [expiryGroups.ts](../../src/lib/expiryGroups.ts) | — | 10 | quality-pod |
 | [financialStatements.ts](../../src/lib/financialStatements.ts) | — | 10 | quality-pod |
+| [followUpInterval.ts](../../src/lib/followUpInterval.ts) | yes | 10 | quality-pod |
 | [getHospitalId.ts](../../src/lib/getHospitalId.ts) | — | 10 | quality-pod |
 | [gst.ts](../../src/lib/gst.ts) | — | 2 | revenue-pod |
 | [gstReturns.ts](../../src/lib/gstReturns.ts) | — | 10 | quality-pod |
@@ -1138,11 +1142,12 @@ R3 ratchet moves.
 | [portalLanguages.ts](../../src/lib/portalLanguages.ts) | — | 10 | quality-pod |
 | [postAuthRoute.ts](../../src/lib/postAuthRoute.ts) | — | 10 | quality-pod |
 | [prescribedPending.ts](../../src/lib/prescribedPending.ts) | — | 10 | quality-pod |
-| [prescriptionQuantity.ts](../../src/lib/prescriptionQuantity.ts) | — | 10 | quality-pod |
+| [prescriptionQuantity.ts](../../src/lib/prescriptionQuantity.ts) | yes | 10 | quality-pod |
 | [printUtils.ts](../../src/lib/printUtils.ts) | yes | 10 | quality-pod |
 | [qualityIndicators.ts](../../src/lib/qualityIndicators.ts) | — | 10 | quality-pod |
 | [quickAccessDefaults.ts](../../src/lib/quickAccessDefaults.ts) | — | 10 | quality-pod |
 | [quickPickDefaults.ts](../../src/lib/quickPickDefaults.ts) | — | 10 | quality-pod |
+| [quickScribeConsent.ts](../../src/lib/quickScribeConsent.ts) | yes | 10 | quality-pod |
 | [quickScribePrint.ts](../../src/lib/quickScribePrint.ts) | yes | 10 | quality-pod |
 | [quickScribeSafety.ts](../../src/lib/quickScribeSafety.ts) | yes | 10 | quality-pod |
 | [receiptPrint.ts](../../src/lib/receiptPrint.ts) | yes | 10 | quality-pod |

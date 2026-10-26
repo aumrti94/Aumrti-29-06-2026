@@ -126,18 +126,20 @@ describe("renderQuickScribeHtml — statutory content", () => {
     expect(html).not.toContain("No drug-interaction or allergy screening was performed");
   });
 
-  it("carries the screening statement it was given", () => {
+  it("does NOT print the screening statement, even when one is given — product decision", () => {
+    // screeningNote is still computed and passed by the caller (QuickScribePage still needs it
+    // for nothing in particular yet, but removing the field was a larger change than asked for
+    // — see the field's own comment in quickScribePrint.ts) — it is just never rendered here.
     const html = renderQuickScribeHtml(base({ screeningNote: "duplicate check ran; no allergy history" }));
-    expect(html).toContain("duplicate check ran; no allergy history");
+    expect(html).not.toContain("duplicate check ran; no allergy history");
   });
 
-  it("warns that the document is not valid for Schedule X / NDPS drugs", () => {
-    expect(renderQuickScribeHtml(base())).toContain("NDPS");
+  it("does NOT print the Schedule X / NDPS limitation notice — product decision", () => {
+    expect(renderQuickScribeHtml(base())).not.toContain("NDPS");
   });
 
-  it("omits the Schedule X and generic-substitution notices when there are no medicines", () => {
+  it("omits the generic-substitution notice when there are no medicines", () => {
     const html = renderQuickScribeHtml(base({ medicines: [] }));
-    expect(html).not.toContain("NDPS");
     expect(html).not.toContain("equivalent generic");
   });
 
@@ -150,5 +152,186 @@ describe("renderQuickScribeHtml — statutory content", () => {
   it("renders the date in en-IN (DD/MM/YYYY), never the US order", () => {
     const html = renderQuickScribeHtml(base({ createdAt: "2026-09-26T09:30:00.000Z" }));
     expect(html).toMatch(/26\/09\/2026/);
+  });
+});
+
+describe("renderQuickScribeHtml — visit code", () => {
+  it("prints the visit code when one was allocated", () => {
+    // This is the whole return-visit mechanism: the patient brings this string back on paper.
+    const html = renderQuickScribeHtml(base({ visitCode: "QS-7K3M9" }));
+    expect(html).toContain("Visit Code:");
+    expect(html).toContain("QS-7K3M9");
+  });
+
+  it("omits the visit-code label entirely when no code was allocated", () => {
+    // A note printed while the insert failed has no code. Printing an empty "Visit Code:" label
+    // would invite the patient to read back a value that resolves to nothing.
+    for (const code of [null, undefined, ""]) {
+      const html = renderQuickScribeHtml(base({ visitCode: code }));
+      expect(html).not.toContain("Visit Code:");
+    }
+  });
+
+  it("escapes the visit code rather than interpolating it as markup", () => {
+    const html = renderQuickScribeHtml(base({ visitCode: `<b>QS</b>` }));
+    expect(html).not.toContain("<b>QS</b>");
+    expect(html).toContain("&lt;b&gt;");
+  });
+
+  it("still renders a lawful prescription without a code", () => {
+    // The code is a convenience. Its absence must never degrade the statutory content.
+    const html = renderQuickScribeHtml(base({ visitCode: null }));
+    expect(html).toContain("<th>Qty</th>");
+    expect(html).toContain("Signature");
+  });
+});
+
+describe("renderQuickScribeHtml — the follow-up delta line", () => {
+  // This is the whole point of a return visit: without this line, nothing on the second printout
+  // ever referenced the first, which is exactly the gap a real run of the feature surfaced.
+  it("prints 'Follow-up of visit dated ...' when both the previous code and date are present", () => {
+    const html = renderQuickScribeHtml(base({
+      previousVisitCode: "QS-PT92E",
+      previousVisitDate: "2026-10-25T05:51:00.000Z",
+    }));
+    expect(html).toContain("Follow-up of visit dated");
+    expect(html).toContain("25/10/2026");
+    expect(html).toContain("QS-PT92E");
+  });
+
+  it("omits the line entirely when there is no linked previous visit", () => {
+    const html = renderQuickScribeHtml(base({ previousVisitCode: null, previousVisitDate: null }));
+    expect(html).not.toContain("Follow-up of visit dated");
+  });
+
+  it("omits the line when only one of the pair is present — both or neither, never a dangling reference", () => {
+    for (const partial of [
+      { previousVisitCode: "QS-PT92E", previousVisitDate: null },
+      { previousVisitCode: null, previousVisitDate: "2026-10-25T05:51:00.000Z" },
+    ]) {
+      const html = renderQuickScribeHtml(base(partial));
+      expect(html).not.toContain("Follow-up of visit dated");
+    }
+  });
+
+  it("escapes the previous visit code rather than interpolating it as markup", () => {
+    const html = renderQuickScribeHtml(base({
+      previousVisitCode: `<b>QS</b>`,
+      previousVisitDate: "2026-10-25T05:51:00.000Z",
+    }));
+    expect(html).not.toContain("<b>QS</b>");
+    expect(html).toContain("&lt;b&gt;");
+  });
+
+  it("prints above the patient identity block, matching the plan's 'one delta line at the top'", () => {
+    const html = renderQuickScribeHtml(base({
+      previousVisitCode: "QS-PT92E",
+      previousVisitDate: "2026-10-25T05:51:00.000Z",
+    }));
+    const deltaIdx = html.indexOf("Follow-up of visit dated");
+    const patientBlockIdx = html.indexOf('class="qs-patient"');
+    expect(deltaIdx).toBeGreaterThan(-1);
+    expect(patientBlockIdx).toBeGreaterThan(deltaIdx);
+  });
+});
+
+describe("renderQuickScribeHtml — the five additional fields", () => {
+  it("renders Chief Complaint, Reports Reviewed, Diagnosis and Advice only when non-empty", () => {
+    // "Advice" anchored as ">Advice " — the page title "Consultation Advice" also contains the
+    // bare word, so a plain substring check would pass even if the section never rendered.
+    const empty = renderQuickScribeHtml(base());
+    expect(empty).not.toContain("Chief Complaint");
+    expect(empty).not.toContain("Reports Reviewed");
+    expect(empty).not.toContain(">Diagnosis<");
+    expect(empty).not.toContain(">Advice &amp; Instructions<");
+
+    const filled = renderQuickScribeHtml(base({
+      chiefComplaint: "Fever since 3 days",
+      reportsReviewed: "CBC — WBC 11,200",
+      diagnosis: "Viral fever",
+      advice: "Plenty of fluids, review if fever persists beyond 5 days",
+    }));
+    expect(filled).toContain("Chief Complaint");
+    expect(filled).toContain("Fever since 3 days");
+    expect(filled).toContain("Reports Reviewed");
+    expect(filled).toContain("CBC — WBC 11,200");
+    expect(filled).toContain(">Diagnosis<");
+    expect(filled).toContain("Viral fever");
+    expect(filled).toContain(">Advice &amp; Instructions<");
+    expect(filled).toContain("Plenty of fluids");
+  });
+
+  it("omits Reports Reviewed and Diagnosis when the string is present but blank", () => {
+    // A field that is "" or whitespace-only must render exactly as absent, not as an empty
+    // heading — a printed "Diagnosis" label with nothing under it reads as an omission, not
+    // as a field that was never filled.
+    const html = renderQuickScribeHtml(base({ reportsReviewed: "   ", diagnosis: "" }));
+    expect(html).not.toContain("Reports Reviewed");
+    expect(html).not.toContain("Diagnosis");
+  });
+
+  it("prints Diagnosis after Reports Reviewed and before Medicines — the house Clinical-Notes-then-Rx order", () => {
+    const html = renderQuickScribeHtml(base({
+      reportsReviewed: "CBC reviewed",
+      diagnosis: "Viral fever",
+    }));
+    const reportsIdx = html.indexOf("Reports Reviewed");
+    const diagnosisIdx = html.indexOf(">Diagnosis<");
+    const medicinesIdx = html.indexOf(">Medicines<");
+    expect(reportsIdx).toBeGreaterThan(-1);
+    expect(diagnosisIdx).toBeGreaterThan(reportsIdx);
+    expect(medicinesIdx).toBeGreaterThan(diagnosisIdx);
+  });
+
+  it("prints Advice after Investigations and before the follow-up box", () => {
+    const html = renderQuickScribeHtml(base({
+      advice: "Review in a week",
+      followUpDate: "2026-11-02",
+    }));
+    const radiologyIdx = html.indexOf("Radiology Tests");
+    const adviceIdx = html.indexOf(">Advice &amp; Instructions<");
+    const followUpIdx = html.indexOf("Follow-up:");
+    expect(adviceIdx).toBeGreaterThan(radiologyIdx);
+    expect(followUpIdx).toBeGreaterThan(adviceIdx);
+  });
+
+  it("renders the follow-up date in en-IN order and omits the box when there is none", () => {
+    const withDate = renderQuickScribeHtml(base({ followUpDate: "2026-11-02" }));
+    expect(withDate).toMatch(/Follow-up:.*02\/11\/2026/);
+
+    for (const d of [undefined, "", "not-a-date"]) {
+      const without = renderQuickScribeHtml(base({ followUpDate: d }));
+      expect(without).not.toContain("Follow-up:");
+    }
+  });
+
+  it("escapes all five new fields rather than interpolating them as markup", () => {
+    const html = renderQuickScribeHtml(base({
+      chiefComplaint: `<i>x</i>`,
+      reportsReviewed: `<i>y</i>`,
+      diagnosis: `<i>z</i>`,
+      advice: `<i>w</i>`,
+    }));
+    expect(html).not.toContain("<i>x</i>");
+    expect(html).not.toContain("<i>y</i>");
+    expect(html).not.toContain("<i>z</i>");
+    expect(html).not.toContain("<i>w</i>");
+  });
+});
+
+describe("renderQuickScribeHtml — the .qs-table fix", () => {
+  it("puts the qs-table class on <table>, not on individual cells", () => {
+    // The class must sit on <table> so the <th>Qty</th> assertion above keeps matching bare —
+    // per-cell classes would be the regression that breaks it.
+    const html = renderQuickScribeHtml(base());
+    expect(html).toContain('<table class="qs-table">');
+    expect(html).not.toMatch(/<th class=/);
+    expect(html).not.toMatch(/<td class=/);
+  });
+
+  it("declares the drug table at 14px via the descendant selector, not the bare element", () => {
+    const html = renderQuickScribeHtml(base());
+    expect(html).toContain(".qs-table th");
+    expect(html).toContain(".qs-table td");
   });
 });
